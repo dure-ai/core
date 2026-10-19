@@ -1,0 +1,6 @@
+cortex-mem MCP server
+Copyright 2026 The cortex-mem authors
+
+Portions are derived from mem-mcp (https://github.com/Jh-jaehyuk/mem-mcp),
+originally released under the MIT License by the same author (Jaehyuk Han)
+and relicensed here under the Apache License, Version 2.0.
