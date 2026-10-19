@@ -7,9 +7,10 @@ import pytest
 
 from cortex_mem.contract import Event, QueryContext
 from cortex_mem.store.memory import InMemoryEpisodeStore
+from cortex_mem.store.sqlite import SqliteEpisodeStore
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
-STORES = [InMemoryEpisodeStore]
+STORES = [InMemoryEpisodeStore, SqliteEpisodeStore]
 
 
 @pytest.fixture(params=STORES, ids=lambda f: f.__name__)

@@ -11,3 +11,17 @@
 uv sync
 uv run pytest
 ```
+
+## Claude Code에 등록
+
+```bash
+claude mcp add cortex-mem -- uv run --directory /path/to/mcp-server python -m cortex_mem.server
+```
+
+도구: `record_episode`(기록), `recall`(불러오기), `report_outcome`(불러온 기억이 도움됐는지 보고). 서버 프로세스 하나가 세션 하나다.
+
+| 환경변수 | 기본값 | |
+|---|---|---|
+| `CORTEX_DB_PATH` | `~/.cortex-mem/episodes.db` | 이벤트 저장소(SQLite) |
+| `CORTEX_USER` | OS 사용자 | 기록자 |
+| `CORTEX_ENGINE` | `promote_all` | `promote_all` \| `no_memory` |
