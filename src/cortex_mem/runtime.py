@@ -44,37 +44,46 @@ class Verdict:
 
 
 class _StagedState:
-    """StateStore handed to the engine: writes stay here until the runtime commits."""
+    """StateStore handed to the engine: writes stay here until the runtime commits.
+
+    Pending values are kept as JSON text, so a value is copied on the way in
+    and on the way out, as it is once committed."""
 
     def __init__(self, backend: EngineStateBackend, read_only: bool = False) -> None:
         self._backend = backend
         self._read_only = read_only
-        self.writes: dict[str, Any] = {}
+        self._writes: dict[str, str] = {}
         self.deletes: set[str] = set()
+
+    @property
+    def writes(self) -> dict[str, Any]:
+        """Pending writes as fresh values, for the backend commit."""
+        return {key: json.loads(raw) for key, raw in self._writes.items()}
 
     def get(self, key: str) -> Any | None:
         if key in self.deletes:
             return None
-        if key in self.writes:
-            return self.writes[key]
+        if key in self._writes:
+            return json.loads(self._writes[key])
         return self._backend.get(key)
 
     def put(self, key: str, value: Any) -> None:
         self._check_writable()
-        size = len(json.dumps(value).encode())
+        raw = json.dumps(value)
+        size = len(raw.encode())
         if size > MAX_STATE_VALUE_BYTES:
             raise ValueError(f"state value for {key!r} is {size} bytes; split it across keys")
         self.deletes.discard(key)
-        self.writes[key] = value
+        self._writes[key] = raw
 
     def delete(self, key: str) -> None:
         self._check_writable()
-        self.writes.pop(key, None)
+        self._writes.pop(key, None)
         self.deletes.add(key)
 
     def scan(self, prefix: str = "") -> Iterator[tuple[str, Any]]:
         merged = dict(self._backend.scan(prefix))
-        merged.update((k, v) for k, v in self.writes.items() if k.startswith(prefix))
+        merged.update((k, json.loads(v)) for k, v in self._writes.items() if k.startswith(prefix))
         for key in sorted(merged):
             if key not in self.deletes:
                 yield key, merged[key]
@@ -113,7 +122,10 @@ class Runtime:
         return EngineContext(events=self.events, knowledge=self.knowledge, state=state)
 
     def append(self, event: Event) -> str:
-        """Append an event and deliver everything not yet delivered."""
+        """Append an event and deliver everything not yet delivered. An outcome
+        or human_confirm must say what it judges (non-empty refs)."""
+        if event.kind in ("outcome", "human_confirm") and not event.refs:
+            raise ValueError(f"{event.kind} event {event.id!r} needs refs: the ids it judges")
         self.events.append(event)
         self.sync()
         return event.id
@@ -171,15 +183,16 @@ class Runtime:
     def recall(
         self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6
     ) -> list[Handoff]:
-        """handoff, then record what was handed off as a recall event (refs = ids).
-        The recall event is personal whatever scope was searched: a query says
-        what someone is working on, and is not shared by searching widely."""
+        """handoff, then record what was handed off as a recall event (refs = ids,
+        repo and conditions = the caller's repo and context). The recall event
+        is personal whatever scope was searched: a query says what someone is
+        working on, and is not shared by searching widely."""
         handoffs = self.handoff(query, caller, scope, k)
         self.append(
             Event(
                 id=event_id, kind="recall", at=caller.at, user=caller.user, team=caller.team,
                 session=caller.session, scope="personal", text=query, agent=caller.agent,
-                refs=tuple(h.id for h in handoffs),
+                refs=tuple(h.id for h in handoffs), repo=caller.repo, conditions=caller.context,
             )
         )
         return handoffs

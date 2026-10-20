@@ -125,6 +125,27 @@ def test_recall_appends_recall_event_with_handed_off_ids():
     assert (recall.user, recall.team, recall.session, recall.at) == ("u1", "t1", "s2", T0)
 
 
+def test_recall_event_records_where_the_question_was_asked():
+    rt = runtime()
+    rt.append(ev("e1", "deploy uses release tags"))
+    asker = Caller(user="u1", team="t1", session="s2", at=T0, repo="acme/api", context={"service": "api"})
+
+    rt.recall("deploy tags", asker, "personal", event_id="r1")
+
+    [recall] = rt.events.get(["r1"])
+    assert (recall.repo, dict(recall.conditions)) == ("acme/api", {"service": "api"})
+
+
+def test_caller_context_is_read_only():
+    context = {"service": "api"}
+    asker = Caller(user="u1", team="t1", session="s1", at=T0, context=context)
+    context["service"] = "web"
+
+    assert asker.context == {"service": "api"}
+    with pytest.raises(TypeError):
+        asker.context["service"] = "web"
+
+
 def test_recall_event_stays_personal_whatever_scope_was_searched():
     rt = runtime()
     rt.append(ev("e1", "deploy uses release tags", scope="org"))

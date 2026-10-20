@@ -43,7 +43,11 @@ class Event:
 
     refs by kind:
       recall               -> ids of the Handoffs given to the agent
-      outcome/human_confirm -> ids of the events or Handoffs being judged
+      outcome/human_confirm -> ids of the events or Handoffs being judged;
+                               must not be empty (Runtime.append refuses it)
+
+    A recall event's repo and conditions are where the question was asked
+    (Caller.repo and Caller.context).
     """
 
     id: str
@@ -69,17 +73,22 @@ class Event:
 
 @dataclass(frozen=True)
 class Caller:
-    """Who is asking. The server fills it from the connection, the harness
-    from the scenario (virtual time)."""
+    """Who is asking, and from where. The server fills it from the connection
+    and its config, the harness from the scenario (virtual time). repo and
+    context let an engine tell where a conditional fact applies; matching
+    them against Event.conditions is the engine's job."""
 
     user: str
     team: str
     session: str
     at: datetime  # timezone-aware
     agent: str | None = None
+    repo: str | None = None  # the repository being worked in
+    context: Mapping[str, str] = field(default_factory=dict)  # e.g. {"service": "api"}; keys as in conditions
 
     def __post_init__(self) -> None:
         _require_tz(self.at, "Caller.at")
+        _freeze(self, "context")
 
 
 @dataclass(frozen=True)

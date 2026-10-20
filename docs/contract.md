@@ -55,7 +55,12 @@ flowchart TB
 
 ### Caller — 지금 부르는 쪽
 
-`user`, `team`, `session`, `at`(timezone 필수), `agent`. 서버는 연결에서, 하니스는 시나리오(가상 시각)에서 채운다. 질의 범위 `scope`는 Caller와 별도 인자로 받는다.
+`user`, `team`, `session`, `at`(timezone 필수), `agent`, `repo`, `context`. 서버는 연결과 설정에서, 하니스는 시나리오(가상 시각)에서 채운다. 질의 범위 `scope`는 Caller와 별도 인자로 받는다.
+
+- `repo`: 지금 작업 중인 저장소. 서버는 프로젝트별 설정 `CORTEX_REPO`를 기본값으로 쓰고, 도구 인자로 덮어쓸 수 있다. 하니스는 문항의 repo.
+- `context`: 질문한 맥락(`{"service": "api"}` 등). 키 규칙은 `conditions`와 같다. 생성 시 읽기 전용으로 고정된다.
+- 조건부 사실(`Event.conditions`)이 이 질문에 해당하는지 판단하는 건 **엔진 몫**이다. 런타임은 `repo`·`context`로 거르지 않는다.
+- recall 이벤트는 `repo`·`conditions`에 질문한 곳(`Caller.repo`, `Caller.context`)을 남긴다.
 
 ### Knowledge — 승격된 항목 하나 (위키 문서 하나)
 
@@ -153,7 +158,7 @@ class Engine(Protocol):
 | kind | refs |
 |---|---|
 | `recall` | 에이전트에게 건넨 Handoff id |
-| `outcome`, `human_confirm` | 판정 대상인 이벤트 또는 Handoff id. **비우지 않는다** |
+| `outcome`, `human_confirm` | 판정 대상인 이벤트 또는 Handoff id. **비면 `Runtime.append`가 `ValueError`로 거부한다.** 가리키는 id가 있는지는 검사하지 않는다(Handoff id는 지식 항목이 아닐 수 있고, 이미 강등됐을 수 있다) |
 | `record` | 이 기록을 쓰기 직전에 건네받은 Handoff id (알면). 에이전트가 받은 걸 다시 말한 건지 구분하는 단서 |
 | `commit` | 비워 둔다 |
 
@@ -207,7 +212,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 ### 3-8. 엔진 상태와 scope 기본값
 
 - 오래 남길 상태는 `ctx.state`에만 둔다. 인스턴스 필드는 캐시로만 쓴다. 서버 프로세스가 여러 개 떠서 같은 저장소를 쓸 수 있기 때문이다.
-- `ctx.state`의 값은 JSON이고, 넣고 꺼낼 때 복사된다. `handoff`에서는 읽기 전용이다.
+- `ctx.state`의 값은 JSON이고, 넣고 꺼낼 때 복사된다. 커밋 전의 값도 마찬가지다(런타임이 JSON 문자열로 들고 있다가 꺼낼 때마다 새로 만든다). `handoff`에서는 읽기 전용이다.
 - 값 하나는 JSON으로 64 KiB까지다(`MAX_STATE_VALUE_BYTES`). 넘으면 `put`이 `ValueError`를 던진다.
 - **권장: 대상 하나당 키 하나.** 상태 전체를 값 하나에 넣으면 이벤트마다 전체를 다시 쓰게 된다. 예시:
   ```
@@ -230,7 +235,8 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 |---|---|---|
 | 에이전트 기록 | `record` | `text`, `agent`, `signal="self"`, `conditions` |
 | recall 요청과 응답 내용 | `recall` | `text`=질의, `refs`=건넨 Handoff id |
-| CI·테스트 결과 | `outcome` | `signal="test"`, `outcome`, `refs`, `repo`, `rev` |
+| CI·테스트 결과 (앞선 기록·항목을 판정) | `outcome` | `signal="test"`, `outcome`, `refs`(필수), `repo`, `rev` |
+| CI·테스트 결과 (단독 증거) | `record` | `signal="test"`, `outcome`, `repo`, `rev` |
 | 사람 확인 | `human_confirm` | `signal="human"`, `outcome`, `refs` |
 | 문서 근거 | `record` | `signal="doc"`, `repo`, `rev` |
 | 대상 코드 커밋(여러 저장소) | `commit` | `repo`, `rev`, `text`=커밋 메시지 |
@@ -297,10 +303,14 @@ class Database(Protocol):                                     # 한 연결 뒤�
 - [x] D6 handoff는 엔진 몫, 범위 필터는 런타임 (§3-5)
 - [x] D7 서버 전송: 최종 HTTP 하나, v0.1은 공용 DB + stdio 가능 (PR #2)
 
-**2차 리뷰에서 제안, 이견 확인 중**
-- [ ] 결정 종류는 Promote·Demote 두 가지 + `why`·`since` (§2)
-- [ ] personal 기록 롤업은 v0.1 제외 (§3-4)
-- [ ] outcome scope 기본값 = 판정 대상 지식의 범위 (§3-8)
+**합의됨 (10/20, 2차 리뷰)**
+- [x] 결정 종류는 Promote·Demote 두 가지 + `why`·`since` (§2)
+- [x] personal 기록 롤업은 v0.1 제외 (§3-4)
+- [x] outcome scope 기본값 = 판정 대상 지식의 범위 (§3-8)
+- [x] 질문 맥락 `Caller.repo`·`context` (§2), outcome·human_confirm의 refs는 append에서 검사 (§3-2)
+
+**나중에 논의**
+- [ ] 레포 이름 (`mcp-server`가 core까지 담고 있음)
 
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
@@ -354,7 +364,8 @@ class ExternalMemoryAdapter:
 - 이벤트는 런타임이 커서로 정확히 한 번 전달. 시작 시 전체 재생 없음
 - 누출 검사는 런타임 두 곳: 결정 검증 + handoff 필터
 - scope: personal < team < org. personal 기록은 팀 지식의 근거가 될 수 없음
-- Event에 team 추가, conditions는 읽기 전용, Caller(user, team, session, at, agent) 도입
+- Event에 team 추가, conditions는 읽기 전용, Caller(user, team, session, at, agent, repo, context) 도입
+- outcome·human_confirm은 refs(판정 대상 id) 없으면 append 거부
 - 하니스는 같은 Runtime + InMemoryDatabase로 실행, handoff로 채점. 결정 기록(verdicts)은 관찰 지표
 - 저장소 공통 테스트(cortex_mem.testing): PG 구현도 이걸 상속해 통과하면 계약 준수
 ```
