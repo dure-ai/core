@@ -252,7 +252,8 @@ class SqliteKnowledgeBase:
         return [found[i] for i in ids if i in found]
 
     def all(self) -> list[Knowledge]:
-        return [_row_to_knowledge(row) for row in self.db.query(f"SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge ORDER BY id")]
+        rows = self.db.query(f"SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge ORDER BY id")
+        return [_row_to_knowledge(row) for row in rows]
 
     def search(
         self, query: str, caller: Caller, scope: Scope, k: int = 20
