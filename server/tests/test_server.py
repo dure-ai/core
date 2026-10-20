@@ -14,8 +14,8 @@ from cortex_mem.store.sqlite import SqliteDatabase
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
-def service(db, user="u1", team="t1", session="s1", policy=ScopePolicy(), engine="promote_all"):
-    return Service(db, engine, user=user, team=team, session=session, policy=policy, clock=lambda: T0)
+def service(db, user="u1", team="t1", session="s1", policy=ScopePolicy(), engine="promote_all", repo=None):
+    return Service(db, engine, user=user, team=team, session=session, repo=repo, policy=policy, clock=lambda: T0)
 
 
 # ── scope policy ────────────────────────────────────────────────────────────
@@ -119,6 +119,37 @@ def test_outcome_scope_can_be_narrowed_and_falls_back_to_policy():
     assert m.report_outcome("failure", ["not-knowledge"], repo="acme/api")["scope"] == "team"
 
 
+def test_configured_repo_applies_scope_policy_without_the_agent_passing_it():
+    db = SqliteDatabase()
+    m = service(db, policy=ScopePolicy.parse("personal", "acme/*=team"), repo="acme/api")
+
+    recorded = m.record("deploy needs approval")
+    elsewhere = m.record("my dotfiles use zsh", repo="me/dotfiles")
+
+    assert recorded["scope"] == "team" and elsewhere["scope"] == "personal"
+    assert [e.repo for e in db.events.get([recorded["id"], elsewhere["id"]])] == ["acme/api", "me/dotfiles"]
+
+
+def test_recall_passes_where_the_question_was_asked():
+    db = SqliteDatabase()
+    m = service(db, repo="acme/api")
+    m.record("deploy uses release tags")
+
+    m.recall("deploy tags", context={"service": "billing"})
+    m.recall("deploy tags", repo="acme/web")
+
+    first, second = [e for _, e in db.events.since(0) if e.kind == "recall"]
+    assert (first.repo, dict(first.conditions)) == ("acme/api", {"service": "billing"})
+    assert (second.repo, dict(second.conditions)) == ("acme/web", {})
+
+
+def test_outcome_without_refs_is_refused():
+    m = service(SqliteDatabase())
+
+    with pytest.raises(ValueError, match="needs refs"):
+        m.report_outcome("failure", [])
+
+
 def test_session_started_earlier_sees_later_record(tmp_path):
     """The PR #2 review bug: B started before A recorded, and still finds it."""
     path = tmp_path / "cortex.db"
@@ -197,7 +228,7 @@ def test_each_call_lets_time_pass_for_the_engine():
 # ── stdio ───────────────────────────────────────────────────────────────────
 
 
-def call(db, tool, args, user="u1"):
+def call(db, tool, args, user="u1", raw=False):
     async def run():
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "cortex_mem_server.server"],
@@ -206,7 +237,7 @@ def call(db, tool, args, user="u1"):
         async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool, args)
-            return json.loads(result.content[0].text)
+            return result if raw else json.loads(result.content[0].text)
 
     return anyio.run(run)
 
@@ -219,3 +250,9 @@ def test_stdio_session_b_recalls_what_session_a_recorded(tmp_path):
     hits = call(db, "recall", {"query": "cloud sql proxy"})["memories"]
 
     assert [h["content"] for h in hits] == ["cloud sql needs the auth proxy"]
+
+
+def test_stdio_outcome_without_refs_tells_the_agent_why(tmp_path):
+    result = call(tmp_path / "cortex.db", "report_outcome", {"outcome": "failure", "refs": []}, raw=True)
+
+    assert result.is_error and "needs refs" in result.content[0].text

@@ -29,6 +29,16 @@ uv run pytest
 claude mcp add cortex-mem -- uv run --directory /path/to/mcp-server cortex-mem-server
 ```
 
+작업하는 저장소마다 `CORTEX_REPO`를 주려면, 그 저장소에서 local 범위로 등록한다(local 범위는 그 프로젝트에서만 쓰인다).
+
+```bash
+cd ~/work/api
+claude mcp add cortex-mem -s local -e CORTEX_REPO=acme/api -e CORTEX_TEAM=payments \
+  -- uv run --directory /path/to/mcp-server cortex-mem-server
+```
+
+서버는 `uv run --directory`로 mcp-server 폴더에서 돌기 때문에, 작업 디렉터리로는 에이전트가 어느 저장소에 있는지 알 수 없다. 그래서 저장소는 설정으로 준다.
+
 도구: `record_episode`(기록), `recall`(불러오기), `report_outcome`(불러온 기억이 도움됐는지 보고). 서버 프로세스 하나가 세션 하나이고, 프로세스들은 SQLite 파일 하나를 함께 쓴다. 런타임이 이벤트를 엔진에 정확히 한 번 전달하므로, 먼저 떠 있던 세션도 다른 세션의 기록을 본다.
 
 | 환경변수 | 기본값 | |
@@ -37,8 +47,9 @@ claude mcp add cortex-mem -- uv run --directory /path/to/mcp-server cortex-mem-s
 | `CORTEX_USER` | OS 사용자 | 기록자 |
 | `CORTEX_TEAM` | `default` | 기록자의 팀 |
 | `CORTEX_AGENT` | 없음 | 클라이언트 이름(예: `claude-code`) |
+| `CORTEX_REPO` | 없음 | 이 프로젝트의 저장소(예: `acme/api`). 기록·불러오기·결과 보고의 기본 `repo`가 되고, 저장소별 공개 범위가 여기에 적용된다. 도구 인자 `repo`로 덮어쓸 수 있다 |
 | `CORTEX_ENGINE` | `promote_all` | `promote_all` \| `no_memory` \| `모듈:팩토리` |
 | `CORTEX_RECORD_SCOPE` | `personal` | 기록의 기본 공개 범위 |
 | `CORTEX_REPO_SCOPES` | 없음 | 저장소별 기본 범위. `acme/*=team,acme/handbook=org`처럼 쉼표로 구분, 먼저 맞는 것이 적용 |
 
-공개 범위는 에이전트가 아니라 서버 설정이 정한다. 에이전트는 `scope`로 기본값보다 좁히는 것만 할 수 있고(예: 팀 저장소에서 `personal` 메모), 넓히려 하면 기본값이 쓰인다. `recall`은 기본으로 볼 수 있는 범위 전체(본인·팀·조직)를 찾는다. `report_outcome`은 기본으로 판정 대상 지식을 볼 수 있는 범위에 남는다(팀 지식에 대한 실패 보고는 팀에 보여야 강등 근거가 된다). 대상이 지식 항목이 아니면 저장소 설정을 따른다.
+공개 범위는 에이전트가 아니라 서버 설정이 정한다. 에이전트는 `scope`로 기본값보다 좁히는 것만 할 수 있고(예: 팀 저장소에서 `personal` 메모), 넓히려 하면 기본값이 쓰인다. `recall`은 기본으로 볼 수 있는 범위 전체(본인·팀·조직)를 찾고, `repo`·`context`(예: `{"service": "api"}`)로 질문한 곳을 엔진에 알린다. `report_outcome`은 기본으로 판정 대상 지식을 볼 수 있는 범위에 남는다(팀 지식에 대한 실패 보고는 팀에 보여야 강등 근거가 된다). 대상이 지식 항목이 아니면 저장소 설정을 따른다.

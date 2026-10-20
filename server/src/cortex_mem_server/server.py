@@ -7,6 +7,9 @@ Environment variables (all optional):
     CORTEX_USER          who is recording               (default: OS user)
     CORTEX_TEAM          the user's team                (default: default)
     CORTEX_AGENT         client name, e.g. claude-code  (default: unset)
+    CORTEX_REPO          repository this project works in, e.g. acme/api (default: unset);
+                         set it per project (.mcp.json) so scope policy and engines know
+                         where work happens without the agent passing repo
     CORTEX_ENGINE        promote_all | no_memory | module:factory   (default: promote_all)
     CORTEX_RECORD_SCOPE  default scope of what is recorded          (default: personal)
     CORTEX_REPO_SCOPES   per-repo defaults, comma-separated fnmatch pattern=scope,
@@ -19,7 +22,7 @@ Processes share the SQLite file; the runtime delivers each event once.
 import getpass
 import importlib
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
@@ -28,6 +31,7 @@ from typing import get_args
 from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from cortex_mem.access import knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
@@ -106,17 +110,22 @@ class Service:
         team: str,
         session: str,
         agent: str | None = None,
+        repo: str | None = None,
         policy: ScopePolicy = ScopePolicy(),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         name, built = load_engine(engine)
         self.runtime = Runtime(built, db.events, db.knowledge, db.state(name), transaction=db.transaction)
         self.user, self.team, self.session, self.agent = user, team, session, agent
+        self.repo = repo  # default for every call; a tool argument overrides it
         self.policy = policy
         self.clock = clock
 
-    def _caller(self) -> Caller:
-        caller = Caller(user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent)
+    def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
+        caller = Caller(
+            user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent,
+            repo=repo or self.repo, context=context or {},
+        )
         self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
         return caller
 
@@ -135,16 +144,23 @@ class Service:
         repo: str | None = None,
         rev: str | None = None,
     ) -> dict:
-        caller = self._caller()
-        effective = self.policy.resolve(scope, repo)
+        caller = self._caller(repo)
+        effective = self.policy.resolve(scope, caller.repo)
         id = self._append(
             caller, kind="record", scope=effective, text=text, signal="self",
-            conditions=conditions or {}, refs=tuple(refs), repo=repo, rev=rev,
+            conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
         return {"id": id, "scope": effective}
 
-    def recall(self, query: str, scope: Scope = "org", k: int = 6) -> list[dict]:
-        caller = self._caller()
+    def recall(
+        self,
+        query: str,
+        scope: Scope = "org",
+        k: int = 6,
+        repo: str | None = None,
+        context: Mapping[str, str] | None = None,
+    ) -> list[dict]:
+        caller = self._caller(repo, context)
         handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
@@ -160,21 +176,21 @@ class Service:
         scope: Scope | None = None,
         repo: str | None = None,
     ) -> dict:
-        caller = self._caller()
-        effective = _narrow(scope, self._outcome_default(caller, refs, repo))
+        caller = self._caller(repo)
+        effective = _narrow(scope, self._outcome_default(caller, refs))
         id = self._append(
             caller, kind="outcome", scope=effective, text=text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=repo,
+            signal=signal, refs=tuple(refs), repo=caller.repo,
         )
         return {"id": id, "scope": effective}
 
-    def _outcome_default(self, caller: Caller, refs: Sequence[str], repo: str | None) -> Scope:
+    def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
         seen by the widest audience of the judged knowledge the caller can see.
         A team item can only be demoted by evidence the team sees."""
         judged = [k for k in self.runtime.knowledge.get(refs) if knowledge_visible(k, caller, "org")]
         if not judged:
-            return self.policy.default_for(repo)
+            return self.policy.default_for(caller.repo)
         return max((k.scope for k in judged), key=_WIDTH.__getitem__)
 
 
@@ -194,6 +210,7 @@ def get_service() -> Service:
             team=os.environ.get("CORTEX_TEAM", "default"),
             session=uuid4().hex,
             agent=os.environ.get("CORTEX_AGENT"),
+            repo=os.environ.get("CORTEX_REPO") or None,
             policy=ScopePolicy.parse(
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
@@ -214,18 +231,27 @@ def record_episode(
     future sessions can recall it. Who may see it is set by the server for the
     repo; scope can only narrow that (e.g. "personal" for a private note).
     conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
-    memories this builds on. repo/rev: where the evidence is (repo, commit).
+    memories this builds on. repo/rev: where the evidence is (repo, commit);
+    repo defaults to the project's configured repo.
     Returns the id and the scope actually used."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 
 @mcp.tool()
-def recall(query: str, scope: Scope = "org", k: int = 6) -> dict:
+def recall(
+    query: str,
+    scope: Scope = "org",
+    k: int = 6,
+    repo: str | None = None,
+    context: dict[str, str] | None = None,
+) -> dict:
     """Recall memories relevant to the current task. Call before starting work
     that past sessions may have covered. By default searches everything you may
-    see (your own, your team's, the org's); scope narrows it. Returns up to k
-    memories, best first."""
-    return {"memories": get_service().recall(query, scope, k)}
+    see (your own, your team's, the org's); scope narrows it. repo and context
+    say where you are working (e.g. context={"service": "api"}), so facts that
+    hold only elsewhere can be left out; repo defaults to the project's
+    configured repo. Returns up to k memories, best first."""
+    return {"memories": get_service().recall(query, scope, k, repo, context)}
 
 
 @mcp.tool()
@@ -237,12 +263,15 @@ def report_outcome(
     scope: Scope | None = None,
     repo: str | None = None,
 ) -> dict:
-    """Report whether recalled memories (refs = their ids) helped: "success",
-    "failure", or "unknown". signal says who judged it: "self", "test",
+    """Report whether recalled memories (refs = their ids, at least one) helped:
+    "success", "failure", or "unknown". signal says who judged it: "self", "test",
     "review", "human", or "doc". This is how memories earn or lose trust.
     By default the report is visible to whoever can see the judged memories;
     scope can only narrow that. Returns the id and the scope actually used."""
-    return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+    try:
+        return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+    except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
+        raise ToolError(str(exc)) from exc
 
 
 def main() -> None:
