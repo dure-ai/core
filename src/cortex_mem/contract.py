@@ -1,23 +1,38 @@
 """Engine port contract v0.1.
 
 Everything the MCP server, the evaluation harness, and every engine share.
-The engine is the only swappable part; the harness sees engines only through
-these types. Rules that are not expressible in types (call order, id and scope
-semantics) are documented in docs/contract.md and are part of the contract.
+The engine is the only swappable part. It reads the fixed stores through
+EngineContext and returns decisions; the runtime (runtime.py) validates them
+and writes the knowledge base. Rules that are not expressible in types (call
+order, id and scope semantics) are documented in docs/contract.md and are
+part of the contract.
 """
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Literal, Protocol, runtime_checkable
 
 CONTRACT_VERSION = "0.1.0"
 
 Kind = Literal["record", "recall", "outcome", "human_confirm", "commit"]
 Signal = Literal["self", "test", "review", "human"]
 Outcome = Literal["success", "failure", "unknown"]
-Scope = Literal["personal", "team"]
+Scope = Literal["personal", "team", "org"]
 Status = Literal["memory", "knowledge", "invalidated"]
+KnowledgeKind = Literal["knowledge", "skill"]
+
+
+def _freeze(obj: object, name: str) -> None:
+    """Replace a mapping field with a read-only copy, so a value handed to an
+    engine can never change what a store holds."""
+    object.__setattr__(obj, name, MappingProxyType(dict(getattr(obj, name))))
+
+
+def _require_tz(at: datetime, what: str) -> None:
+    if at.tzinfo is None:
+        raise ValueError(f"{what} must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -34,6 +49,7 @@ class Event:
     kind: Kind
     at: datetime  # timezone-aware
     user: str
+    team: str
     session: str
     scope: Scope
     text: str = ""
@@ -46,16 +62,59 @@ class Event:
     rev: str | None = None
 
     def __post_init__(self) -> None:
-        if self.at.tzinfo is None:
-            raise ValueError(f"Event.at must be timezone-aware: {self.id}")
+        _require_tz(self.at, f"Event.at ({self.id})")
+        _freeze(self, "conditions")
 
 
 @dataclass(frozen=True)
-class QueryContext:
+class Caller:
+    """Who is asking. The server fills it from the connection, the harness
+    from the scenario (virtual time)."""
+
     user: str
+    team: str
     session: str
+    at: datetime  # timezone-aware
+    agent: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_tz(self.at, "Caller.at")
+
+
+@dataclass(frozen=True)
+class Knowledge:
+    """One promoted item: a page in the knowledge base (the Git wiki)."""
+
+    id: str  # chosen by the engine, stable: it is the wiki path
+    kind: KnowledgeKind
+    title: str
+    body: str  # markdown
     scope: Scope
+    owner: str  # personal: user id, team: team id, org: "*" (one org in v0.1)
+    sources: tuple[str, ...]  # event ids; must not be empty
     conditions: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _freeze(self, "conditions")
+
+
+@dataclass(frozen=True)
+class Promote:
+    """Create the item, or replace the item with the same id."""
+
+    item: Knowledge
+
+
+@dataclass(frozen=True)
+class Demote:
+    """Remove an item from the knowledge base."""
+
+    id: str
+    reason: str
+    sources: tuple[str, ...]  # event ids that justify it, e.g. failure outcomes
+
+
+Decision = Promote | Demote
 
 
 @dataclass(frozen=True)
@@ -64,14 +123,17 @@ class Handoff:
 
     id: str  # stable across calls; recall events carry it in refs
     content: str
-    sources: tuple[str, ...]  # event ids, resolvable via EpisodeReader.get
+    sources: tuple[str, ...]  # event ids; the runtime drops items whose sources the caller cannot see
     status: Status | None = None  # shown to the agent, never used for scoring
     conditions: Mapping[str, str] = field(default_factory=dict)
     confidence: float | None = None  # 0..1, enables Brier scoring
 
+    def __post_init__(self) -> None:
+        _freeze(self, "conditions")
 
-class EpisodeReader(Protocol):
-    """Read-only view of the store. This is what engines receive."""
+
+class EventReader(Protocol):
+    """Read-only view of the event log."""
 
     def get(self, ids: Collection[str]) -> list[Event]:
         """Events for the given ids, in the order given; unknown ids are skipped."""
@@ -80,43 +142,79 @@ class EpisodeReader(Protocol):
     def search(
         self,
         query: str,
-        ctx: QueryContext,
+        caller: Caller,
+        scope: Scope,
         k: int = 20,
         kinds: Collection[Kind] | None = None,
     ) -> list[tuple[Event, float]]:
-        """Up to k events visible under ctx, best first (higher score = better).
-
-        personal: only ctx.user's events.
-        team: ctx.user's events plus every user's team-scoped events.
-        """
+        """Up to k events visible to caller under scope, best first (higher score = better).
+        Visibility is access.event_visible."""
         ...
 
 
-class EpisodeStore(EpisodeReader, Protocol):
-    """Append-only store (fixed part, not swapped per engine)."""
+class KnowledgeReader(Protocol):
+    """Read-only view of the knowledge base as it stands now."""
 
-    def append(self, event: Event) -> str:
-        """Persist the event and return its id. Raises ValueError on a duplicate id."""
+    def get(self, ids: Collection[str]) -> list[Knowledge]:
+        """Items for the given ids, in the order given; unknown ids are skipped."""
         ...
+
+    def all(self) -> list[Knowledge]:
+        """Every item, ordered by id."""
+        ...
+
+    def search(
+        self, query: str, caller: Caller, scope: Scope, k: int = 20
+    ) -> list[tuple[Knowledge, float]]:
+        """Up to k items visible to caller under scope, best first.
+        Visibility is access.knowledge_visible."""
+        ...
+
+
+class StateStore(Protocol):
+    """The engine's own persistent key-value store. Values are JSON
+    (dict, list, str, int, float, bool, None) and are copied on the way in
+    and out. Writes made during observe or tick become durable only if the
+    call returns; in handoff the store is read-only."""
+
+    def get(self, key: str) -> Any | None: ...
+
+    def put(self, key: str, value: Any) -> None: ...
+
+    def delete(self, key: str) -> None: ...
+
+    def scan(self, prefix: str = "") -> Iterator[tuple[str, Any]]:
+        """Keys starting with prefix, in key order."""
+        ...
+
+
+@dataclass(frozen=True)
+class EngineContext:
+    """What the fixed part hands an engine on every call."""
+
+    events: EventReader
+    knowledge: KnowledgeReader
+    state: StateStore
 
 
 @runtime_checkable
 class Engine(Protocol):
-    """The engine port. observe() is always called after the event was appended."""
+    """The engine port. Keep durable state in ctx.state, not on the instance:
+    several server processes may run the same engine against the same stores."""
 
-    def observe(self, event: Event) -> None: ...
+    def observe(self, event: Event, ctx: EngineContext) -> Sequence[Decision]:
+        """Called once per event, in append order, after the event was appended."""
+        ...
 
-    def handoff(self, query: str, ctx: QueryContext, k: int = 6) -> list[Handoff]:
+    def tick(self, now: datetime, ctx: EngineContext) -> Sequence[Decision]:
+        """Time passed. Expire, demote or clean up what depends on time."""
+        ...
+
+    def handoff(
+        self, query: str, caller: Caller, scope: Scope, ctx: EngineContext, k: int = 6
+    ) -> list[Handoff]:
         """At most k items, best first. Same event sequence => same result."""
         ...
 
 
-@runtime_checkable
-class KnowledgeSnapshot(Protocol):
-    """Optional adapter: what the engine would hand off as of `at`, for
-    deterministic list-level scoring. Called after observing every event up to `at`."""
-
-    def snapshot(self, at: datetime) -> list[Handoff]: ...
-
-
-EngineFactory = Callable[[EpisodeReader], Engine]
+EngineFactory = Callable[[Mapping[str, str]], Engine]  # engine config only; stores come through ctx

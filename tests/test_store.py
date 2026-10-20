@@ -1,28 +1,48 @@
-"""EpisodeStore conformance. A new store implementation (e.g. PostgreSQL)
-passes the contract when it passes these tests: add its factory to STORES."""
+"""Store conformance. A new store implementation (e.g. PostgreSQL) passes the
+contract when it passes these tests: add its factory to the matching list."""
 
 from datetime import datetime, timezone
 
 import pytest
 
-from cortex_mem.contract import Event, QueryContext
-from cortex_mem.store.memory import InMemoryEpisodeStore
+from cortex_mem.contract import Caller, Event, Knowledge
+from cortex_mem.store.base import CursorConflict
+from cortex_mem.store.memory import InMemoryEventStore, InMemoryKnowledgeBase, InMemoryStateBackend
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
-STORES = [InMemoryEpisodeStore]
+EVENT_STORES = [InMemoryEventStore]
+KNOWLEDGE_STORES = [InMemoryKnowledgeBase]
+STATE_BACKENDS = [InMemoryStateBackend]
 
 
-@pytest.fixture(params=STORES, ids=lambda f: f.__name__)
+@pytest.fixture(params=EVENT_STORES, ids=lambda f: f.__name__)
 def store(request):
     return request.param()
 
 
-def ev(id, text="", kind="record", user="u1", scope="personal"):
-    return Event(id=id, kind=kind, at=T0, user=user, session="s1", scope=scope, text=text)
+@pytest.fixture(params=KNOWLEDGE_STORES, ids=lambda f: f.__name__)
+def kb(request):
+    return request.param()
 
 
-def ctx(user="u1", scope="personal"):
-    return QueryContext(user=user, session="s2", scope=scope)
+@pytest.fixture(params=STATE_BACKENDS, ids=lambda f: f.__name__)
+def state(request):
+    return request.param()
+
+
+def ev(id, text="", kind="record", user="u1", team="t1", scope="personal"):
+    return Event(id=id, kind=kind, at=T0, user=user, team=team, session="s1", scope=scope, text=text)
+
+
+def caller(user="u1", team="t1"):
+    return Caller(user=user, team=team, session="s2", at=T0)
+
+
+def item(id, body="deploy uses tags", scope="team", owner="t1"):
+    return Knowledge(id=id, kind="knowledge", title=id, body=body, scope=scope, owner=owner, sources=("e1",))
+
+
+# ── EventStore ──────────────────────────────────────────────────────────────
 
 
 def test_append_returns_event_id(store):
@@ -44,7 +64,7 @@ def test_get_keeps_requested_order_and_skips_unknown(store):
 
 def test_get_round_trips_every_field(store):
     original = Event(
-        id="e1", kind="outcome", at=T0, user="u1", session="s1", scope="team",
+        id="e1", kind="outcome", at=T0, user="u1", team="t1", session="s1", scope="team",
         text="ci passed", agent="claude-code", signal="test", outcome="success",
         conditions={"service": "a"}, refs=("h1", "h2"), repo="org/repo", rev="abc123",
     )
@@ -53,18 +73,29 @@ def test_get_round_trips_every_field(store):
     assert store.get(["e1"]) == [original]
 
 
+def test_since_returns_append_order_with_growing_positions(store):
+    for id in ["b", "a", "c"]:
+        store.append(ev(id, "x"))
+
+    everything = list(store.since(0))
+    assert [e.id for _, e in everything] == ["b", "a", "c"]
+    positions = [seq for seq, _ in everything]
+    assert positions == sorted(positions) and positions[0] >= 1
+    assert [e.id for _, e in store.since(positions[1])] == ["c"]
+
+
 def test_search_ranks_better_match_first(store):
     store.append(ev("weak", "deploy"))
     store.append(ev("strong", "deploy uses release tags"))
 
-    assert [e.id for e, _ in store.search("deploy release tags", ctx())] == ["strong", "weak"]
+    assert [e.id for e, _ in store.search("deploy release tags", caller(), "personal")] == ["strong", "weak"]
 
 
 def test_search_scores_are_descending(store):
     for i, text in enumerate(["deploy", "deploy tags", "deploy release tags"]):
         store.append(ev(f"e{i}", text))
 
-    scores = [s for _, s in store.search("deploy release tags", ctx())]
+    scores = [s for _, s in store.search("deploy release tags", caller(), "personal")]
     assert scores == sorted(scores, reverse=True)
 
 
@@ -72,23 +103,118 @@ def test_search_respects_k(store):
     for i in range(5):
         store.append(ev(f"e{i}", "deploy tags"))
 
-    assert len(store.search("deploy tags", ctx(), k=2)) == 2
+    assert len(store.search("deploy tags", caller(), "personal", k=2)) == 2
 
 
 def test_search_filters_by_kind(store):
     store.append(ev("rec", "cloud sql proxy"))
     store.append(ev("rcl", "cloud sql proxy", kind="recall"))
 
-    assert [e.id for e, _ in store.search("cloud sql", ctx(), kinds={"record"})] == ["rec"]
+    assert [e.id for e, _ in store.search("cloud sql", caller(), "personal", kinds={"record"})] == ["rec"]
 
 
-def test_personal_scope_hides_other_users_events(store):
-    store.append(ev("mine", "deploy uses tags", user="u1", scope="team"))
-    store.append(ev("theirs_team", "deploy uses tags", user="u2", scope="team"))
-    store.append(ev("theirs_personal", "deploy uses tags", user="u2", scope="personal"))
+def test_search_scope_widens_personal_team_org(store):
+    store.append(ev("mine", "deploy uses tags", user="u1", scope="personal"))
+    store.append(ev("team_mate", "deploy uses tags", user="u2", scope="team"))
+    store.append(ev("team_mate_personal", "deploy uses tags", user="u2", scope="personal"))
+    store.append(ev("other_team", "deploy uses tags", user="u3", team="t2", scope="team"))
+    store.append(ev("org_wide", "deploy uses tags", user="u3", team="t2", scope="org"))
 
-    personal = {e.id for e, _ in store.search("deploy tags", ctx(scope="personal"))}
-    team = {e.id for e, _ in store.search("deploy tags", ctx(scope="team"))}
+    def ids(scope):
+        return {e.id for e, _ in store.search("deploy tags", caller(), scope)}
 
-    assert personal == {"mine"}
-    assert team == {"mine", "theirs_team"}
+    assert ids("personal") == {"mine"}
+    assert ids("team") == {"mine", "team_mate"}
+    assert ids("org") == {"mine", "team_mate", "org_wide"}
+
+
+# ── KnowledgeStore ──────────────────────────────────────────────────────────
+
+
+def test_knowledge_put_replaces_same_id(kb):
+    kb.put(item("k1", "old"))
+    kb.put(item("k1", "new"))
+
+    assert [i.body for i in kb.get(["k1"])] == ["new"]
+
+
+def test_knowledge_remove_and_unknown_ids(kb):
+    kb.put(item("k1"))
+    kb.remove("k1")
+    kb.remove("missing")
+
+    assert kb.get(["k1"]) == []
+    assert kb.all() == []
+
+
+def test_knowledge_all_is_ordered_by_id(kb):
+    for id in ["b", "c", "a"]:
+        kb.put(item(id))
+
+    assert [i.id for i in kb.all()] == ["a", "b", "c"]
+
+
+def test_knowledge_round_trips_every_field(kb):
+    original = Knowledge(
+        id="deploy/tags", kind="skill", title="Deploy", body="1. tag\n2. push", scope="personal",
+        owner="u1", sources=("e1", "e2"), conditions={"service": "api"},
+    )
+    kb.put(original)
+
+    assert kb.get(["deploy/tags"]) == [original]
+
+
+def test_knowledge_search_respects_scope(kb):
+    kb.put(item("mine", scope="personal", owner="u1"))
+    kb.put(item("someone_else", scope="personal", owner="u2"))
+    kb.put(item("my_team", scope="team", owner="t1"))
+    kb.put(item("other_team", scope="team", owner="t2"))
+    kb.put(item("org_wide", scope="org", owner="*"))
+
+    def ids(scope):
+        return {i.id for i, _ in kb.search("deploy tags", caller(), scope)}
+
+    assert ids("personal") == {"mine"}
+    assert ids("team") == {"mine", "my_team"}
+    assert ids("org") == {"mine", "my_team", "org_wide"}
+
+
+# ── EngineStateBackend ──────────────────────────────────────────────────────
+
+
+def test_state_commit_applies_writes_deletes_and_cursor(state):
+    state.commit(0, 3, {"a": 1, "b": {"x": [1, 2]}}, set())
+    state.commit(3, 5, {"c": "z"}, {"a"})
+
+    assert state.cursor() == 5
+    assert state.get("a") is None
+    assert state.get("b") == {"x": [1, 2]}
+    assert list(state.scan()) == [("b", {"x": [1, 2]}), ("c", "z")]
+
+
+def test_state_commit_rejects_stale_cursor(state):
+    state.commit(0, 1, {"a": 1}, set())
+
+    with pytest.raises(CursorConflict):
+        state.commit(0, 2, {"a": 2}, set())
+    assert state.get("a") == 1 and state.cursor() == 1
+
+
+def test_state_values_are_copied(state):
+    value = {"n": [1]}
+    state.commit(0, 0, {"k": value}, set())
+    value["n"].append(2)
+    state.get("k")["n"].append(3)
+
+    assert state.get("k") == {"n": [1]}
+
+
+def test_state_scan_filters_by_prefix(state):
+    state.commit(0, 0, {"cand/a": 1, "cand/b": 2, "seen/a": 3}, set())
+
+    assert [k for k, _ in state.scan("cand/")] == ["cand/a", "cand/b"]
+
+
+def test_state_rejects_non_json_values(state):
+    with pytest.raises(TypeError):
+        state.commit(0, 0, {"k": object()}, set())
