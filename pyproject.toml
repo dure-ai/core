@@ -3,9 +3,14 @@ name = "cortex-mem"
 version = "0.1.0"
 description = "Engine port contract and runtime for cortex-mem, an agent memory engine that promotes memories to knowledge on evidence."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
 license = { text = "Apache-2.0" }
 authors = [{ name = "The cortex-mem authors" }]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = []
 
 [dependency-groups]
@@ -26,3 +31,10 @@ cortex-mem-server = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "server/tests"]
+
+# Check against the lowest supported Python so newer-only syntax is caught.
+[tool.ruff]
+target-version = "py312"
+
+[tool.pyright]
+pythonVersion = "3.12"
