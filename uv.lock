@@ -6,6 +6,12 @@ resolution-markers = [
     "python_full_version < '3.14'",
 ]
 
+[manifest]
+members = [
+    "cortex-mem",
+    "cortex-mem-server",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
@@ -141,23 +147,38 @@ wheels = [
 ]
 
 [[package]]
-name = "cortex-mem-mcp"
+name = "cortex-mem"
 version = "0.1.0"
 source = { editable = "." }
-dependencies = [
-    { name = "mcp" },
-]
 
 [package.dev-dependencies]
 dev = [
+    { name = "cortex-mem-server" },
     { name = "pytest" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=1.2" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "cortex-mem-server", editable = "server" },
+    { name = "pytest", specifier = ">=8" },
+]
+
+[[package]]
+name = "cortex-mem-server"
+version = "0.1.0"
+source = { editable = "server" }
+dependencies = [
+    { name = "cortex-mem" },
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cortex-mem", editable = "." },
+    { name = "mcp", specifier = ">=2.3" },
+]
 
 [[package]]
 name = "cryptography"

@@ -1,0 +1,237 @@
+"""cortex-mem MCP server (stdio). Turns tool calls into runtime calls:
+tool arguments -> Caller + scope policy -> Runtime. Storage, delivery and
+checks live in the runtime and the stores; the engine is picked by config.
+
+Environment variables (all optional):
+    CORTEX_DB_PATH       SQLite file                    (default: ~/.cortex-mem/cortex.db)
+    CORTEX_USER          who is recording               (default: OS user)
+    CORTEX_TEAM          the user's team                (default: default)
+    CORTEX_AGENT         client name, e.g. claude-code  (default: unset)
+    CORTEX_ENGINE        promote_all | no_memory | module:factory   (default: promote_all)
+    CORTEX_RECORD_SCOPE  default scope of what is recorded          (default: personal)
+    CORTEX_REPO_SCOPES   per-repo defaults, comma-separated fnmatch pattern=scope,
+                         e.g. "acme/*=team,acme/handbook=org"
+
+One server process is one session: Claude Code starts a process per session.
+Processes share the SQLite file; the runtime delivers each event once.
+"""
+
+import getpass
+import importlib
+import os
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from fnmatch import fnmatchcase
+from pathlib import Path
+from typing import get_args
+from uuid import uuid4
+
+from mcp.server.mcpserver import MCPServer
+
+from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
+from cortex_mem.runtime import Runtime
+
+from .sqlite import SqliteDatabase
+
+ENGINE_ALIASES = {
+    "promote_all": "cortex_mem.engines.baseline:PromoteAllEngine",
+    "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
+}
+_WIDTH = {"personal": 0, "team": 1, "org": 2}
+
+
+def _scope(value: str) -> Scope:
+    if value not in get_args(Scope):
+        raise ValueError(f"unknown scope: {value!r}")
+    return value  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class ScopePolicy:
+    """Who sees a record is decided by the deployment, not by the agent: the
+    agent may narrow the default but never widen it."""
+
+    default: Scope = "personal"
+    repos: tuple[tuple[str, Scope], ...] = ()  # (fnmatch pattern, scope), first match wins
+
+    @classmethod
+    def parse(cls, default: str = "personal", repos: str = "") -> "ScopePolicy":
+        pairs = []
+        for entry in filter(None, (part.strip() for part in repos.split(","))):
+            pattern, _, scope = entry.rpartition("=")
+            if not pattern:
+                raise ValueError(f"expected pattern=scope, got {entry!r}")
+            pairs.append((pattern, _scope(scope)))
+        return cls(_scope(default), tuple(pairs))
+
+    def default_for(self, repo: str | None) -> Scope:
+        if repo:
+            for pattern, scope in self.repos:
+                if fnmatchcase(repo, pattern):
+                    return scope
+        return self.default
+
+    def resolve(self, requested: Scope | None, repo: str | None) -> Scope:
+        default = self.default_for(repo)
+        if requested is None or _WIDTH[requested] > _WIDTH[default]:
+            return default
+        return requested
+
+
+def load_engine(spec: str) -> tuple[str, Engine]:
+    """Resolve an alias or module:factory and build the engine. Returns the
+    resolved path too: it names the engine's state, whichever way it was given."""
+    path = ENGINE_ALIASES.get(spec, spec)
+    module, _, attr = path.partition(":")
+    if not attr:
+        raise ValueError(f"CORTEX_ENGINE must be an alias or module:factory, got {spec!r}")
+    factory = getattr(importlib.import_module(module), attr)
+    return path, factory({})
+
+
+class Service:
+    """The server's logic without the MCP transport."""
+
+    def __init__(
+        self,
+        db: SqliteDatabase,
+        engine: str,
+        user: str,
+        team: str,
+        session: str,
+        agent: str | None = None,
+        policy: ScopePolicy = ScopePolicy(),
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        name, built = load_engine(engine)
+        self.runtime = Runtime(built, db.events, db.knowledge, db.state(name), transaction=db.transaction)
+        self.user, self.team, self.session, self.agent = user, team, session, agent
+        self.policy = policy
+        self.clock = clock
+
+    def _caller(self) -> Caller:
+        caller = Caller(user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent)
+        self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
+        return caller
+
+    def _append(self, caller: Caller, **fields) -> str:
+        return self.runtime.append(
+            Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
+                  session=caller.session, agent=caller.agent, **fields)
+        )
+
+    def record(
+        self,
+        text: str,
+        scope: Scope | None = None,
+        conditions: dict[str, str] | None = None,
+        refs: Sequence[str] = (),
+        repo: str | None = None,
+        rev: str | None = None,
+    ) -> dict:
+        caller = self._caller()
+        effective = self.policy.resolve(scope, repo)
+        id = self._append(
+            caller, kind="record", scope=effective, text=text, signal="self",
+            conditions=conditions or {}, refs=tuple(refs), repo=repo, rev=rev,
+        )
+        return {"id": id, "scope": effective}
+
+    def recall(self, query: str, scope: Scope = "org", k: int = 6) -> list[dict]:
+        caller = self._caller()
+        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
+        return [
+            {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
+            for h in handoffs
+        ]
+
+    def report_outcome(
+        self,
+        outcome: Outcome,
+        refs: Sequence[str],
+        text: str = "",
+        signal: Signal = "self",
+        scope: Scope | None = None,
+        repo: str | None = None,
+    ) -> dict:
+        caller = self._caller()
+        effective = self.policy.resolve(scope, repo)
+        id = self._append(
+            caller, kind="outcome", scope=effective, text=text, outcome=outcome,
+            signal=signal, refs=tuple(refs), repo=repo,
+        )
+        return {"id": id, "scope": effective}
+
+
+mcp = MCPServer("cortex-mem")
+_service: Service | None = None
+
+
+def get_service() -> Service:
+    global _service
+    if _service is None:
+        path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _service = Service(
+            SqliteDatabase(path),
+            engine=os.environ.get("CORTEX_ENGINE", "promote_all"),
+            user=os.environ.get("CORTEX_USER") or getpass.getuser(),
+            team=os.environ.get("CORTEX_TEAM", "default"),
+            session=uuid4().hex,
+            agent=os.environ.get("CORTEX_AGENT"),
+            policy=ScopePolicy.parse(
+                os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
+            ),
+        )
+    return _service
+
+
+@mcp.tool()
+def record_episode(
+    text: str,
+    scope: Scope | None = None,
+    conditions: dict[str, str] | None = None,
+    refs: list[str] | None = None,
+    repo: str | None = None,
+    rev: str | None = None,
+) -> dict:
+    """Record something learned while working (a fix, a cause, a convention) so
+    future sessions can recall it. Who may see it is set by the server for the
+    repo; scope can only narrow that (e.g. "personal" for a private note).
+    conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
+    memories this builds on. repo/rev: where the evidence is (repo, commit).
+    Returns the id and the scope actually used."""
+    return get_service().record(text, scope, conditions, refs or (), repo, rev)
+
+
+@mcp.tool()
+def recall(query: str, scope: Scope = "org", k: int = 6) -> dict:
+    """Recall memories relevant to the current task. Call before starting work
+    that past sessions may have covered. By default searches everything you may
+    see (your own, your team's, the org's); scope narrows it. Returns up to k
+    memories, best first."""
+    return {"memories": get_service().recall(query, scope, k)}
+
+
+@mcp.tool()
+def report_outcome(
+    outcome: Outcome,
+    refs: list[str],
+    text: str = "",
+    signal: Signal = "self",
+    scope: Scope | None = None,
+    repo: str | None = None,
+) -> dict:
+    """Report whether recalled memories (refs = their ids) helped: "success",
+    "failure", or "unknown". signal says who judged it: "self", "test",
+    "review", or "human". This is how memories earn or lose trust."""
+    return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+
+
+def main() -> None:
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
