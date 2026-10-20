@@ -129,7 +129,7 @@ class Engine(Protocol):
    runtime.append(Event(kind="recall", text=query, refs=tuple(h.id for h in handoffs), ...))
    return handoffs  # 에이전트에게
    ```
-   엔진은 자기가 건넨 것이 무엇인지 recall 이벤트로 다시 관찰한다.
+   엔진은 자기가 건넨 것이 무엇인지 recall 이벤트로 다시 관찰한다. recall 이벤트는 검색한 범위와 상관없이 `personal`로 남는다. 질의는 그 사람이 무엇을 하는지 드러내기 때문이다.
 
 ### 3-2. `refs` 의미
 
