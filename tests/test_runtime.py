@@ -122,6 +122,52 @@ def test_second_session_sees_first_sessions_record():
     assert [h.id for h in session_b.handoff("cloud sql proxy", caller(), "personal")] == ["k-e1"]
 
 
+def test_state_values_are_copied_in_and_out_during_observe():
+    """sunm2n's reproduction on PR #1: pending writes must not share objects with the engine."""
+
+    class Mutating(Scripted):
+        def observe(self, event, ctx):
+            value = {"n": 1}
+            ctx.state.put("x", value)
+            value["n"] = 2
+            ctx.state.get("x")["n"] = 3
+            for _, v in ctx.state.scan("x"):
+                v["n"] = 4
+            return []
+
+    rt = runtime(Mutating())
+    rt.append(ev("e1"))
+
+    assert rt.state.get("x") == {"n": 1}
+
+
+def test_state_values_are_copied_in_during_tick():
+    class Mutating(Scripted):
+        def tick(self, now, ctx):
+            value = {"n": 1}
+            ctx.state.put("x", value)
+            value["n"] = 2
+            return []
+
+    rt = runtime(Mutating())
+    rt.tick(T0)
+
+    assert rt.state.get("x") == {"n": 1}
+
+
+@pytest.mark.parametrize("kind", ["outcome", "human_confirm"])
+def test_judgement_without_refs_is_refused(kind):
+    engine = Scripted()
+    rt = runtime(engine)
+
+    with pytest.raises(ValueError, match="needs refs"):
+        rt.append(ev("o1", kind=kind, outcome="failure"))
+    assert rt.events.get(["o1"]) == [] and engine.seen == []
+
+    rt.append(ev("o2", kind=kind, outcome="failure", refs=("k1",)))
+    assert engine.seen == ["o2"]
+
+
 def test_oversized_state_value_is_refused():
     class Hoarder(Scripted):
         def observe(self, event, ctx):
@@ -224,10 +270,10 @@ def test_demote_removes_item_and_checks_its_sources():
     })
     rt = runtime(engine)
     rt.append(ev("e1", scope="team"))
-    rt.append(ev("fail_personal", kind="outcome", user="u2", scope="personal"))
+    rt.append(ev("fail_personal", kind="outcome", user="u2", scope="personal", refs=("k1",)))
     assert [i.id for i in rt.knowledge.all()] == ["k1"]
 
-    rt.append(ev("fail_team", kind="outcome", user="u2", scope="team"))
+    rt.append(ev("fail_team", kind="outcome", user="u2", scope="team", refs=("k1",)))
     assert rt.knowledge.all() == []
     assert len(rt.rejections) == 1
 
