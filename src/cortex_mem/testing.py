@@ -5,6 +5,9 @@ when a subclass of the matching suite passes:
         def make(self):
             return SqliteDatabase(":memory:").events
 
+DatabaseContract runs the runtime over a whole Database, so delivery
+(exactly once, all or nothing, state versions) is checked per backend too.
+
 Needs pytest; import it from tests only.
 """
 
@@ -13,7 +16,8 @@ from typing import Any
 
 import pytest
 
-from .contract import Caller, Event, Knowledge
+from .contract import Caller, Event, Knowledge, Promote
+from .runtime import Runtime
 from .store.base import CursorConflict
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
@@ -199,3 +203,110 @@ class EngineStateBackendContract(_Contract):
     def test_state_rejects_non_json_values(self, state):
         with pytest.raises(TypeError):
             state.commit(0, 0, {"k": object()}, set())
+
+    def test_state_reset_drops_keys_and_cursor_and_records_version(self, state):
+        assert state.version() is None
+        state.commit(0, 4, {"a": 1}, set())
+
+        state.reset("2")
+
+        assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
+
+
+class _Counting:
+    """Records each delivery in `seen` and in its state, promotes each event."""
+
+    def __init__(self, seen, state_version=None, fail=False):
+        self.seen = seen
+        if state_version is not None:
+            self.state_version = state_version
+        self.fail = fail
+
+    def observe(self, event, ctx):
+        self.seen.append(event.id)
+        ctx.state.put(f"{getattr(self, 'state_version', 'v0')}/{event.id}", True)
+        if self.fail:
+            raise RuntimeError("boom")
+        item = Knowledge(id=f"k-{event.id}", kind="knowledge", title=event.id, body=event.text,
+                         scope="personal", owner=event.user, sources=(event.id,))
+        return [Promote(item)]
+
+    def tick(self, now, ctx):
+        return []
+
+    def handoff(self, query, caller, scope, ctx, k=6):
+        return []
+
+
+class DatabaseContract:
+    """make(tmp_path) returns a zero-argument opener. Each call to it is one
+    more process (connection) on the same storage."""
+
+    def make(self, tmp_path) -> Any:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def open_db(self, tmp_path):
+        return self.make(tmp_path)
+
+    @staticmethod
+    def runtime(open_db, engine, name="engine"):
+        db = open_db()
+        return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)
+
+    def test_two_processes_deliver_each_event_once(self, open_db):
+        seen = []
+        a = self.runtime(open_db, _Counting(seen))
+        b = self.runtime(open_db, _Counting(seen))
+
+        a.append(ev("e1", "one"))
+        b.append(ev("e2", "two"))
+        a.sync()
+        b.sync()
+
+        assert seen == ["e1", "e2"]
+        assert [k.id for k in a.knowledge.all()] == ["k-e1", "k-e2"]
+        assert a.state.cursor() == b.state.cursor() == 2
+
+    def test_failed_delivery_commits_nothing_and_is_retried(self, open_db):
+        seen = []
+        engine = _Counting(seen, fail=True)
+        rt = self.runtime(open_db, engine)
+
+        with pytest.raises(RuntimeError):
+            rt.append(ev("e1", "x"))
+        assert (rt.state.cursor(), list(rt.state.scan()), rt.knowledge.all()) == (0, [], [])
+        assert [e.id for e in rt.events.get(["e1"])] == ["e1"]  # the event itself stays appended
+
+        engine.fail = False
+        rt.sync()
+        assert seen == ["e1", "e1"]
+        assert (rt.state.cursor(), [k.id for k in rt.knowledge.all()]) == (1, ["k-e1"])
+
+    def test_state_knowledge_and_cursor_survive_reopening(self, open_db):
+        self.runtime(open_db, _Counting([])).append(ev("e1", "x"))
+
+        seen = []
+        again = self.runtime(open_db, _Counting(seen))
+        again.sync()
+
+        assert seen == []
+        assert [k for k, _ in again.state.scan()] == ["v0/e1"]
+        assert [k.id for k in again.knowledge.all()] == ["k-e1"]
+
+    def test_changed_state_version_drops_state_and_redelivers(self, open_db):
+        rt = self.runtime(open_db, _Counting([], state_version="1"))
+        rt.append(ev("e1", "x"))
+        rt.append(ev("e2", "y"))
+
+        seen = []
+        upgraded = self.runtime(open_db, _Counting(seen, state_version="2"))
+        upgraded.sync()
+
+        assert seen == ["e1", "e2"]
+        assert [k for k, _ in upgraded.state.scan()] == ["2/e1", "2/e2"]
+        assert upgraded.state.cursor() == 2
+
+        later = []
+        self.runtime(open_db, _Counting(later, state_version="2")).sync()
+        assert later == []

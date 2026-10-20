@@ -17,11 +17,12 @@ from typing import Any, Literal, Protocol, runtime_checkable
 CONTRACT_VERSION = "0.1.0"
 
 Kind = Literal["record", "recall", "outcome", "human_confirm", "commit"]
-Signal = Literal["self", "test", "review", "human"]
+Signal = Literal["self", "test", "review", "human", "doc"]
 Outcome = Literal["success", "failure", "unknown"]
 Scope = Literal["personal", "team", "org"]
 Status = Literal["memory", "knowledge", "invalidated"]
 KnowledgeKind = Literal["knowledge", "skill"]
+DemoteWhy = Literal["invalid", "stale"]
 
 
 def _freeze(obj: object, name: str) -> None:
@@ -100,18 +101,29 @@ class Knowledge:
 
 @dataclass(frozen=True)
 class Promote:
-    """Create the item, or replace the item with the same id."""
+    """Create the item, or replace the item with the same id (an update).
+    A skill is promoted the same way, with item.kind = "skill"."""
 
     item: Knowledge
 
 
 @dataclass(frozen=True)
 class Demote:
-    """Remove an item from the knowledge base."""
+    """Remove an item from the knowledge base. The wiki history keeps it, so
+    the item was valid from its Promote commit until `since`.
+
+    why: "invalid" = it was or became false; "stale" = no longer relevant
+    (archived). The runtime handles both alike; the harness counts them apart."""
 
     id: str
     reason: str
     sources: tuple[str, ...]  # event ids that justify it, e.g. failure outcomes
+    why: DemoteWhy = "invalid"
+    since: datetime | None = None  # timezone-aware; when it stopped holding, if known
+
+    def __post_init__(self) -> None:
+        if self.since is not None:
+            _require_tz(self.since, f"Demote.since ({self.id})")
 
 
 Decision = Promote | Demote
@@ -200,7 +212,11 @@ class EngineContext:
 @runtime_checkable
 class Engine(Protocol):
     """The engine port. Keep durable state in ctx.state, not on the instance:
-    several server processes may run the same engine against the same stores."""
+    several server processes may run the same engine against the same stores.
+
+    An engine may set a class attribute `state_version: str`. When it differs
+    from the version the stored state was written with, the runtime drops the
+    state and delivers every event again from the start of the log."""
 
     def observe(self, event: Event, ctx: EngineContext) -> Sequence[Decision]:
         """Called once per event, in append order, after the event was appended."""

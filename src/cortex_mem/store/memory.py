@@ -4,6 +4,7 @@ ties keep insertion order so results are deterministic."""
 import json
 import re
 from collections.abc import Collection, Iterator, Mapping, Set
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from ..access import event_visible, knowledge_visible
@@ -99,6 +100,7 @@ class InMemoryStateBackend:
     def __init__(self) -> None:
         self._data: dict[str, str] = {}  # stored as JSON text, like a durable store
         self._cursor = 0
+        self._version: str | None = None
 
     def get(self, key: str) -> Any | None:
         raw = self._data.get(key)
@@ -122,3 +124,26 @@ class InMemoryStateBackend:
             self._data.pop(key, None)
         self._data.update(encoded)
         self._cursor = cursor
+
+    def version(self) -> str | None:
+        return self._version
+
+    def reset(self, version: str) -> None:
+        self._data.clear()
+        self._cursor = 0
+        self._version = version
+
+
+class InMemoryDatabase:
+    """Every store in memory: one per harness scenario run, or per test."""
+
+    def __init__(self) -> None:
+        self.events = InMemoryEventStore()
+        self.knowledge = InMemoryKnowledgeBase()
+        self._states: dict[str, InMemoryStateBackend] = {}
+
+    def state(self, engine: str) -> InMemoryStateBackend:
+        return self._states.setdefault(engine, InMemoryStateBackend())
+
+    def transaction(self) -> AbstractContextManager[object]:
+        return nullcontext()

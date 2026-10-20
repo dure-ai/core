@@ -2,10 +2,11 @@
 see these; they get the read-only views in contract.EngineContext.
 
 A durable implementation (SQLite, PostgreSQL) passes the contract when it
-passes tests/test_store.py.
+passes the suites in cortex_mem.testing.
 """
 
 from collections.abc import Iterator, Mapping, Set
+from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
 from ..contract import Event, EventReader, Knowledge, KnowledgeReader
@@ -56,4 +57,31 @@ class EngineStateBackend(Protocol):
     ) -> None:
         """Apply writes and deletes and move the cursor to `cursor`, all or
         nothing. Raises CursorConflict if the cursor is no longer `expected`."""
+        ...
+
+    def version(self) -> str | None:
+        """The engine state_version the state was written with (None = never set)."""
+        ...
+
+    def reset(self, version: str) -> None:
+        """Drop every key, move the cursor back to 0 and record `version`."""
+        ...
+
+
+class Database(Protocol):
+    """All stores behind one connection. The runtime takes them apart:
+    Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)."""
+
+    @property
+    def events(self) -> EventStore: ...
+
+    @property
+    def knowledge(self) -> KnowledgeStore: ...
+
+    def state(self, engine: str) -> EngineStateBackend:
+        """State and cursor of the engine with this name (its import path)."""
+        ...
+
+    def transaction(self) -> AbstractContextManager[object]:
+        """One write transaction across the stores; may be entered again inside itself."""
         ...

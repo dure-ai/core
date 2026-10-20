@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from cortex_mem.contract import Caller, Engine, EngineFactory, Event, Handoff, Knowledge
+from cortex_mem.contract import Caller, Demote, Engine, EngineFactory, Event, Handoff, Knowledge
 from cortex_mem.engines.baseline import NoMemoryEngine, PromoteAllEngine
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryEventStore, InMemoryKnowledgeBase, InMemoryStateBackend
@@ -33,6 +33,12 @@ def test_naive_datetime_is_rejected():
         ev("e1", at=datetime(2026, 10, 19))
     with pytest.raises(ValueError):
         Caller(user="u1", team="t1", session="s1", at=datetime(2026, 10, 19))
+
+
+def test_demote_since_must_be_timezone_aware():
+    with pytest.raises(ValueError):
+        Demote("k1", "replaced", ("e1",), why="stale", since=datetime(2026, 10, 19))
+    assert Demote("k1", "replaced", ("e1",), since=T0).why == "invalid"
 
 
 def test_observe_does_not_change_stored_conditions():

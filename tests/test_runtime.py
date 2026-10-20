@@ -122,6 +122,18 @@ def test_second_session_sees_first_sessions_record():
     assert [h.id for h in session_b.handoff("cloud sql proxy", caller(), "personal")] == ["k-e1"]
 
 
+def test_oversized_state_value_is_refused():
+    class Hoarder(Scripted):
+        def observe(self, event, ctx):
+            ctx.state.put("everything", "x" * (64 * 1024))
+            return []
+
+    rt = runtime(Hoarder())
+    with pytest.raises(ValueError, match="split it across keys"):
+        rt.append(ev("e1"))
+    assert rt.state.cursor() == 0
+
+
 def test_handoff_cannot_write_state():
     class Writer(Scripted):
         def handoff(self, query, caller, scope, ctx, k=6):
@@ -175,6 +187,14 @@ def test_personal_record_cannot_become_team_knowledge():
     assert "not visible" in rt.rejections[0].reason
 
 
+def test_personal_records_of_several_people_cannot_become_team_knowledge():
+    """v0.1: cross-checks happen on team records. The handoff filter would
+    hide such an item from teammates anyway, since they cannot see its sources."""
+    rt = check(Promote(item("k1", ("e1", "e2"))), ev("e1", scope="personal"), ev("e2", user="u2", scope="personal"))
+
+    assert rt.knowledge.all() == []
+
+
 def test_other_teams_record_cannot_support_this_teams_knowledge():
     rt = check(Promote(item("k1", ("e1",))), ev("e1", user="u3", team="t2", scope="team"))
 
@@ -210,6 +230,18 @@ def test_demote_removes_item_and_checks_its_sources():
     rt.append(ev("fail_team", kind="outcome", user="u2", scope="team"))
     assert rt.knowledge.all() == []
     assert len(rt.rejections) == 1
+
+
+def test_every_decision_is_logged_with_its_verdict():
+    accepted = Promote(item("k1", ("e1",)))
+    refused = Promote(item("k2", ("nope",)))
+    rt = check(accepted, ev("e1", scope="team"))
+    rt.engine.decisions["e2"] = [refused]
+    rt.append(ev("e2", scope="team"))
+
+    assert [(v.decision, v.accepted, v.at) for v in rt.verdicts] == [(accepted, True, T0), (refused, False, T0)]
+    assert rt.verdicts[0].reason is None and "unknown sources" in rt.verdicts[1].reason
+    assert rt.rejections == [rt.verdicts[1]]
 
 
 def test_decisions_in_one_batch_see_each_other():
