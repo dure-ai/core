@@ -146,12 +146,14 @@ class Runtime:
     def recall(
         self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6
     ) -> list[Handoff]:
-        """handoff, then record what was handed off as a recall event (refs = ids)."""
+        """handoff, then record what was handed off as a recall event (refs = ids).
+        The recall event is personal whatever scope was searched: a query says
+        what someone is working on, and is not shared by searching widely."""
         handoffs = self.handoff(query, caller, scope, k)
         self.append(
             Event(
                 id=event_id, kind="recall", at=caller.at, user=caller.user, team=caller.team,
-                session=caller.session, scope=scope, text=query, agent=caller.agent,
+                session=caller.session, scope="personal", text=query, agent=caller.agent,
                 refs=tuple(h.id for h in handoffs),
             )
         )

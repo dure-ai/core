@@ -117,3 +117,13 @@ def test_recall_appends_recall_event_with_handed_off_ids():
     [recall] = rt.events.get(["r1"])
     assert (recall.kind, recall.text, recall.refs) == ("recall", "deploy tags", tuple(h.id for h in handoffs))
     assert (recall.user, recall.team, recall.session, recall.at) == ("u1", "t1", "s2", T0)
+
+
+def test_recall_event_stays_personal_whatever_scope_was_searched():
+    rt = runtime()
+    rt.append(ev("e1", "deploy uses release tags", scope="org"))
+
+    rt.recall("deploy tags", caller(), "org", event_id="r1")
+
+    assert rt.events.get(["r1"])[0].scope == "personal"
+    assert rt.events.search("deploy tags", caller(user="u2"), "org", kinds={"recall"}) == []
