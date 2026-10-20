@@ -11,10 +11,10 @@ uv workspace 하나에 패키지 두 개.
 
 | 패키지 | 경로 | 내용 | 의존성 |
 |---|---|---|---|
-| `cortex-mem` | `src/cortex_mem` | 엔진 포트 계약, 런타임, 인메모리 저장소, 기준선 엔진, 저장소 적합성 테스트 | 없음 |
-| `cortex-mem-server` | `server/` | MCP 서버, SQLite 저장소 | `cortex-mem`, `mcp` |
+| `cortex-mem` | `src/cortex_mem` | 엔진 포트 계약, 런타임, 저장소(인메모리, SQLite), 기준선 엔진, 저장소 적합성 테스트 | 없음 (`sqlite3`는 표준 라이브러리) |
+| `cortex-mem-server` | `server/` | MCP 서버: 설정을 읽어 저장소와 엔진을 조립하고, 도구 인자를 런타임 호출로 바꿈 | `cortex-mem`, `mcp` |
 
-하니스와 엔진은 `cortex-mem`에만 의존한다.
+하니스와 엔진은 `cortex-mem`에만 의존한다. SQLite 저장소는 PostgreSQL 구현이 나오기 전까지의 임시 구현이고, PG 구현도 같은 적합성 테스트(`cortex_mem.testing`)를 통과해야 한다.
 
 ## 개발
 
@@ -41,4 +41,4 @@ claude mcp add cortex-mem -- uv run --directory /path/to/mcp-server cortex-mem-s
 | `CORTEX_RECORD_SCOPE` | `personal` | 기록의 기본 공개 범위 |
 | `CORTEX_REPO_SCOPES` | 없음 | 저장소별 기본 범위. `acme/*=team,acme/handbook=org`처럼 쉼표로 구분, 먼저 맞는 것이 적용 |
 
-공개 범위는 에이전트가 아니라 서버 설정이 정한다. 에이전트는 `scope`로 기본값보다 좁히는 것만 할 수 있고(예: 팀 저장소에서 `personal` 메모), 넓히려 하면 기본값이 쓰인다. `recall`은 기본으로 볼 수 있는 범위 전체(본인·팀·조직)를 찾는다.
+공개 범위는 에이전트가 아니라 서버 설정이 정한다. 에이전트는 `scope`로 기본값보다 좁히는 것만 할 수 있고(예: 팀 저장소에서 `personal` 메모), 넓히려 하면 기본값이 쓰인다. `recall`은 기본으로 볼 수 있는 범위 전체(본인·팀·조직)를 찾는다. `report_outcome`은 기본으로 판정 대상 지식을 볼 수 있는 범위에 남는다(팀 지식에 대한 실패 보고는 팀에 보여야 강등 근거가 된다). 대상이 지식 항목이 아니면 저장소 설정을 따른다.

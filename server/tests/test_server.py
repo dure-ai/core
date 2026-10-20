@@ -7,8 +7,9 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from cortex_mem.contract import Demote
 from cortex_mem_server.server import ScopePolicy, Service, load_engine
-from cortex_mem_server.sqlite import SqliteDatabase
+from cortex_mem.store.sqlite import SqliteDatabase
 
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
@@ -90,6 +91,34 @@ def test_report_outcome_refs_judged_ids():
     assert (event.kind, event.outcome, event.signal, event.refs) == ("outcome", "failure", "test", (rid,))
 
 
+def test_outcome_on_team_knowledge_is_seen_by_the_team_and_demotes_it():
+    """Found with real Claude Code sessions: a failure report without a repo was
+    personal, so it could not count as evidence against team knowledge."""
+    db = SqliteDatabase()
+    policy = ScopePolicy.parse("personal", "acme/*=team")
+    me = service(db, user="u1", policy=policy, engine=f"{__name__}:DemoteOnFailure")
+    me.record("deploy needs approval", repo="acme/api")
+    [hit] = me.recall("deploy")
+
+    teammate = service(db, user="u2", policy=policy, engine=f"{__name__}:DemoteOnFailure")
+    report = teammate.report_outcome("failure", [hit["id"]], text="approval step was removed")
+
+    assert report["scope"] == "team"
+    assert db.knowledge.all() == []
+
+
+def test_outcome_scope_can_be_narrowed_and_falls_back_to_policy():
+    db = SqliteDatabase()
+    policy = ScopePolicy.parse("personal", "acme/*=team")
+    m = service(db, policy=policy)
+    m.record("deploy needs approval", repo="acme/api")
+    [hit] = m.recall("deploy")
+
+    assert m.report_outcome("failure", [hit["id"]], scope="personal")["scope"] == "personal"
+    assert m.report_outcome("failure", ["not-knowledge"])["scope"] == "personal"
+    assert m.report_outcome("failure", ["not-knowledge"], repo="acme/api")["scope"] == "team"
+
+
 def test_session_started_earlier_sees_later_record(tmp_path):
     """The PR #2 review bug: B started before A recorded, and still finds it."""
     path = tmp_path / "cortex.db"
@@ -112,6 +141,26 @@ def test_teammate_sees_team_records_but_not_personal_ones():
 
     assert [h["content"] for h in teammate.recall("deploy")] == ["deploy needs approval"]
     assert stranger.recall("deploy") == []
+
+
+class DemoteOnFailure:
+    """PromoteAll, plus: a failure outcome demotes the knowledge it refers to."""
+
+    def __init__(self, config):
+        from cortex_mem.engines.baseline import PromoteAllEngine
+
+        self.inner = PromoteAllEngine(config)
+
+    def observe(self, event, ctx):
+        if event.kind == "outcome" and event.outcome == "failure":
+            return [Demote(id, "reported failure", (event.id,)) for id in event.refs]
+        return self.inner.observe(event, ctx)
+
+    def tick(self, now, ctx):
+        return []
+
+    def handoff(self, query, caller, scope, ctx, k=6):
+        return self.inner.handoff(query, caller, scope, ctx, k)
 
 
 class ClockedEngine:

@@ -8,6 +8,9 @@ append order for events and id order for knowledge.
 Several server processes (one per stdio session) may share the file.
 transaction() takes SQLite's write lock (BEGIN IMMEDIATE), so the runtime
 delivers each event exactly once across processes.
+
+Standard library only, so the core package stays dependency-free. Temporary
+until the PostgreSQL store, which passes the same suites (cortex_mem.testing).
 """
 
 import json
@@ -20,10 +23,10 @@ from datetime import datetime
 from os import PathLike
 from typing import Any
 
-from cortex_mem.contract import Caller, Event, Kind, Knowledge, Scope
-from cortex_mem.store.base import CursorConflict
+from ..contract import Caller, Event, Kind, Knowledge, Scope
+from .base import CursorConflict
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _WORD = re.compile(r"\w+")
 _HANGUL = re.compile(r"[가-힣]")
@@ -107,7 +110,9 @@ class SqliteDatabase:
                 "CREATE TABLE IF NOT EXISTS engine_state (engine TEXT, key TEXT, value TEXT, "
                 "PRIMARY KEY (engine, key))"
             )
-            self.con.execute("CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER)")
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
+            )
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def state(self, engine: str) -> "SqliteStateBackend":
@@ -313,4 +318,17 @@ class SqliteStateBackend:
                 "INSERT INTO engine_cursor (engine, cursor) VALUES (?, ?) "
                 "ON CONFLICT (engine) DO UPDATE SET cursor = excluded.cursor",
                 (self.engine, cursor),
+            )
+
+    def version(self) -> str | None:
+        rows = self.db.query("SELECT version FROM engine_cursor WHERE engine = ?", (self.engine,))
+        return rows[0][0] if rows else None
+
+    def reset(self, version: str) -> None:
+        with self.db.transaction():
+            self.db.con.execute("DELETE FROM engine_state WHERE engine = ?", (self.engine,))
+            self.db.con.execute(
+                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (?, 0, ?) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version",
+                (self.engine, version),
             )

@@ -29,16 +29,24 @@ from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
 
+from cortex_mem.access import knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
 from cortex_mem.runtime import Runtime
-
-from .sqlite import SqliteDatabase
+from cortex_mem.store.base import Database
+from cortex_mem.store.sqlite import SqliteDatabase
 
 ENGINE_ALIASES = {
     "promote_all": "cortex_mem.engines.baseline:PromoteAllEngine",
     "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
+
+
+def _narrow(requested: Scope | None, default: Scope) -> Scope:
+    """The requested scope if it is no wider than the default, else the default."""
+    if requested is None or _WIDTH[requested] > _WIDTH[default]:
+        return default
+    return requested
 
 
 def _scope(value: str) -> Scope:
@@ -73,10 +81,7 @@ class ScopePolicy:
         return self.default
 
     def resolve(self, requested: Scope | None, repo: str | None) -> Scope:
-        default = self.default_for(repo)
-        if requested is None or _WIDTH[requested] > _WIDTH[default]:
-            return default
-        return requested
+        return _narrow(requested, self.default_for(repo))
 
 
 def load_engine(spec: str) -> tuple[str, Engine]:
@@ -95,7 +100,7 @@ class Service:
 
     def __init__(
         self,
-        db: SqliteDatabase,
+        db: Database,
         engine: str,
         user: str,
         team: str,
@@ -156,12 +161,21 @@ class Service:
         repo: str | None = None,
     ) -> dict:
         caller = self._caller()
-        effective = self.policy.resolve(scope, repo)
+        effective = _narrow(scope, self._outcome_default(caller, refs, repo))
         id = self._append(
             caller, kind="outcome", scope=effective, text=text, outcome=outcome,
             signal=signal, refs=tuple(refs), repo=repo,
         )
         return {"id": id, "scope": effective}
+
+    def _outcome_default(self, caller: Caller, refs: Sequence[str], repo: str | None) -> Scope:
+        """An outcome is evidence about what it judges, so by default it is
+        seen by the widest audience of the judged knowledge the caller can see.
+        A team item can only be demoted by evidence the team sees."""
+        judged = [k for k in self.runtime.knowledge.get(refs) if knowledge_visible(k, caller, "org")]
+        if not judged:
+            return self.policy.default_for(repo)
+        return max((k.scope for k in judged), key=_WIDTH.__getitem__)
 
 
 mcp = MCPServer("cortex-mem")
@@ -225,7 +239,9 @@ def report_outcome(
 ) -> dict:
     """Report whether recalled memories (refs = their ids) helped: "success",
     "failure", or "unknown". signal says who judged it: "self", "test",
-    "review", or "human". This is how memories earn or lose trust."""
+    "review", "human", or "doc". This is how memories earn or lose trust.
+    By default the report is visible to whoever can see the judged memories;
+    scope can only narrow that. Returns the id and the scope actually used."""
     return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
 
 

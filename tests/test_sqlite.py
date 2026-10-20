@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 import pytest
 
 from cortex_mem.contract import Caller, Event, Knowledge
-from cortex_mem.engines.baseline import PromoteAllEngine
-from cortex_mem.runtime import Runtime
-from cortex_mem.testing import EngineStateBackendContract, EventStoreContract, KnowledgeStoreContract
-from cortex_mem_server.sqlite import SqliteDatabase
+from cortex_mem.store.sqlite import SqliteDatabase
+from cortex_mem.testing import (
+    DatabaseContract,
+    EngineStateBackendContract,
+    EventStoreContract,
+    KnowledgeStoreContract,
+)
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
 
@@ -24,6 +27,14 @@ class TestSqliteKnowledgeBase(KnowledgeStoreContract):
 class TestSqliteStateBackend(EngineStateBackendContract):
     def make(self):
         return SqliteDatabase().state("engine")
+
+
+class TestSqliteDatabase(DatabaseContract):
+    """Each open is a new connection to the same file, like a new server process."""
+
+    def make(self, tmp_path):
+        path = tmp_path / "cortex.db"
+        return lambda: SqliteDatabase(path)
 
 
 def ev(id, text, user="u1", scope="personal"):
@@ -59,60 +70,6 @@ def test_replaced_knowledge_is_searched_by_its_new_text():
 
     assert db.knowledge.search("redis", caller(), "personal") == []
     assert [k.id for k, _ in db.knowledge.search("postgres", caller(), "personal")] == ["k1"]
-
-
-def test_everything_persists_across_connections(tmp_path):
-    path = tmp_path / "cortex.db"
-    db = SqliteDatabase(path)
-    rt = Runtime(PromoteAllEngine(), db.events, db.knowledge, db.state("promote_all"), db.transaction)
-    rt.append(ev("e1", "deploy uses tags"))
-
-    reopened = SqliteDatabase(path)
-
-    assert [e.id for e in reopened.events.get(["e1"])] == ["e1"]
-    assert [k.id for k in reopened.knowledge.all()] == ["k-e1"]
-    assert reopened.state("promote_all").cursor() == 1
-
-
-def test_two_processes_deliver_each_event_once(tmp_path):
-    """Two server processes (two connections) share one engine's state."""
-    path = tmp_path / "cortex.db"
-    seen = []
-
-    class Counting(PromoteAllEngine):
-        def observe(self, event, ctx):
-            seen.append(event.id)
-            return super().observe(event, ctx)
-
-    def session():
-        db = SqliteDatabase(path)
-        return Runtime(Counting(), db.events, db.knowledge, db.state("counting"), db.transaction)
-
-    a, b = session(), session()
-    a.append(ev("e1", "one"))
-    b.append(ev("e2", "two"))
-    a.sync()
-    b.sync()
-
-    assert seen == ["e1", "e2"]
-    assert [k.id for k in a.knowledge.all()] == ["k-e1", "k-e2"]
-
-
-def test_failed_delivery_rolls_back_knowledge_and_state(tmp_path):
-    db = SqliteDatabase(tmp_path / "cortex.db")
-
-    class Broken(PromoteAllEngine):
-        def observe(self, event, ctx):
-            ctx.state.put("touched", True)
-            raise RuntimeError("boom")
-
-    rt = Runtime(Broken(), db.events, db.knowledge, db.state("broken"), db.transaction)
-    with pytest.raises(RuntimeError):
-        rt.append(ev("e1", "x"))
-
-    assert db.state("broken").cursor() == 0
-    assert db.state("broken").get("touched") is None
-    assert [e.id for e in db.events.get(["e1"])] == ["e1"]  # the event itself stays appended
 
 
 def test_old_schema_is_refused(tmp_path):
