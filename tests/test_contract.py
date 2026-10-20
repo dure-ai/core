@@ -1,114 +1,119 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
-from cortex_mem.contract import (
-    Engine,
-    EngineFactory,
-    Event,
-    Handoff,
-    KnowledgeSnapshot,
-    QueryContext,
-)
+from cortex_mem.contract import Caller, Engine, EngineFactory, Event, Handoff, Knowledge
 from cortex_mem.engines.baseline import NoMemoryEngine, PromoteAllEngine
-from cortex_mem.store.memory import InMemoryEpisodeStore
+from cortex_mem.runtime import Runtime
+from cortex_mem.store.memory import InMemoryEventStore, InMemoryKnowledgeBase, InMemoryStateBackend
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
 FACTORIES: list[EngineFactory] = [NoMemoryEngine, PromoteAllEngine]
 
 
-def ev(id, text="", kind="record", user="u1", scope="personal", at=T0, **kw):
-    return Event(id=id, kind=kind, at=at, user=user, session="s1", scope=scope, text=text, **kw)
+def ev(id, text="", kind="record", user="u1", team="t1", scope="personal", at=T0, **kw):
+    return Event(id=id, kind=kind, at=at, user=user, team=team, session="s1", scope=scope, text=text, **kw)
 
 
-def ctx(user="u1", scope="personal"):
-    return QueryContext(user=user, session="s2", scope=scope)
+def caller(user="u1", team="t1"):
+    return Caller(user=user, team=team, session="s2", at=T0)
 
 
-def feed(store, engine, *events):
-    for e in events:
-        store.append(e)
-        engine.observe(e)
+def runtime(factory=PromoteAllEngine):
+    return Runtime(factory({}), InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend())
 
 
 @pytest.mark.parametrize("factory", FACTORIES)
-def test_baselines_conform_to_engine_and_snapshot(factory):
-    engine = factory(InMemoryEpisodeStore())
-    assert isinstance(engine, Engine)
-    assert isinstance(engine, KnowledgeSnapshot)
+def test_baselines_conform_to_engine(factory):
+    assert isinstance(factory({}), Engine)
 
 
 def test_naive_datetime_is_rejected():
     with pytest.raises(ValueError):
         ev("e1", at=datetime(2026, 10, 19))
+    with pytest.raises(ValueError):
+        Caller(user="u1", team="t1", session="s1", at=datetime(2026, 10, 19))
 
 
-def test_observe_can_read_its_own_event_from_store():
-    store = InMemoryEpisodeStore()
-    seen = []
+def test_observe_does_not_change_stored_conditions():
+    """sunm2n's reproduction on PR #1: an engine must not be able to change a stored event."""
+    store = InMemoryEventStore()
+    event = ev("e1", conditions={"service": "A"})
+    store.append(event)
 
-    class Probe:
-        def __init__(self, reader):
-            self.reader = reader
-
-        def observe(self, event):
-            seen.extend(self.reader.get([event.id]))
-
-        def handoff(self, query, ctx, k=6):
-            return []
-
-    feed(store, Probe(store), ev("e1", "cloud sql timeout"))
-    assert [e.id for e in seen] == ["e1"]
+    with pytest.raises(TypeError):
+        event.conditions["service"] = "B"
+    assert store.get(["e1"])[0].conditions == {"service": "A"}
 
 
-def test_promote_all_sources_resolve_through_reader():
-    store = InMemoryEpisodeStore()
-    engine = PromoteAllEngine(store)
-    feed(store, engine, ev("e1", "cloud sql needs a proxy"), ev("e2", "redis is fine"))
+def test_conditions_are_copied_from_the_callers_dict():
+    conditions = {"service": "A"}
+    event = ev("e1", conditions=conditions)
+    conditions["service"] = "B"
 
-    handoffs = engine.handoff("cloud sql proxy", ctx())
+    assert event.conditions == {"service": "A"}
 
-    assert [h.id for h in handoffs] == ["e1"]
-    assert all(isinstance(h, Handoff) for h in handoffs)
+
+@pytest.mark.parametrize("cls", [Knowledge, Handoff])
+def test_knowledge_and_handoff_conditions_are_read_only(cls):
+    if cls is Knowledge:
+        obj = Knowledge(id="k", kind="knowledge", title="t", body="b", scope="personal",
+                        owner="u1", sources=("e1",), conditions={"a": "1"})
+    else:
+        obj = Handoff(id="h", content="c", sources=("e1",), conditions={"a": "1"})
+    with pytest.raises(TypeError):
+        obj.conditions["a"] = "2"
+
+
+def test_promote_all_promotes_each_record_as_widely_as_it_was_recorded():
+    rt = runtime()
+    rt.append(ev("e1", "cloud sql needs a proxy", scope="team"))
+    rt.append(ev("e2", "my editor uses tabs", scope="personal"))
+    rt.append(ev("r1", "cloud sql", kind="recall"))
+
+    assert [(i.id, i.scope, i.owner, i.sources) for i in rt.knowledge.all()] == [
+        ("k-e1", "team", "t1", ("e1",)),
+        ("k-e2", "personal", "u1", ("e2",)),
+    ]
+    assert rt.rejections == []
+
+
+def test_promote_all_hands_off_knowledge_with_resolvable_sources():
+    rt = runtime()
+    rt.append(ev("e1", "cloud sql needs a proxy"))
+    rt.append(ev("e2", "redis is fine"))
+
+    handoffs = rt.handoff("cloud sql proxy", caller(), "personal")
+
+    assert [h.id for h in handoffs] == ["k-e1"]
     for h in handoffs:
-        assert [e.id for e in store.get(h.sources)] == list(h.sources)
-
-
-def test_promote_all_hands_off_records_only():
-    store = InMemoryEpisodeStore()
-    engine = PromoteAllEngine(store)
-    feed(
-        store,
-        engine,
-        ev("e1", "cloud sql needs a proxy"),
-        ev("r1", "cloud sql proxy", kind="recall", refs=("e1",)),
-    )
-
-    assert [h.id for h in engine.handoff("cloud sql proxy", ctx())] == ["e1"]
+        assert [e.id for e in rt.events.get(h.sources)] == list(h.sources)
 
 
 def test_no_memory_hands_off_nothing():
-    store = InMemoryEpisodeStore()
-    engine = NoMemoryEngine(store)
-    feed(store, engine, ev("e1", "cloud sql needs a proxy"))
+    rt = runtime(NoMemoryEngine)
+    rt.append(ev("e1", "cloud sql needs a proxy"))
 
-    assert engine.handoff("cloud sql", ctx()) == []
-    assert engine.snapshot(T0) == []
+    assert rt.handoff("cloud sql", caller(), "personal") == []
+    assert rt.knowledge.all() == []
 
 
 def test_handoff_is_deterministic_for_same_event_sequence():
     def run():
-        store = InMemoryEpisodeStore()
-        engine = PromoteAllEngine(store)
-        feed(store, engine, *(ev(f"e{i}", "deploy uses tags") for i in range(5)))
-        return [h.id for h in engine.handoff("deploy tags", ctx(), k=3)]
+        rt = runtime()
+        for i in range(5):
+            rt.append(ev(f"e{i}", "deploy uses tags"))
+        return [h.id for h in rt.handoff("deploy tags", caller(), "personal", k=3)]
 
-    assert run() == run() == ["e0", "e1", "e2"]
+    assert run() == run() == ["k-e0", "k-e1", "k-e2"]
 
 
-def test_promote_all_snapshot_respects_time():
-    store = InMemoryEpisodeStore()
-    engine = PromoteAllEngine(store)
-    feed(store, engine, ev("e1", "a", at=T0), ev("e2", "b", at=T0 + timedelta(days=1)))
+def test_recall_appends_recall_event_with_handed_off_ids():
+    rt = runtime()
+    rt.append(ev("e1", "deploy uses release tags"))
 
-    assert [h.id for h in engine.snapshot(T0)] == ["e1"]
+    handoffs = rt.recall("deploy tags", caller(), "personal", event_id="r1")
+
+    [recall] = rt.events.get(["r1"])
+    assert (recall.kind, recall.text, recall.refs) == ("recall", "deploy tags", tuple(h.id for h in handoffs))
+    assert (recall.user, recall.team, recall.session, recall.at) == ("u1", "t1", "s2", T0)
