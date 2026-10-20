@@ -265,3 +265,45 @@ def test_handoff_is_cut_to_k():
     rt.append(ev("e1"))
 
     assert len(rt.handoff("q", caller(), "personal", k=2)) == 2
+
+
+# ── transactions and concurrent delivery ────────────────────────────────────
+
+
+def test_each_delivery_runs_in_its_own_transaction():
+    log = []
+
+    class Tx:
+        def __enter__(self):
+            log.append("begin")
+
+        def __exit__(self, *exc):
+            log.append("rollback" if exc[0] else "commit")
+
+    engine = Scripted()
+    rt = Runtime(engine, InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend(), transaction=Tx)
+    rt.events.append(ev("e1"))
+    rt.events.append(ev("e2"))
+    rt.sync()
+
+    # two deliveries, then one more transaction that finds nothing to deliver
+    assert log == ["begin", "commit", "begin", "commit", "begin", "commit"]
+
+
+def test_event_delivered_by_another_process_is_not_applied_twice():
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    other = runtime(PromoteAllEngine(), events, kb, state)
+
+    class Racing(PromoteAllEngine):
+        """While this process is observing, the other one delivers the same event."""
+
+        def observe(self, event, ctx):
+            other.sync()
+            return [Promote(item("dup", (event.id,), scope="personal", owner="u1"))]
+
+    rt = runtime(Racing(), events, kb, state)
+    events.append(ev("e1", "deploy uses tags"))
+    rt.sync()
+
+    assert [i.id for i in kb.all()] == ["k-e1"]  # only the winner's decision
+    assert state.cursor() == 1 and rt.rejections == []

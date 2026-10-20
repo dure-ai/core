@@ -6,7 +6,8 @@ what the engine hands off. The server and the harness run this same code, so
 a harness score describes what the server does.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -24,7 +25,7 @@ from .contract import (
     Promote,
     Scope,
 )
-from .store.base import EngineStateBackend, EventStore, KnowledgeStore
+from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
 
 _ABSENT = object()
 
@@ -77,17 +78,23 @@ class _StagedState:
 
 
 class Runtime:
+    """`transaction` opens one write transaction across the stores. A durable
+    backend passes it so that delivering one event (cursor, engine state and
+    knowledge writes) is all or nothing and serialized across processes."""
+
     def __init__(
         self,
         engine: Engine,
         events: EventStore,
         knowledge: KnowledgeStore,
         state: EngineStateBackend,
+        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
         self.engine = engine
         self.events = events
         self.knowledge = knowledge
         self.state = state
+        self.transaction = transaction
         self.rejections: list[Rejection] = []
 
     def _ctx(self, state: _StagedState) -> EngineContext:
@@ -100,24 +107,35 @@ class Runtime:
         return event.id
 
     def sync(self) -> int:
-        """Deliver events appended since the cursor, in order. Returns how many.
-        If the engine raises, that event stays undelivered and is retried next time."""
-        cursor = self.state.cursor()
+        """Deliver events appended since the cursor, in order, one transaction
+        each. Returns how many this call delivered. If the engine raises, that
+        event stays undelivered and is retried next time."""
         delivered = 0
-        for seq, event in self.events.since(cursor):
-            staged = _StagedState(self.state)
-            decisions = self.engine.observe(event, self._ctx(staged))
-            self._commit(decisions, staged, cursor, seq, event.at)
-            cursor = seq
+        while True:
+            with self.transaction():
+                cursor = self.state.cursor()
+                pending = next(iter(self.events.since(cursor)), None)
+                if pending is None:
+                    return delivered
+                seq, event = pending
+                staged = _StagedState(self.state)
+                decisions = self.engine.observe(event, self._ctx(staged))
+                try:
+                    self._commit(decisions, staged, cursor, seq, event.at)
+                except CursorConflict:
+                    continue  # another process delivered it first; read the cursor again
             delivered += 1
-        return delivered
 
     def tick(self, now: datetime) -> None:
         self.sync()
-        staged = _StagedState(self.state)
-        decisions = self.engine.tick(now, self._ctx(staged))
-        cursor = self.state.cursor()
-        self._commit(decisions, staged, cursor, cursor, now)
+        with self.transaction():
+            cursor = self.state.cursor()
+            staged = _StagedState(self.state)
+            decisions = self.engine.tick(now, self._ctx(staged))
+            try:
+                self._commit(decisions, staged, cursor, cursor, now)
+            except CursorConflict:
+                return  # events arrived meanwhile; the next tick sees them
 
     def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
         self.sync()
@@ -149,10 +167,11 @@ class Runtime:
     ) -> None:
         pending: dict[str, Knowledge | None] = {}  # id -> item, or None when demoted
         accepted: list[Decision] = []
+        rejected: list[Rejection] = []
         for decision in decisions:
             reason = self._check(decision, pending)
             if reason is not None:
-                self.rejections.append(Rejection(decision, reason, at))
+                rejected.append(Rejection(decision, reason, at))
                 continue
             accepted.append(decision)
             if isinstance(decision, Promote):
@@ -160,6 +179,7 @@ class Runtime:
             else:
                 pending[decision.id] = None
         self.state.commit(expected, cursor, staged.writes, staged.deletes)
+        self.rejections.extend(rejected)
         for decision in accepted:
             if isinstance(decision, Promote):
                 self.knowledge.put(decision.item)

@@ -120,7 +120,7 @@ class Engine(Protocol):
 ### 3-1. 런타임과 호출 순서
 
 1. 모든 이벤트는 `append` 순서대로 **정확히 한 번** `observe`에 전달된다. 커서는 런타임이 관리하고, 엔진은 재생이나 커서를 신경 쓰지 않는다.
-2. `observe`가 반환하면 그 호출의 상태 쓰기, 결정 반영, 커서 이동이 함께 반영된다. `observe`가 예외를 던지면 아무것도 반영되지 않고, 그 이벤트는 다음 `sync` 때 다시 전달된다.
+2. 이벤트 하나의 전달은 트랜잭션 하나다. `observe`가 반환하면 그 호출의 상태 쓰기, 결정 반영, 커서 이동이 함께 반영된다. `observe`가 예외를 던지면 아무것도 반영되지 않고, 그 이벤트는 다음 `sync` 때 다시 전달된다. 다른 프로세스가 먼저 전달했으면(`CursorConflict`) 이쪽 결과는 버리고 커서를 다시 읽는다.
 3. 이벤트는 `append` 뒤에 전달되므로, 엔진은 `observe` 안에서 그 이벤트를 `ctx.events.get`할 수 있다.
 4. `handoff` 직전에 런타임이 밀린 이벤트를 먼저 전달한다. 그래서 세션 B도 세션 A가 남긴 기록을 반영한 상태로 답한다.
 5. recall 한 번은 이렇게 흐른다(`Runtime.recall`).
@@ -226,8 +226,8 @@ class EngineStateBackend(Protocol):                           # 엔진 하나의
     def commit(self, expected, cursor, writes, deletes) -> None: ...  # 커서가 expected가 아니면 CursorConflict
 ```
 
-- `tests/test_store.py`의 목록(`EVENT_STORES`, `KNOWLEDGE_STORES`, `STATE_BACKENDS`)에 구현을 추가해 통과시키면 계약을 지킨 것이다. `search` 점수는 "높을수록 좋음"만 약속한다.
-- 영속 구현은 상태 커밋과 결정 반영을 **한 트랜잭션**으로 묶어야 한다. 인메모리 구현은 단일 프로세스라 순서만 지킨다.
+- `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `search` 점수는 "높을수록 좋음"만 약속한다.
+- 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **한 트랜잭션**으로 묶고 프로세스 사이에서 직렬화한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
 
 ## 6. v0.2 이후로 미룬 것
@@ -310,5 +310,5 @@ class ExternalMemoryAdapter:
 - scope: personal < team < org. personal 기록은 팀 지식의 근거가 될 수 없음
 - Event에 team 추가, conditions는 읽기 전용, Caller(user, team, session, at, agent) 도입
 - 하니스는 같은 Runtime + 인메모리 저장소로 실행, 시각 t의 지식 베이스로 채점
-- 저장소 공통 테스트(tests/test_store.py): PG 구현도 이걸 통과하면 계약 준수
+- 저장소 공통 테스트(cortex_mem.testing): PG 구현도 이걸 상속해 통과하면 계약 준수
 ```
