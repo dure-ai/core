@@ -6,6 +6,7 @@ what the engine hands off. The server and the harness run this same code, so
 a harness score describes what the server does.
 """
 
+import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -28,14 +29,17 @@ from .contract import (
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
 
 _ABSENT = object()
+MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 
 
 @dataclass(frozen=True)
-class Rejection:
-    """A decision the runtime refused. The harness counts these against the engine."""
+class Verdict:
+    """What the runtime did with one decision: the decision log. The harness
+    reports it as an observed metric; it does not count toward the verdict."""
 
     decision: object
-    reason: str
+    accepted: bool
+    reason: str | None  # why it was refused; None when accepted
     at: datetime
 
 
@@ -57,6 +61,9 @@ class _StagedState:
 
     def put(self, key: str, value: Any) -> None:
         self._check_writable()
+        size = len(json.dumps(value).encode())
+        if size > MAX_STATE_VALUE_BYTES:
+            raise ValueError(f"state value for {key!r} is {size} bytes; split it across keys")
         self.deletes.discard(key)
         self.writes[key] = value
 
@@ -95,7 +102,12 @@ class Runtime:
         self.knowledge = knowledge
         self.state = state
         self.transaction = transaction
-        self.rejections: list[Rejection] = []
+        self.verdicts: list[Verdict] = []
+        self._version_checked = False
+
+    @property
+    def rejections(self) -> list[Verdict]:
+        return [v for v in self.verdicts if not v.accepted]
 
     def _ctx(self, state: _StagedState) -> EngineContext:
         return EngineContext(events=self.events, knowledge=self.knowledge, state=state)
@@ -110,6 +122,7 @@ class Runtime:
         """Deliver events appended since the cursor, in order, one transaction
         each. Returns how many this call delivered. If the engine raises, that
         event stays undelivered and is retried next time."""
+        self._check_state_version()
         delivered = 0
         while True:
             with self.transaction():
@@ -125,6 +138,18 @@ class Runtime:
                 except CursorConflict:
                     continue  # another process delivered it first; read the cursor again
             delivered += 1
+
+    def _check_state_version(self) -> None:
+        """Drop the engine's state and start delivery over when the engine's
+        state_version differs from the stored one. The knowledge base is kept;
+        replayed Promotes replace items with the same id."""
+        want = getattr(self.engine, "state_version", None)
+        if want is None or self._version_checked:
+            return
+        with self.transaction():
+            if self.state.version() != want:
+                self.state.reset(want)
+        self._version_checked = True
 
     def tick(self, now: datetime) -> None:
         self.sync()
@@ -169,11 +194,11 @@ class Runtime:
     ) -> None:
         pending: dict[str, Knowledge | None] = {}  # id -> item, or None when demoted
         accepted: list[Decision] = []
-        rejected: list[Rejection] = []
+        verdicts: list[Verdict] = []
         for decision in decisions:
             reason = self._check(decision, pending)
+            verdicts.append(Verdict(decision, reason is None, reason, at))
             if reason is not None:
-                rejected.append(Rejection(decision, reason, at))
                 continue
             accepted.append(decision)
             if isinstance(decision, Promote):
@@ -181,7 +206,7 @@ class Runtime:
             else:
                 pending[decision.id] = None
         self.state.commit(expected, cursor, staged.writes, staged.deletes)
-        self.rejections.extend(rejected)
+        self.verdicts.extend(verdicts)
         for decision in accepted:
             if isinstance(decision, Promote):
                 self.knowledge.put(decision.item)
