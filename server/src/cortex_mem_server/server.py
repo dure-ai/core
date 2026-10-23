@@ -117,7 +117,7 @@ class Service:
         name, built = load_engine(engine)
         self.runtime = Runtime(built, db.events, db.knowledge, db.state(name), transaction=db.transaction)
         self.user, self.team, self.session, self.agent = user, team, session, agent
-        self.repo = repo  # default for every call; a tool argument overrides it
+        self.repo = repo  # the configured repo: picks the scope policy; a tool argument only says where
         self.policy = policy
         self.clock = clock
 
@@ -145,7 +145,7 @@ class Service:
         rev: str | None = None,
     ) -> dict:
         caller = self._caller(repo)
-        effective = self.policy.resolve(scope, caller.repo)
+        effective = self.policy.resolve(scope, self.repo)
         id = self._append(
             caller, kind="record", scope=effective, text=text, signal="self",
             conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
@@ -190,7 +190,7 @@ class Service:
         A team item can only be demoted by evidence the team sees."""
         judged = [k for k in self.runtime.knowledge.get(refs) if knowledge_visible(k, caller, "org")]
         if not judged:
-            return self.policy.default_for(caller.repo)
+            return self.policy.default_for(self.repo)
         return max((k.scope for k in judged), key=_WIDTH.__getitem__)
 
 
@@ -232,8 +232,8 @@ def record_episode(
     repo; scope can only narrow that (e.g. "personal" for a private note).
     conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
     memories this builds on. repo/rev: where the evidence is (repo, commit);
-    repo defaults to the project's configured repo.
-    Returns the id and the scope actually used."""
+    repo defaults to the project's configured repo and does not change who may
+    see the record. Returns the id and the scope actually used."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 

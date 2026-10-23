@@ -62,11 +62,31 @@ def test_recall_returns_recorded_episode():
 
 
 def test_record_reports_the_scope_actually_used():
+    m = service(SqliteDatabase(), policy=ScopePolicy.parse("personal", "acme/*=team"), repo="acme/api")
+
+    assert m.record("x")["scope"] == "team"
+    assert m.record("y", scope="org")["scope"] == "team"
+    assert m.record("z", scope="personal")["scope"] == "personal"
+
+
+def test_repo_argument_cannot_widen_configured_repo_policy():
+    """PR #2 review: the agent chose the policy by naming a repo with a wider default."""
+    db = SqliteDatabase()
+    alice = service(db, user="alice", team="t5", policy=ScopePolicy.parse("personal", "acme/handbook=org"),
+                    repo="alice/private")
+
+    result = alice.record("사내 비밀 메모", scope="org", repo="acme/handbook")
+
+    assert result["scope"] == "personal"
+    assert db.events.get([result["id"]])[0].repo == "acme/handbook"  # still says where the evidence is
+    bob = service(db, user="bob", team="t9")
+    assert bob.recall("비밀 메모") == []
+
+
+def test_without_configured_repo_only_the_default_policy_applies():
     m = service(SqliteDatabase(), policy=ScopePolicy.parse("personal", "acme/*=team"))
 
-    assert m.record("x", repo="acme/api")["scope"] == "team"
-    assert m.record("y", scope="org", repo="acme/api")["scope"] == "team"
-    assert m.record("z", scope="personal", repo="acme/api")["scope"] == "personal"
+    assert m.record("x", repo="acme/api")["scope"] == "personal"
 
 
 def test_recall_is_recorded_as_personal_recall_event_with_refs():
@@ -96,8 +116,8 @@ def test_outcome_on_team_knowledge_is_seen_by_the_team_and_demotes_it():
     personal, so it could not count as evidence against team knowledge."""
     db = SqliteDatabase()
     policy = ScopePolicy.parse("personal", "acme/*=team")
-    me = service(db, user="u1", policy=policy, engine=f"{__name__}:DemoteOnFailure")
-    me.record("deploy needs approval", repo="acme/api")
+    me = service(db, user="u1", policy=policy, engine=f"{__name__}:DemoteOnFailure", repo="acme/api")
+    me.record("deploy needs approval")
     [hit] = me.recall("deploy")
 
     teammate = service(db, user="u2", policy=policy, engine=f"{__name__}:DemoteOnFailure")
@@ -110,13 +130,15 @@ def test_outcome_on_team_knowledge_is_seen_by_the_team_and_demotes_it():
 def test_outcome_scope_can_be_narrowed_and_falls_back_to_policy():
     db = SqliteDatabase()
     policy = ScopePolicy.parse("personal", "acme/*=team")
-    m = service(db, policy=policy)
-    m.record("deploy needs approval", repo="acme/api")
+    m = service(db, policy=policy, repo="acme/api")
+    m.record("deploy needs approval")
     [hit] = m.recall("deploy")
+    elsewhere = service(db, policy=policy)
 
     assert m.report_outcome("failure", [hit["id"]], scope="personal")["scope"] == "personal"
-    assert m.report_outcome("failure", ["not-knowledge"])["scope"] == "personal"
-    assert m.report_outcome("failure", ["not-knowledge"], repo="acme/api")["scope"] == "team"
+    assert m.report_outcome("failure", ["not-knowledge"])["scope"] == "team"
+    assert elsewhere.report_outcome("failure", ["not-knowledge"])["scope"] == "personal"
+    assert elsewhere.report_outcome("failure", ["not-knowledge"], repo="acme/api")["scope"] == "personal"
 
 
 def test_configured_repo_applies_scope_policy_without_the_agent_passing_it():
@@ -126,7 +148,7 @@ def test_configured_repo_applies_scope_policy_without_the_agent_passing_it():
     recorded = m.record("deploy needs approval")
     elsewhere = m.record("my dotfiles use zsh", repo="me/dotfiles")
 
-    assert recorded["scope"] == "team" and elsewhere["scope"] == "personal"
+    assert recorded["scope"] == "team" and elsewhere["scope"] == "team"  # the policy follows the configuration
     assert [e.repo for e in db.events.get([recorded["id"], elsewhere["id"]])] == ["acme/api", "me/dotfiles"]
 
 
@@ -164,9 +186,9 @@ def test_session_started_earlier_sees_later_record(tmp_path):
 def test_teammate_sees_team_records_but_not_personal_ones():
     db = SqliteDatabase()
     policy = ScopePolicy.parse("personal", "acme/*=team")
-    me = service(db, user="u1", policy=policy)
-    me.record("deploy needs approval", repo="acme/api")
-    me.record("my deploy shortcut", scope="personal", repo="acme/api")
+    me = service(db, user="u1", policy=policy, repo="acme/api")
+    me.record("deploy needs approval")
+    me.record("my deploy shortcut", scope="personal")
     teammate = service(db, user="u2", policy=policy)
     stranger = service(db, user="u3", team="t2", policy=policy)
 
