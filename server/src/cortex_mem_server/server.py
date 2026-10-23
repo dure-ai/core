@@ -250,6 +250,13 @@ def _identity() -> tuple[str, str]:
     return user, team
 
 
+def _max_failures() -> int:
+    raw = os.environ.get("CORTEX_MAX_FAILURES", "3")
+    if not raw.strip().isdigit() or int(raw) < 1:
+        raise SystemExit(f"cortex-mem: CORTEX_MAX_FAILURES must be a whole number of at least 1, got {raw!r}")
+    return int(raw)
+
+
 def get_service() -> Service:
     global _service
     if _service is None:
@@ -267,7 +274,7 @@ def get_service() -> Service:
             policy=ScopePolicy.parse(
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
-            max_failures=int(os.environ.get("CORTEX_MAX_FAILURES", "3")),
+            max_failures=_max_failures(),
         )
     return _service
 
@@ -337,6 +344,7 @@ def report_outcome(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")  # stderr
     _identity()  # fail at start, not at the first tool call
+    _max_failures()
     mcp.run()
 
 

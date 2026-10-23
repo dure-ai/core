@@ -370,14 +370,18 @@ def test_stdio_outcome_without_refs_tells_the_agent_why(tmp_path):
     assert result.is_error and "needs refs" in result.content[0].text
 
 
-def test_server_refuses_to_start_without_a_team(tmp_path):
+@pytest.mark.parametrize(
+    "settings, message",
+    [({}, "set CORTEX_TEAM"), ({"CORTEX_TEAM": "t1", "CORTEX_MAX_FAILURES": "0"}, "CORTEX_MAX_FAILURES")],
+)
+def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
     import subprocess
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
-    env["CORTEX_DB_PATH"] = str(tmp_path / "cortex.db")
+    env.update(settings, CORTEX_DB_PATH=str(tmp_path / "cortex.db"))
     result = subprocess.run(
         [sys.executable, "-m", "cortex_mem_server.server"], env=env, capture_output=True, text=True,
         stdin=subprocess.DEVNULL, timeout=30, check=False,
     )
 
-    assert result.returncode != 0 and "set CORTEX_TEAM" in result.stderr
+    assert result.returncode != 0 and message in result.stderr
