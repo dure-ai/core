@@ -168,6 +168,13 @@ def test_judgement_without_refs_is_refused(kind):
     assert engine.seen == ["o2"]
 
 
+@pytest.mark.parametrize("max_failures", [0, -1])
+def test_max_failures_must_allow_one_attempt(max_failures):
+    with pytest.raises(ValueError, match="max_failures"):
+        Runtime(Scripted(), InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend(),
+                max_failures=max_failures)
+
+
 def test_oversized_state_value_is_refused():
     class Hoarder(Scripted):
         def observe(self, event, ctx):

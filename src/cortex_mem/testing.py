@@ -216,16 +216,17 @@ class EngineStateBackendContract(_Contract):
 class _Counting:
     """Records each delivery in `seen` and in its state, promotes each event."""
 
-    def __init__(self, seen, state_version=None, fail=False):
+    def __init__(self, seen, state_version=None, fail=False, fail_on=None):
         self.seen = seen
         if state_version is not None:
             self.state_version = state_version
         self.fail = fail
+        self.fail_on = fail_on  # an event id that always fails
 
     def observe(self, event, ctx):
         self.seen.append(event.id)
         ctx.state.put(f"{getattr(self, 'state_version', 'v0')}/{event.id}", True)
-        if self.fail:
+        if self.fail or event.id == self.fail_on:
             raise RuntimeError("boom")
         item = Knowledge(id=f"k-{event.id}", kind="knowledge", title=event.id, body=event.text,
                          scope="personal", owner=event.user, sources=(event.id,))
@@ -250,9 +251,9 @@ class DatabaseContract:
         return self.make(tmp_path)
 
     @staticmethod
-    def runtime(open_db, engine, name="engine"):
+    def runtime(open_db, engine, name="engine", max_failures=None):
         db = open_db()
-        return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)
+        return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction, max_failures)
 
     def test_two_processes_deliver_each_event_once(self, open_db):
         seen = []
@@ -282,6 +283,41 @@ class DatabaseContract:
         rt.sync()
         assert seen == ["e1", "e1"]
         assert (rt.state.cursor(), [k.id for k in rt.knowledge.all()]) == (1, ["k-e1"])
+
+    def test_without_max_failures_a_failing_event_blocks_delivery(self, open_db):
+        seen = []
+        rt = self.runtime(open_db, _Counting(seen, fail_on="e1"))
+
+        with pytest.raises(RuntimeError):
+            rt.append(ev("e1", "x"))
+        for _ in range(4):
+            with pytest.raises(RuntimeError):
+                rt.sync()
+        with pytest.raises(RuntimeError):
+            rt.append(ev("e2", "y"))
+
+        assert seen == ["e1"] * 6
+        assert (rt.state.cursor(), rt.knowledge.all(), rt.skipped) == (0, [], [])
+
+    def test_max_failures_skips_the_event_and_delivers_the_rest(self, open_db):
+        seen = []
+        rt = self.runtime(open_db, _Counting(seen, fail_on="e1"), max_failures=3)
+
+        with pytest.raises(RuntimeError):
+            rt.append(ev("e1", "x"))
+        with pytest.raises(RuntimeError):
+            rt.sync()
+        rt.append(ev("e2", "y"))  # third attempt on e1 gives up, then e2 is delivered
+
+        assert seen == ["e1", "e1", "e1", "e2"]
+        assert [(s.seq, s.event_id, s.attempts, s.error) for s in rt.skipped] == [(1, "e1", 3, "RuntimeError: boom")]
+        assert rt.state.cursor() == 2
+        assert [k for k, _ in rt.state.scan()] == ["v0/e2"]  # nothing e1 wrote was kept
+        assert [k.id for k in rt.knowledge.all()] == ["k-e2"]
+
+        later = []
+        self.runtime(open_db, _Counting(later, fail_on="e1"), max_failures=3).sync()
+        assert later == []  # another process does not retry the skipped event
 
     def test_state_knowledge_and_cursor_survive_reopening(self, open_db):
         self.runtime(open_db, _Counting([])).append(ev("e1", "x"))

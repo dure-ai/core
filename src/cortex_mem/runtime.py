@@ -43,6 +43,17 @@ class Verdict:
     at: datetime
 
 
+@dataclass(frozen=True)
+class Skipped:
+    """An event the runtime stopped trying to deliver after `max_failures`
+    failed attempts. The engine never saw it; the event stays in the log."""
+
+    seq: int
+    event_id: str
+    attempts: int
+    error: str  # the last exception, as "Type: message"
+
+
 class _StagedState:
     """StateStore handed to the engine: writes stay here until the runtime commits.
 
@@ -96,7 +107,15 @@ class _StagedState:
 class Runtime:
     """`transaction` opens one write transaction across the stores. A durable
     backend passes it so that delivering one event (cursor, engine state and
-    knowledge writes) is all or nothing and serialized across processes."""
+    knowledge writes) is all or nothing and serialized across processes.
+
+    `max_failures` is how many times `observe` may fail on one event before the
+    runtime skips it and moves on. None (the default) never skips: the error is
+    raised every time, and delivery stays stuck on that event. A long-running
+    server sets it so one bad event cannot block every caller; the harness
+    leaves it None so an engine failure is never hidden. Failures are counted
+    per Runtime (per process), and skipped events are listed in `skipped`.
+    """
 
     def __init__(
         self,
@@ -105,13 +124,19 @@ class Runtime:
         knowledge: KnowledgeStore,
         state: EngineStateBackend,
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
+        max_failures: int | None = None,
     ) -> None:
+        if max_failures is not None and max_failures < 1:
+            raise ValueError("max_failures must be at least 1, or None to never skip")
         self.engine = engine
         self.events = events
         self.knowledge = knowledge
         self.state = state
         self.transaction = transaction
+        self.max_failures = max_failures
         self.verdicts: list[Verdict] = []
+        self.skipped: list[Skipped] = []
+        self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._version_checked = False
 
     @property
@@ -133,7 +158,8 @@ class Runtime:
     def sync(self) -> int:
         """Deliver events appended since the cursor, in order, one transaction
         each. Returns how many this call delivered. If the engine raises, that
-        event stays undelivered and is retried next time."""
+        event stays undelivered and is retried next time, until `max_failures`
+        attempts have failed; then it is skipped (see `skipped`)."""
         self._check_state_version()
         delivered = 0
         while True:
@@ -144,12 +170,32 @@ class Runtime:
                     return delivered
                 seq, event = pending
                 staged = _StagedState(self.state)
-                decisions = self.engine.observe(event, self._ctx(staged))
+                try:
+                    decisions = self.engine.observe(event, self._ctx(staged))
+                except Exception as exc:
+                    if not self._give_up(seq, event, exc):
+                        raise
+                    try:
+                        self.state.commit(cursor, seq, {}, set())  # past it, with none of its writes
+                    except CursorConflict:
+                        pass  # another process moved on first
+                    continue
                 try:
                     self._commit(decisions, staged, cursor, seq, event.at)
                 except CursorConflict:
                     continue  # another process delivered it first; read the cursor again
+                self._failures.pop(seq, None)
             delivered += 1
+
+    def _give_up(self, seq: int, event: Event, exc: Exception) -> bool:
+        """Count a failed attempt; True when the event is to be skipped now."""
+        attempts = self._failures.get(seq, 0) + 1
+        if self.max_failures is None or attempts < self.max_failures:
+            self._failures[seq] = attempts
+            return False
+        self._failures.pop(seq, None)
+        self.skipped.append(Skipped(seq, event.id, attempts, f"{type(exc).__name__}: {exc}"))
+        return True
 
     def _check_state_version(self) -> None:
         """Drop the engine's state and start delivery over when the engine's
