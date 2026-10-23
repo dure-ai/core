@@ -14,6 +14,7 @@ Environment variables (all optional):
     CORTEX_RECORD_SCOPE  default scope of what is recorded          (default: personal)
     CORTEX_REPO_SCOPES   per-repo defaults, comma-separated fnmatch pattern=scope,
                          e.g. "acme/*=team,acme/handbook=org"
+    CORTEX_MAX_FAILURES  failed deliveries of one event before it is skipped (default: 3)
 
 One server process is one session: Claude Code starts a process per session.
 Processes share the SQLite file; the runtime delivers each event once.
@@ -21,6 +22,7 @@ Processes share the SQLite file; the runtime delivers each event once.
 
 import getpass
 import importlib
+import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ ENGINE_ALIASES = {
     "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
+log = logging.getLogger("cortex_mem_server")
 
 
 def _narrow(requested: Scope | None, default: Scope) -> Scope:
@@ -113,27 +116,56 @@ class Service:
         repo: str | None = None,
         policy: ScopePolicy = ScopePolicy(),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        max_failures: int | None = None,
     ) -> None:
         name, built = load_engine(engine)
-        self.runtime = Runtime(built, db.events, db.knowledge, db.state(name), transaction=db.transaction)
+        self.runtime = Runtime(
+            built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures
+        )
         self.user, self.team, self.session, self.agent = user, team, session, agent
         self.repo = repo  # the configured repo: picks the scope policy; a tool argument only says where
         self.policy = policy
         self.clock = clock
+        self._skipped_logged = 0
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
         caller = Caller(
             user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent,
             repo=repo or self.repo, context=context or {},
         )
-        self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
+        try:
+            self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
+        except Exception:
+            # An engine failure must not stop the tool call; the runtime retries
+            # the event next time and skips it after max_failures attempts.
+            log.exception("engine failed while catching up; continuing")
+        self._log_skipped()
         return caller
 
-    def _append(self, caller: Caller, **fields) -> str:
-        return self.runtime.append(
-            Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
-                  session=caller.session, agent=caller.agent, **fields)
-        )
+    def _append(self, caller: Caller, **fields) -> tuple[str, bool]:
+        """Append an event; returns its id and whether the engine has seen it.
+        Once stored, the event is not lost if delivery fails: it is retried
+        later, so the agent must not record it again."""
+        event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
+                      session=caller.session, agent=caller.agent, **fields)
+        try:
+            self.runtime.append(event)
+        except Exception:
+            if not self.runtime.events.get([event.id]):
+                raise  # refused before it was stored (e.g. missing refs)
+            log.exception("event %s stored, but the engine failed to take it in", event.id)
+            return event.id, False
+        finally:
+            self._log_skipped()
+        return event.id, True
+
+    def _log_skipped(self) -> None:
+        for skipped in self.runtime.skipped[self._skipped_logged:]:
+            log.error(
+                "skipped event %s after %d failed deliveries: %s",
+                skipped.event_id, skipped.attempts, skipped.error,
+            )
+        self._skipped_logged = len(self.runtime.skipped)
 
     def record(
         self,
@@ -146,11 +178,11 @@ class Service:
     ) -> dict:
         caller = self._caller(repo)
         effective = self.policy.resolve(scope, self.repo)
-        id = self._append(
+        id, delivered = self._append(
             caller, kind="record", scope=effective, text=text, signal="self",
             conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
-        return {"id": id, "scope": effective}
+        return {"id": id, "scope": effective, "delivered": delivered}
 
     def recall(
         self,
@@ -178,11 +210,11 @@ class Service:
     ) -> dict:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
-        id = self._append(
+        id, delivered = self._append(
             caller, kind="outcome", scope=effective, text=text, outcome=outcome,
             signal=signal, refs=tuple(refs), repo=caller.repo,
         )
-        return {"id": id, "scope": effective}
+        return {"id": id, "scope": effective, "delivered": delivered}
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
@@ -214,6 +246,7 @@ def get_service() -> Service:
             policy=ScopePolicy.parse(
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
+            max_failures=int(os.environ.get("CORTEX_MAX_FAILURES", "3")),
         )
     return _service
 
@@ -233,7 +266,9 @@ def record_episode(
     conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
     memories this builds on. repo/rev: where the evidence is (repo, commit);
     repo defaults to the project's configured repo and does not change who may
-    see the record. Returns the id and the scope actually used."""
+    see the record. Returns the id, the scope actually used, and delivered:
+    false means it is stored and will reach memory later, so do not record it
+    again."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 
@@ -267,7 +302,8 @@ def report_outcome(
     "success", "failure", or "unknown". signal says who judged it: "self", "test",
     "review", "human", or "doc". This is how memories earn or lose trust.
     By default the report is visible to whoever can see the judged memories;
-    scope can only narrow that. Returns the id and the scope actually used."""
+    scope can only narrow that. Returns the id, the scope actually used, and
+    delivered (false: stored, reaches memory later; do not report it again)."""
     try:
         return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
@@ -275,6 +311,7 @@ def report_outcome(
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")  # stderr
     mcp.run()
 
 

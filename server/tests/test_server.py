@@ -235,6 +235,63 @@ class ClockedEngine:
         return []
 
 
+class FailsOnBoom:
+    """PromoteAll, except that any event whose text has "boom" always fails."""
+
+    def __init__(self, config):
+        from cortex_mem.engines.baseline import PromoteAllEngine
+
+        self.inner = PromoteAllEngine(config)
+
+    def observe(self, event, ctx):
+        if "boom" in event.text:
+            raise RuntimeError("engine bug")
+        return self.inner.observe(event, ctx)
+
+    def tick(self, now, ctx):
+        return []
+
+    def handoff(self, query, caller, scope, ctx, k=6):
+        return self.inner.handoff(query, caller, scope, ctx, k)
+
+
+def test_engine_failure_does_not_block_tools_and_the_bad_event_is_skipped(caplog):
+    """PR #2 review: one event the engine always fails on stopped every tool, and
+    a stored record came back as an error, so the agent recorded it again."""
+    db = SqliteDatabase()
+    m = Service(db, f"{__name__}:FailsOnBoom", user="u1", team="t1", session="s1",
+                clock=lambda: T0, max_failures=3)
+
+    bad = m.record("boom")
+    assert bad["delivered"] is False and db.events.get([bad["id"]])  # stored, not lost
+
+    good = m.record("deploy uses release tags")  # attempts 2 and 3 on "boom", then skipped
+
+    assert good["delivered"] is True
+    assert [h["content"] for h in m.recall("deploy tags")] == ["deploy uses release tags"]
+    assert [s.event_id for s in m.runtime.skipped] == [bad["id"]]
+    assert f"skipped event {bad['id']} after 3 failed deliveries" in caplog.text
+
+
+def test_without_max_failures_the_service_keeps_retrying():
+    db = SqliteDatabase()
+    m = Service(db, f"{__name__}:FailsOnBoom", user="u1", team="t1", session="s1", clock=lambda: T0)
+
+    m.record("boom")
+    later = m.record("deploy uses release tags")
+
+    assert later["delivered"] is False and m.runtime.skipped == []
+    assert m.runtime.state.cursor() == 0
+
+
+def test_refused_event_is_still_an_error():
+    m = Service(SqliteDatabase(), f"{__name__}:FailsOnBoom", user="u1", team="t1", session="s1",
+                clock=lambda: T0, max_failures=3)
+
+    with pytest.raises(ValueError, match="needs refs"):
+        m.report_outcome("failure", [])
+
+
 def test_each_call_lets_time_pass_for_the_engine():
     ClockedEngine.ticks = []
     now = [T0]
