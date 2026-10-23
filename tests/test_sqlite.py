@@ -83,3 +83,31 @@ def test_old_schema_is_refused(tmp_path):
 
     with pytest.raises(RuntimeError, match="schema"):
         SqliteDatabase(path)
+
+
+def test_schema_2_file_gains_text_redacted(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "v2.db"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE events (seq INTEGER PRIMARY KEY, id, kind, at, user, team, session, scope, text, agent, "
+        "signal, outcome, conditions, refs, repo, rev, UNIQUE (id))"
+    )
+    con.execute(
+        "INSERT INTO events (id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, "
+        "refs, repo, rev) VALUES ('e1', 'record', ?, 'u1', 't1', 's1', 'personal', 'old', NULL, NULL, NULL, "
+        "'{}', '[]', NULL, NULL)",
+        (T0.isoformat(),),
+    )
+    con.execute("PRAGMA user_version = 2")
+    con.commit()
+    con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 3
+    [old] = db.events.get(["e1"])
+    assert (old.text, old.text_redacted) == ("old", False)
+    db.events.append(ev("e2", "new"))
+    assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]

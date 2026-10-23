@@ -210,11 +210,14 @@ class Service:
     ) -> dict:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
+        # The judgement must reach whoever sees the judged item, but the agent's
+        # words follow the repo's policy: past it, only the judgement is shared.
+        redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
         id, delivered = self._append(
-            caller, kind="outcome", scope=effective, text=text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=caller.repo,
+            caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
+            signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
         )
-        return {"id": id, "scope": effective, "delivered": delivered}
+        return {"id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered}
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
@@ -301,9 +304,12 @@ def report_outcome(
     """Report whether recalled memories (refs = their ids, at least one) helped:
     "success", "failure", or "unknown". signal says who judged it: "self", "test",
     "review", "human", or "doc". This is how memories earn or lose trust.
-    By default the report is visible to whoever can see the judged memories;
-    scope can only narrow that. Returns the id, the scope actually used, and
-    delivered (false: stored, reaches memory later; do not report it again)."""
+    By default the judgement (outcome, signal, refs) is visible to whoever can
+    see the judged memories, e.g. the whole org for an org memory; scope can
+    only narrow that. If that is wider than this repo's policy, text is not
+    stored (text_redacted: true). Returns the id, the scope actually used,
+    text_redacted, and delivered (false: stored, reaches memory later; do not
+    report it again)."""
     try:
         return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed

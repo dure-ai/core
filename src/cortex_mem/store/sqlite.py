@@ -26,13 +26,13 @@ from typing import Any
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _WORD = re.compile(r"\w+")
 _HANGUL = re.compile(r"[가-힣]")
 _EVENT_COLUMNS = (
     "id, kind, at, user, team, session, scope, text, agent, signal, outcome, "
-    "conditions, refs, repo, rev"
+    "conditions, refs, repo, rev, text_redacted"
 )
 _KNOWLEDGE_COLUMNS = "id, kind, title, body, scope, owner, sources, conditions"
 _EVENT_VISIBLE = (
@@ -64,11 +64,12 @@ def _match(query: str) -> str | None:
 
 
 def _row_to_event(row: tuple) -> Event:
-    id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev = row
+    id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
     return Event(
         id=id, kind=kind, at=datetime.fromisoformat(at), user=user, team=team, session=session,
         scope=scope, text=text, agent=agent, signal=signal, outcome=outcome,
         conditions=json.loads(conditions), refs=tuple(json.loads(refs)), repo=repo, rev=rev,
+        text_redacted=bool(redacted),
     )
 
 
@@ -94,7 +95,11 @@ class SqliteDatabase:
     def _create(self) -> None:
         version = self.con.execute("PRAGMA user_version").fetchone()[0]
         has_tables = self.con.execute("SELECT count(*) FROM sqlite_master WHERE name = 'events'").fetchone()[0]
-        if has_tables and version != SCHEMA_VERSION:
+        if has_tables and version == 2:
+            with self.transaction():  # 2 -> 3: events.text_redacted
+                self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
+                self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif has_tables and version != SCHEMA_VERSION:
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
             self.con.execute(
@@ -151,11 +156,11 @@ class SqliteEventStore:
         try:
             with self.db.transaction():
                 cur = self.db.con.execute(
-                    f"INSERT INTO events ({_EVENT_COLUMNS}) VALUES ({', '.join('?' * 15)})",
+                    f"INSERT INTO events ({_EVENT_COLUMNS}) VALUES ({', '.join('?' * 16)})",
                     (
                         e.id, e.kind, e.at.isoformat(), e.user, e.team, e.session, e.scope, e.text,
                         e.agent, e.signal, e.outcome, json.dumps(dict(e.conditions)),
-                        json.dumps(list(e.refs)), e.repo, e.rev,
+                        json.dumps(list(e.refs)), e.repo, e.rev, int(e.text_redacted),
                     ),
                 )
                 self.db.con.execute(

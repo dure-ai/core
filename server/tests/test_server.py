@@ -141,6 +141,38 @@ def test_outcome_scope_can_be_narrowed_and_falls_back_to_policy():
     assert elsewhere.report_outcome("failure", ["not-knowledge"], repo="acme/api")["scope"] == "personal"
 
 
+def test_outcome_wider_than_repo_policy_keeps_the_judgement_but_not_the_text():
+    """PR #2 review: a report from a personal-policy repo on org knowledge was
+    shared org-wide together with the agent's words."""
+    db = SqliteDatabase()
+    policy = ScopePolicy.parse("personal", "acme/handbook=org")
+    writer = service(db, user="u1", policy=policy, repo="acme/handbook", engine=f"{__name__}:DemoteOnFailure")
+    writer.record("release notes go in CHANGELOG.md")
+    [hit] = writer.recall("release notes")
+    bob = service(db, user="bob", team="t9", policy=policy, repo="bob/private",
+                  engine=f"{__name__}:DemoteOnFailure")
+
+    report = bob.report_outcome("failure", [hit["id"]], text="failed in my private repo at /secret/x")
+
+    assert (report["scope"], report["text_redacted"]) == ("org", True)
+    [event] = db.events.get([report["id"]])
+    assert (event.scope, event.text, event.text_redacted, event.refs) == ("org", "", True, (hit["id"],))
+    assert db.knowledge.all() == []  # the judgement still demotes
+
+
+def test_outcome_within_repo_policy_keeps_its_text():
+    db = SqliteDatabase()
+    policy = ScopePolicy.parse("personal", "acme/*=team")
+    m = service(db, policy=policy, repo="acme/api")
+    m.record("deploy needs approval")
+    [hit] = m.recall("deploy")
+
+    report = m.report_outcome("failure", [hit["id"]], text="approval step was removed")
+
+    assert (report["scope"], report["text_redacted"]) == ("team", False)
+    assert db.events.get([report["id"]])[0].text == "approval step was removed"
+
+
 def test_configured_repo_applies_scope_policy_without_the_agent_passing_it():
     db = SqliteDatabase()
     m = service(db, policy=ScopePolicy.parse("personal", "acme/*=team"), repo="acme/api")

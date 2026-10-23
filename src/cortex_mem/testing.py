@@ -63,7 +63,7 @@ class EventStoreContract(_Contract):
         original = Event(
             id="e1", kind="outcome", at=T0, user="u1", team="t1", session="s1", scope="team",
             text="ci passed", agent="claude-code", signal="test", outcome="success",
-            conditions={"service": "a"}, refs=("h1", "h2"), repo="org/repo", rev="abc123",
+            conditions={"service": "a"}, refs=("h1", "h2"), repo="org/repo", rev="abc123", text_redacted=True,
         )
         store.append(original)
 
