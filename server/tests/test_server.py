@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 
@@ -367,3 +368,16 @@ def test_stdio_outcome_without_refs_tells_the_agent_why(tmp_path):
     result = call(tmp_path / "cortex.db", "report_outcome", {"outcome": "failure", "refs": []}, raw=True)
 
     assert result.is_error and "needs refs" in result.content[0].text
+
+
+def test_server_refuses_to_start_without_a_team(tmp_path):
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CORTEX_")}
+    env["CORTEX_DB_PATH"] = str(tmp_path / "cortex.db")
+    result = subprocess.run(
+        [sys.executable, "-m", "cortex_mem_server.server"], env=env, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=30, check=False,
+    )
+
+    assert result.returncode != 0 and "set CORTEX_TEAM" in result.stderr

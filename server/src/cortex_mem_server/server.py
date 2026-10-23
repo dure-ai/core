@@ -2,14 +2,16 @@
 tool arguments -> Caller + scope policy -> Runtime. Storage, delivery and
 checks live in the runtime and the stores; the engine is picked by config.
 
-Environment variables (all optional):
+Environment variables (only CORTEX_TEAM is required):
+    CORTEX_TEAM          the user's team; the server refuses to start without it, since
+                         records filed under the wrong team cannot be moved later
     CORTEX_DB_PATH       SQLite file                    (default: ~/.cortex-mem/cortex.db)
-    CORTEX_USER          who is recording               (default: OS user)
-    CORTEX_TEAM          the user's team                (default: default)
+    CORTEX_USER          who is recording               (default: OS user, with a notice)
     CORTEX_AGENT         client name, e.g. claude-code  (default: unset)
     CORTEX_REPO          repository this project works in, e.g. acme/api (default: unset);
-                         set it per project (.mcp.json) so scope policy and engines know
-                         where work happens without the agent passing repo
+                         register the server per project (`claude mcp add -s local -e
+                         CORTEX_REPO=...`) so it picks the repo's scope policy and tells
+                         engines where work happens; the agent cannot change the policy
     CORTEX_ENGINE        promote_all | no_memory | module:factory   (default: promote_all)
     CORTEX_RECORD_SCOPE  default scope of what is recorded          (default: personal)
     CORTEX_REPO_SCOPES   per-repo defaults, comma-separated fnmatch pattern=scope,
@@ -233,16 +235,32 @@ mcp = MCPServer("cortex-mem")
 _service: Service | None = None
 
 
+def _identity() -> tuple[str, str]:
+    """(user, team) from the environment. A missing team stops the server."""
+    team = os.environ.get("CORTEX_TEAM", "").strip()
+    if not team:
+        raise SystemExit(
+            "cortex-mem: set CORTEX_TEAM to your team (e.g. -e CORTEX_TEAM=payments); "
+            "team records are shared by this name and cannot be moved later"
+        )
+    user = os.environ.get("CORTEX_USER", "").strip()
+    if not user:
+        user = getpass.getuser()
+        log.warning("CORTEX_USER is not set; recording as the OS user %r", user)
+    return user, team
+
+
 def get_service() -> Service:
     global _service
     if _service is None:
+        user, team = _identity()
         path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         _service = Service(
             SqliteDatabase(path),
             engine=os.environ.get("CORTEX_ENGINE", "promote_all"),
-            user=os.environ.get("CORTEX_USER") or getpass.getuser(),
-            team=os.environ.get("CORTEX_TEAM", "default"),
+            user=user,
+            team=team,
             session=uuid4().hex,
             agent=os.environ.get("CORTEX_AGENT"),
             repo=os.environ.get("CORTEX_REPO") or None,
@@ -318,6 +336,7 @@ def report_outcome(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")  # stderr
+    _identity()  # fail at start, not at the first tool call
     mcp.run()
 
 
