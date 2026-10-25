@@ -323,8 +323,8 @@ class Database(Protocol):                                     # 한 연결 뒤�
 - [x] 저장소 정책보다 넓은 outcome은 `text`를 비우고 `Event.text_redacted` (§2, §3-8)
 - [x] append 위치는 커밋 순서, 판정 기준선 비교는 인메모리 저장소 기준, 한국어 검색은 `simple` (§4, §5)
 
-**나중에 논의**
-- [ ] 레포 이름 (`mcp-server`가 core까지 담고 있음)
+**합의됨 (10/25)**
+- [x] 레포 이름은 `cortex-mem/core` (계약·런타임·저장소와 MCP 서버를 함께 담음). 패키지 이름 `cortex-mem`·`cortex-mem-server`는 그대로
 
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
