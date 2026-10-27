@@ -1,0 +1,29 @@
+[project]
+name = "cortex-mem-server"
+version = "0.1.0"
+description = "MCP server for cortex-mem: turns MCP tool calls into runtime calls."
+requires-python = ">=3.12,<3.15"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The cortex-mem authors" }]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "cortex-mem",
+    "mcp>=2.3,<3",
+]
+
+[project.scripts]
+cortex-mem-server = "cortex_mem_server.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cortex_mem_server"]
+
+[tool.uv.sources]
+cortex-mem = { workspace = true }

@@ -48,6 +48,10 @@ class Event:
 
     A recall event's repo and conditions are where the question was asked
     (Caller.repo and Caller.context).
+
+    text_redacted: the caller left out the text it was given. The server does
+    this for an outcome whose audience is wider than the repo's policy: the
+    judgement (outcome, signal, refs) is shared, the agent's words are not.
     """
 
     id: str
@@ -65,6 +69,7 @@ class Event:
     refs: tuple[str, ...] = ()
     repo: str | None = None  # where the evidence came from, e.g. commit or CI run
     rev: str | None = None
+    text_redacted: bool = False
 
     def __post_init__(self) -> None:
         _require_tz(self.at, f"Event.at ({self.id})")

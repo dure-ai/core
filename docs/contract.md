@@ -50,6 +50,7 @@ flowchart TB
 | `conditions` | Mapping[str, str] | **이 주장이 참인 조건만**. 예: `{"repo": "api", "service": "A"}`. 생성 시 읽기 전용으로 고정된다 |
 | `refs` | tuple[str, ...] | 다른 항목을 가리키는 id (§3-2) |
 | `repo`, `rev` | str? | 근거가 나온 곳(저장소, 커밋·CI 실행 id). `conditions`와 섞지 않는다 |
+| `text_redacted` | bool | 호출자가 받은 `text`를 저장하지 않았다는 표시(기본 `False`). 서버는 저장소 정책보다 넓게 공개되는 outcome에서 판정만 남기고 본문을 비운다(§3-8). 엔진은 "원래 본문이 없는 판정"과 구분할 수 있다 |
 
 `conditions`에는 조건부 사실을 판정하는 데 필요한 맥락(`repo`, `service`, `db` …)을 넣는다. 키 이름은 소문자 snake_case로 쓴다.
 
@@ -57,7 +58,7 @@ flowchart TB
 
 `user`, `team`, `session`, `at`(timezone 필수), `agent`, `repo`, `context`. 서버는 연결과 설정에서, 하니스는 시나리오(가상 시각)에서 채운다. 질의 범위 `scope`는 Caller와 별도 인자로 받는다.
 
-- `repo`: 지금 작업 중인 저장소. 서버는 프로젝트별 설정 `CORTEX_REPO`를 기본값으로 쓰고, 도구 인자로 덮어쓸 수 있다. 하니스는 문항의 repo.
+- `repo`: 지금 작업 중인 저장소. 서버는 프로젝트별 설정 `CORTEX_REPO`를 기본값으로 쓰고, 도구 인자로 덮어쓸 수 있다. 하니스는 문항의 repo. 도구 인자는 위치만 바꾸고 scope 정책은 바꾸지 못한다(§3-8).
 - `context`: 질문한 맥락(`{"service": "api"}` 등). 키 규칙은 `conditions`와 같다. 생성 시 읽기 전용으로 고정된다.
 - 조건부 사실(`Event.conditions`)이 이 질문에 해당하는지 판단하는 건 **엔진 몫**이다. 런타임은 `repo`·`context`로 거르지 않는다.
 - recall 이벤트는 `repo`·`conditions`에 질문한 곳(`Caller.repo`, `Caller.context`)을 남긴다.
@@ -143,6 +144,9 @@ class Engine(Protocol):
 
 1. 모든 이벤트는 `append` 순서대로 **정확히 한 번** `observe`에 전달된다. 커서는 런타임이 관리하고, 엔진은 재생이나 커서를 신경 쓰지 않는다.
 2. 이벤트 하나의 전달은 트랜잭션 하나다. `observe`가 반환하면 그 호출의 상태 쓰기, 결정 반영, 커서 이동이 함께 반영된다. `observe`가 예외를 던지면 아무것도 반영되지 않고, 그 이벤트는 다음 `sync` 때 다시 전달된다. 다른 프로세스가 먼저 전달했으면(`CursorConflict`) 이쪽 결과는 버리고 커서를 다시 읽는다.
+   - **계속 실패하는 이벤트**: `Runtime(..., max_failures=N)`이면 같은 이벤트에서 `observe`가 N번 실패했을 때 그 이벤트를 건너뛴다. 커서만 넘기고 그 호출의 쓰기는 남기지 않으며, `Runtime.skipped`(`seq`, `event_id`, `attempts`, `error`)에 남긴다. 이벤트 자체는 로그에 남는다. 기본값 `None`은 건너뛰지 않고 매번 예외를 던진다.
+   - 하니스는 `None`으로 쓴다. 엔진 실패를 조용히 넘기면 "엔진이 실패했는데 점수는 나온" 상태가 되기 때문이다. 서버는 한 이벤트가 모든 세션을 막지 않도록 `CORTEX_MAX_FAILURES`(기본 3)로 켠다.
+   - 실패 횟수와 `skipped`는 `verdicts`처럼 프로세스 메모리에만 있다(영속화는 §6).
 3. 이벤트는 `append` 뒤에 전달되므로, 엔진은 `observe` 안에서 그 이벤트를 `ctx.events.get`할 수 있다.
 4. `handoff` 직전에 런타임이 밀린 이벤트를 먼저 전달한다. 그래서 세션 B도 세션 A가 남긴 기록을 반영한 상태로 답한다.
 5. recall 한 번은 이렇게 흐른다(`Runtime.recall`).
@@ -224,8 +228,9 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
   ```
   증거 키에 `event_id`를 넣으면 같은 이벤트를 다시 받아도 두 번 세지 않는다(재전달에 대한 안전장치).
 - **상태 형식 버전**: 엔진에 `state_version: str`을 두면, 저장된 버전과 다를 때 런타임이 상태를 지우고 커서를 0으로 돌려 이벤트 로그 처음부터 다시 전달한다. 마이그레이션 코드는 필요 없다. 지식 베이스는 지우지 않는다(다시 나온 Promote가 같은 id를 덮어쓴다). 버전이 다른 서버 프로세스를 동시에 띄우지 않는다.
-- record의 scope 기본값은 서버 설정(저장소 → 기본 scope)이 정하고, 에이전트는 기본값보다 **좁히는 것만** 할 수 있다. recall의 기본 scope는 볼 수 있는 가장 넓은 범위다.
+- record의 scope 기본값은 서버 설정(저장소 → 기본 scope)이 정하고, 에이전트는 기본값보다 **좁히는 것만** 할 수 있다. 저장소 정책은 설정된 저장소(`CORTEX_REPO`)로만 고른다. 도구 인자 `repo`는 근거 위치(`Event.repo`)만 바꾸므로, 기본값이 더 넓은 저장소 이름을 넘겨 범위를 넓힐 수 없다. 설정된 저장소가 없으면 기본 정책(`CORTEX_RECORD_SCOPE`)만 적용한다. recall의 기본 scope는 볼 수 있는 가장 넓은 범위다.
 - outcome(결과 보고)의 scope 기본값은 **판정 대상 지식의 범위**다. 그래야 팀 지식을 강등하는 근거가 된다. 에이전트는 좁히는 것만 할 수 있다. 하니스처럼 scope를 직접 정하는 호출자는 팀 지식에 대한 결과 이벤트를 team으로 넣어야 강등이 일어난다.
+- 그 범위가 설정된 저장소의 정책보다 넓으면(예: personal 정책 저장소에서 org 지식을 판정) 서버는 판정(`outcome`·`signal`·`refs`)만 남기고 `text`를 비운 뒤 `text_redacted=True`로 표시한다. 강등에 필요한 건 판정이고, 에이전트가 쓴 본문(경로, 내부 사정)은 저장소 정책을 따른다. refs에 범위가 다른 항목이 섞이면 가장 넓은 범위 하나로 남는다.
 
 ## 4. 하니스
 
@@ -245,7 +250,8 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 - 엔진마다 시나리오별로 새 `InMemoryDatabase`와 `Runtime`을 만들어 같은 이벤트를 흘려 넣는다. 하니스는 엔진을 직접 부르지 않고 런타임만 부른다(서버와 같은 진입점).
 - 주 채점은 에이전트에게 건넨 결과(handoff)로 한다. 지식 베이스 상태(`knowledge.all()`)는 신뢰도 채점(Brier, v0.2) 같은 선택 기능에만 쓴다.
-- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다.
+- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다. **비교는 인메모리 저장소 기준**이다. 저장소 구현마다 검색 점수 함수가 달라(SQLite FTS5 `bm25`, PostgreSQL `ts_rank`) 같은 데이터에서도 순위가 달라질 수 있으므로, 하니스 비교는 저장소 구현 하나로 고정한다.
+- 런타임은 `max_failures=None`(기본값)으로 만든다(§3-1).
 - 관찰 지표: 결정 기록(`verdicts`: 승인·거부, 사유, 근거 id), `why`별 강등 수, handoff 필터에 걸린 수.
 
 ## 5. 고정 부분의 저장소 인터페이스 (`store/base.py`)
@@ -255,7 +261,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 ```python
 class EventStore(EventReader, Protocol):
     def append(self, event) -> str: ...
-    def since(self, seq) -> Iterator[tuple[int, Event]]: ...   # 위치는 1부터, 늘어나기만
+    def since(self, seq) -> Iterator[tuple[int, Event]]: ...   # 위치는 1부터, 커밋 순서대로 늘어나기만
 
 class KnowledgeStore(KnowledgeReader, Protocol):
     def put(self, item) -> None: ...
@@ -279,6 +285,8 @@ class Database(Protocol):                                     # 한 연결 뒤�
 - `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인한다. `search` 점수는 "높을수록 좋음"만 약속한다.
 - 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **한 트랜잭션**으로 묶고 프로세스 사이에서 직렬화한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
+- **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, append를 `transaction()` 안에서 잠금(advisory lock 등)으로 직렬화한다. PG 구현에는 동시 append 두 개를 섞는 적합성 테스트를 추가한다(지금의 `DatabaseContract`로는 잡히지 않는다).
+- **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL도 `to_tsvector('simple', words || ' ' || grams)`로 같은 토큰을 쓰면 확장 없이 옮겨진다.
 
 ## 6. v0.2 이후로 미룬 것
 
@@ -287,7 +295,7 @@ class Database(Protocol):                                     # 한 연결 뒤�
   - **기존 연구 채점이 시작되기 전까지 필요하다.**
 - **HTTP 전송과 인증**: 토큰 → (user, team). 서버 PR 이후.
 - **팀 간(org) 승격**: 여러 팀의 지식을 org로 올리는 경로. v0.1은 org 이벤트만 org 지식의 근거가 된다.
-- **결정 기록의 영속화와 엔진에 알리기**: v0.1은 `Runtime.verdicts`(메모리)에만 남는다. 위키 커밋 메시지에 같은 내용을 남기는 것은 위키 반영기와 함께.
+- **결정 기록의 영속화와 엔진에 알리기**: v0.1은 `Runtime.verdicts`와 `Runtime.skipped`(메모리)에만 남는다. 위키 커밋 메시지에 같은 내용을 남기는 것은 위키 반영기와 함께.
 - **personal 기록 롤업**: §3-4의 집계 이벤트 방식.
 - **사람 승인·커밋 입력 경로**: 관리 CLI, Git·CI 훅으로 `human_confirm`·`commit` 이벤트를 넣는 관례.
 - 계약을 바꿀 때는 `CONTRACT_VERSION`을 올리고 근거를 이 문서에 남긴다.
@@ -309,12 +317,17 @@ class Database(Protocol):                                     # 한 연결 뒤�
 - [x] outcome scope 기본값 = 판정 대상 지식의 범위 (§3-8)
 - [x] 질문 맥락 `Caller.repo`·`context` (§2), outcome·human_confirm의 refs는 append에서 검사 (§3-2)
 
-**나중에 논의**
-- [ ] 레포 이름 (`mcp-server`가 core까지 담고 있음)
+**합의됨 (10/21, PR #2 리뷰)**
+- [x] scope 정책은 설정된 저장소로만 고른다. 도구 인자 `repo`는 위치만 (§3-8)
+- [x] 계속 실패하는 이벤트: `Runtime(max_failures=N)`, `Runtime.skipped`. 하니스는 `None`, 서버는 `CORTEX_MAX_FAILURES`(기본 3) (§3-1)
+- [x] 저장소 정책보다 넓은 outcome은 `text`를 비우고 `Event.text_redacted` (§2, §3-8)
+- [x] append 위치는 커밋 순서, 판정 기준선 비교는 인메모리 저장소 기준, 한국어 검색은 `simple` (§4, §5)
+
+**합의됨 (10/25)**
+- [x] 레포 이름은 `cortex-mem/core` (계약·런타임·저장소와 MCP 서버를 함께 담음). 패키지 이름 `cortex-mem`·`cortex-mem-server`는 그대로
 
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
-- [ ] 한국어 전문 검색: `simple` 설정으로 갈지, pg_bigm 같은 확장을 쓸지.
 - [ ] 공용 DB 위치: team scope는 공용 DB가 있어야 사람 간 독립 출처를 셀 수 있다.
 
 **모두**
@@ -366,6 +379,8 @@ class ExternalMemoryAdapter:
 - scope: personal < team < org. personal 기록은 팀 지식의 근거가 될 수 없음
 - Event에 team 추가, conditions는 읽기 전용, Caller(user, team, session, at, agent, repo, context) 도입
 - outcome·human_confirm은 refs(판정 대상 id) 없으면 append 거부
+- scope 정책은 설정된 저장소(CORTEX_REPO)로만. 정책보다 넓게 공개되는 outcome은 text를 비우고 text_redacted
+- 계속 실패하는 이벤트는 Runtime(max_failures=N)이 건너뛰고 skipped에 남김(하니스는 None = 건너뛰지 않음)
 - 하니스는 같은 Runtime + InMemoryDatabase로 실행, handoff로 채점. 결정 기록(verdicts)은 관찰 지표
 - 저장소 공통 테스트(cortex_mem.testing): PG 구현도 이걸 상속해 통과하면 계약 준수
 ```

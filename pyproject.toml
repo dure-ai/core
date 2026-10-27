@@ -1,7 +1,7 @@
 [project]
-name = "cortex-mem-mcp"
+name = "cortex-mem"
 version = "0.1.0"
-description = "MCP server and engine port contract for cortex-mem, an agent memory engine that promotes memories to knowledge on evidence."
+description = "Engine port contract and runtime for cortex-mem, an agent memory engine that promotes memories to knowledge on evidence."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = { text = "Apache-2.0" }
@@ -14,7 +14,7 @@ classifiers = [
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "cortex-mem-server"]
 
 [build-system]
 requires = ["hatchling"]
@@ -23,8 +23,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/cortex_mem"]
 
+[tool.uv.workspace]
+members = ["server"]
+
+[tool.uv.sources]
+cortex-mem-server = { workspace = true }
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "server/tests"]
 
 # Check against the lowest supported Python so newer-only syntax is caught.
 [tool.ruff]
