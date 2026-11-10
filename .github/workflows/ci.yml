@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# The job only checks out the code and runs the tests; keep the token read-only whatever the
+# repository default is.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
