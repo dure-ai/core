@@ -8,10 +8,11 @@ from cortex_mem.store.memory import InMemoryDatabase
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
-def ev(id, text="", kind="record", user="u1", signal="self", outcome="unknown", refs=(), minutes=0, **kw):
+def ev(id, text="", kind="record", user="u1", signal="self", outcome="unknown", refs=(), minutes=0,
+       scope="team", **kw):
     return Event(
         id=id, kind=kind, at=T0 + timedelta(minutes=minutes), user=user, team="t1", session=f"s-{id}",
-        scope="team", text=text, signal=signal, outcome=outcome, refs=refs, **kw,
+        scope=scope, text=text, signal=signal, outcome=outcome, refs=refs, **kw,
     )
 
 
@@ -49,15 +50,22 @@ def test_a_passing_outcome_lifts_the_records_it_judges():
     assert ask(rt, "deploy make release") == ["k-right", "k-wrong"]
 
 
-def test_a_human_confirmation_replaces_the_records_it_reviews():
+def test_a_human_confirmation_puts_the_records_it_confirms_first():
     rt = runtime()
-    rt.append(ev("old", "schema lives in struct.py"))
-    rt.append(ev("review", "after the merge the schema lives in models.py", kind="human_confirm",
-                 signal="human", outcome="success", refs=("old",), minutes=1))
+    rt.append(ev("ci", "deploy works with tags", signal="test"))
+    rt.append(ev("note", "deploy uses tags, push a tag to deploy"))
+    rt.append(ev("review", "LGTM", kind="human_confirm", signal="human", outcome="success", refs=("note",)))
 
-    [handoff] = rt.handoff("where does the schema live", Caller(user="u9", team="t1", session="a", at=T0), "team")
-    assert handoff.id == "k-review"
-    assert handoff.sources == ("review",)  # the reviewed note is not cited as support
+    assert ask(rt, "deploy tags") == ["k-note", "k-ci"]  # the bare "LGTM" is not an item
+
+
+def test_a_self_reported_success_does_not_lift_a_record():
+    rt = runtime()
+    rt.append(ev("ci", "deploy works with tags", signal="test"))
+    rt.append(ev("note", "deploy uses tags, push a tag to deploy, tags tags"))
+    rt.append(ev("me", "it worked", kind="outcome", signal="self", outcome="success", refs=("note",)))
+
+    assert ask(rt, "deploy tags") == ["k-ci", "k-note"]
 
 
 def test_a_failure_removes_what_it_judges():
@@ -75,3 +83,30 @@ def test_items_for_another_condition_are_not_handed_off():
     rt.append(ev("any", "deploy needs a tag"))
 
     assert sorted(ask(rt, "deploy release tag", service="api")) == ["k-any", "k-api"]
+
+
+def test_a_late_failure_removes_a_checked_record():
+    rt = runtime()
+    rt.append(ev("e1", "deploy uses tags", signal="test"))
+    rt.append(ev("ci", "failed", kind="outcome", signal="test", outcome="failure", refs=("e1",), minutes=5))
+
+    assert ask(rt, "deploy") == []
+
+
+def test_a_rejected_demote_keeps_the_rank():
+    rt = runtime()
+    rt.append(ev("ci", "deploy works with tags", signal="test"))
+    rt.append(ev("note", "deploy uses tags, push a tag to deploy, tags tags"))
+    # A personal event cannot justify demoting a team item (contract 3-4), so the runtime rejects it.
+    rt.append(ev("mine", "failed", kind="outcome", signal="test", outcome="failure", refs=("ci",),
+                 scope="personal"))
+
+    assert rt.rejections
+    assert ask(rt, "deploy tags") == ["k-ci", "k-note"]
+
+
+def test_the_title_is_the_first_non_blank_line():
+    rt = runtime()
+    rt.append(ev("e1", "\n\ndeploy uses tags\nmore"))
+
+    assert rt.knowledge.get(["k-e1"])[0].title == "deploy uses tags"

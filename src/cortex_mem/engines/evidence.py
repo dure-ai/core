@@ -6,10 +6,11 @@ second. The agent tends to follow the first item, so ranking is where a
 false note loses to a checked one.
 
 - A record with an outside signal (test, review, human, doc) is checked.
-- A passing outcome lifts the items it judges to checked.
-- A human confirmation becomes an item of its own, ranked above checked, and
-  replaces the items it refers to: a reviewer's account of reviewed notes is
-  the newer, checked version of them, whether it agrees or corrects them.
+- A passing outcome with an outside signal lifts the items it judges to
+  checked; an agent's own report of success lifts nothing.
+- A passing human confirmation lifts the items it judges above checked. Its
+  text is not an item: refs name what was judged (contract 3-2), and a bare
+  "LGTM" carries no fact of its own.
 - A failing outcome or confirmation removes the items it judges.
 - An item whose conditions disagree with the caller's context is not handed off.
 
@@ -55,14 +56,15 @@ class EvidenceEngine:
             return []
         judged = self._judged(event.refs, ctx)
         if event.outcome == "failure":
-            return self._demote(judged, "a failure was reported", event, ctx)
+            return self._demote(judged, "a failure was reported", event)
         if event.outcome != "success":
             return []
-        if event.kind == "outcome":
-            for item in judged:
-                ctx.state.put(_rank_key(item.id), max(CHECKED, ctx.state.get(_rank_key(item.id)) or SELF))
+        if event.kind == "outcome" and event.signal in (None, "self"):
             return []
-        return [self._promote(event, CONFIRMED, ctx), *self._demote(judged, "replaced by a review", event, ctx)]
+        rank = CHECKED if event.kind == "outcome" else CONFIRMED
+        for item in judged:
+            ctx.state.put(_rank_key(item.id), max(rank, ctx.state.get(_rank_key(item.id)) or SELF))
+        return []
 
     def tick(self, now: datetime, ctx: EngineContext) -> Sequence[Decision]:
         return []
@@ -86,7 +88,8 @@ class EvidenceEngine:
         ctx.state.put(_rank_key(id), rank)
         return Promote(
             Knowledge(
-                id=id, kind="knowledge", title=event.text.splitlines()[0][:80] if event.text else event.id,
+                id=id, kind="knowledge",
+                title=next((line.strip()[:80] for line in event.text.splitlines() if line.strip()), event.id),
                 body=event.text, scope=event.scope, owner=owner_for(event), sources=(event.id,),
                 conditions=event.conditions,
             )
@@ -96,7 +99,7 @@ class EvidenceEngine:
         """Refs name an item or the event it came from."""
         return ctx.knowledge.get(list(dict.fromkeys(i for r in refs for i in (r, f"k-{r}"))))
 
-    def _demote(self, items: list[Knowledge], reason: str, event: Event, ctx: EngineContext) -> list[Demote]:
-        for item in items:
-            ctx.state.delete(_rank_key(item.id))
+    def _demote(self, items: list[Knowledge], reason: str, event: Event) -> list[Demote]:
+        # The rank stays: the runtime may reject the demote (contract 3-4), and a
+        # removed item is not searched, so its rank is never read.
         return [Demote(item.id, reason, (event.id,), since=event.at) for item in items]

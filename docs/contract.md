@@ -324,7 +324,7 @@ class Database(Protocol):                                     # 한 연결 뒤�
 - [x] append 위치는 커밋 순서, 판정 기준선 비교는 인메모리 저장소 기준, 한국어 검색은 `simple` (§4, §5)
 
 **합의됨 (10/25)**
-- [x] 레포 이름은 `cortex-mem/core` (계약·런타임·저장소와 MCP 서버를 함께 담음). 패키지 이름 `cortex-mem`·`cortex-mem-server`는 그대로
+- [x] 레포 이름은 `dure-ai/core` (계약·런타임·저장소와 MCP 서버를 함께 담음). 패키지 이름 `cortex-mem`·`cortex-mem-server`는 그대로
 
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
