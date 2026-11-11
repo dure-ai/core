@@ -26,7 +26,13 @@ def _tokens(text: str) -> list[str]:
 
 def _bm25(query: str, texts: Sequence[str]) -> list[float]:
     """Score each text against the query; `texts` is the whole corpus for IDF."""
-    docs = [Counter(_tokens(text)) for text in texts]
+    # IDF counts only the texts passed in (visible to the caller, of the requested
+    # kinds), like the harness all_store. SQLite FTS5 counts every row of the table
+    # and uses k1=1.2 with an unshifted IDF, so the two stores rank differently;
+    # harness comparisons use this store only (contract §4).
+    # Every search re-tokenizes the corpus: harness scenarios are small, so this
+    # stays simple on purpose instead of keeping an index.
+    docs =[Counter(_tokens(text)) for text in texts]
     lengths = [sum(doc.values()) for doc in docs]
     average = sum(lengths) / len(docs) if docs else 0.0
     scores = [0.0] * len(docs)
