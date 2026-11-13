@@ -616,6 +616,22 @@ def test_someone_elses_recalls_and_other_repos_are_not_named(tmp_path):
     assert fixer.recalled(since=datetime.now(UTC) + timedelta(days=1)) == []
 
 
+def test_a_repo_argument_the_agent_made_up_does_not_hide_the_recall_from_the_hook(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+    since = datetime.now(UTC) + timedelta(days=1)  # past everything handed so far
+    other, again = (service(db, user="u2", session=f"s-{r}", policy=TEAM, engine=TIERS, repo=f"acme/{r}")
+                    for r in ("other", "app"))
+    other.clock = again.clock = lambda: since + timedelta(hours=1)
+
+    other.recall("test run hang", repo="acme/app")  # asked from another project: not this repo's commit
+    assert fixer.recalled(since=since) == []
+    assert [m["id"] for m in again.recall("test run hang", repo="T5-app")] == [old_id]
+
+    assert fixer.recalled(since=since) == [old_id]
+    asked_in = [e.repo for _, e in db.events.since(0) if e.kind == "recall" and e.at > since]
+    assert asked_in == ["acme/app", "T5-app"]  # the events still say where the agent said it asked
+
+
 def test_a_reviewer_replaces_stale_knowledge_with_the_commit(tmp_path):
     db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
 

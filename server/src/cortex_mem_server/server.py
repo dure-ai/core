@@ -48,6 +48,7 @@ ENGINE_ALIASES = {
     "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
+_SERVER_STATE = "cortex_mem_server"  # name of the server's own key-value state in the database
 TRAILER = "Cortex-Record"  # commit message trailer naming a record the commit bears out
 RECALLED_TRAILER = "Cortex-Recalled"  # ... naming knowledge the committer was handed while making it
 log = logging.getLogger("cortex_mem_server")
@@ -132,6 +133,8 @@ class Service:
         self.clock = clock
         self._skipped_logged = 0
         self._cited: set[str] = set()  # what this session's records cite as handed (one process, one session)
+        self._sessions = db.state(_SERVER_STATE)  # the server's own notes: which project a session runs in
+        self._session_noted = False
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
         caller = Caller(
@@ -200,6 +203,20 @@ class Service:
             )
         return result
 
+    def _note_session(self) -> None:
+        """Note that this session runs in the configured repo. A recall event's
+        repo is where the agent said the question was asked, and agents make
+        that up; which project the server runs in is the server's own
+        knowledge. recalled() goes by this note. Never fails the tool call."""
+        if self._session_noted or not self.repo:
+            return
+        try:
+            at = self._sessions.cursor()
+            self._sessions.commit(at, at, {f"session:{self.session}": self.repo}, frozenset())
+            self._session_noted = True
+        except Exception:
+            log.exception("noting the project of session %s failed", self.session)
+
     def _related(self, text: str, caller: Caller, record_id: str, k: int = 3) -> list[dict]:
         """Knowledge the engine hands over for the record's own text. What is
         handed back is logged as a recall, like any handoff, so the engine
@@ -211,6 +228,7 @@ class Service:
                 if h.status == "knowledge" and record_id not in h.sources
             ][:k]
             if handoffs:
+                self._note_session()
                 self._append(
                     caller, kind="recall", scope="personal", text=text, refs=tuple(h.id for h in handoffs),
                     repo=caller.repo, conditions=caller.context,
@@ -229,6 +247,7 @@ class Service:
         context: Mapping[str, str] | None = None,
     ) -> list[dict]:
         caller = self._caller(repo, context)
+        self._note_session()
         handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
@@ -290,11 +309,15 @@ class Service:
     def recalled(self, since: datetime | None = None) -> list[str]:
         """Ids of what this user was handed in this repo since then and that is
         team knowledge now, oldest first. Read off the recall events, so it
-        does not depend on the agent reporting anything."""
+        does not depend on the agent reporting anything. "In this repo" is the
+        repo the handing session was configured with, whatever repo argument
+        the agent passed; a session with no such note counts by its event's repo."""
         caller = self._caller()
         handed: dict[str, None] = {}
         for _, event in self.runtime.events.since(0):
-            if event.kind != "recall" or event.user != self.user or event.repo != self.repo:
+            if event.kind != "recall" or event.user != self.user:
+                continue
+            if (self._sessions.get(f"session:{event.session}") or event.repo) != self.repo:
                 continue
             if since is not None and event.at <= since:
                 continue
