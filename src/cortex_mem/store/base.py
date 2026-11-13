@@ -5,7 +5,8 @@ A durable implementation (SQLite, PostgreSQL) passes the contract when it
 passes the suites in cortex_mem.testing.
 """
 
-from collections.abc import Iterator, Mapping, Set
+from collections.abc import Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
@@ -53,7 +54,7 @@ class EngineStateBackend(Protocol):
         ...
 
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
     ) -> None:
         """Apply writes and deletes and move the cursor to `cursor`, all or
         nothing. Raises CursorConflict if the cursor is no longer `expected`."""
