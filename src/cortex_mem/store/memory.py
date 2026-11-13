@@ -5,7 +5,8 @@ for knowledge, so results are deterministic."""
 import json
 import math
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -138,7 +139,7 @@ class InMemoryStateBackend:
         return self._cursor
 
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
     ) -> None:
         if self._cursor != expected:
             raise CursorConflict(f"cursor is {self._cursor}, expected {expected}")

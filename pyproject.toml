@@ -14,7 +14,7 @@ classifiers = [
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8", "cortex-mem-server"]
+dev = ["pytest>=8", "cortex-mem-server", "ruff==0.17.4", "basedpyright==1.40.2"]
 
 [build-system]
 requires = ["hatchling"]
@@ -36,5 +36,12 @@ testpaths = ["tests", "server/tests"]
 [tool.ruff]
 target-version = "py312"
 
-[tool.pyright]
+[tool.ruff.lint.flake8-bugbear]
+# ScopePolicy is a frozen dataclass, so a shared default instance is safe.
+extend-immutable-calls = ["cortex_mem_server.server.ScopePolicy"]
+
+# basedpyright ignores [tool.pyright] once this section exists.
+[tool.basedpyright]
 pythonVersion = "3.12"
+# CI fails on errors only; the existing warnings are kept visible but do not fail the run.
+failOnWarnings = false

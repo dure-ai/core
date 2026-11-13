@@ -2,14 +2,15 @@ import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import anyio
 import pytest
+from cortex_mem_server.server import ScopePolicy, Service, load_engine
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from cortex_mem.contract import Demote
-from cortex_mem_server.server import ScopePolicy, Service, load_engine
 from cortex_mem.store.sqlite import SqliteDatabase
 
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
@@ -252,7 +253,7 @@ class DemoteOnFailure:
 class ClockedEngine:
     """Records every tick it gets."""
 
-    ticks: list[datetime] = []
+    ticks: ClassVar[list[datetime]] = []
 
     def __init__(self, config):
         pass

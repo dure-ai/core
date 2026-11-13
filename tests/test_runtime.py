@@ -1,13 +1,17 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from cortex_mem.contract import Caller, Demote, Event, Handoff, Knowledge, Promote
 from cortex_mem.engines.baseline import PromoteAllEngine
 from cortex_mem.runtime import Runtime
-from cortex_mem.store.memory import InMemoryEventStore, InMemoryKnowledgeBase, InMemoryStateBackend
+from cortex_mem.store.memory import (
+    InMemoryEventStore,
+    InMemoryKnowledgeBase,
+    InMemoryStateBackend,
+)
 
-T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
 def ev(id, text="", kind="record", user="u1", team="t1", scope="personal", at=T0, **kw):
