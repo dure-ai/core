@@ -632,6 +632,20 @@ def test_a_repo_argument_the_agent_made_up_does_not_hide_the_recall_from_the_hoo
     assert asked_in == ["acme/app", "T5-app"]  # the events still say where the agent said it asked
 
 
+def test_amending_the_commit_keeps_what_it_named(tmp_path, monkeypatch):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+    msg = tmp_path / "MSG2"
+    msg.write_text("Reworded fix\n")
+    authored = subprocess.run(["git", "log", "-1", "--format=%at"], cwd=tmp_path, check=True, capture_output=True,
+                              text=True).stdout.strip()
+    monkeypatch.setenv("GIT_AUTHOR_DATE", f"@{authored} +0000")
+
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == [old_id]  # as git runs the hook for --amend -m
+
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "@1 +0000")
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == []  # a new commit on top names nothing new
+
+
 def test_a_reviewer_replaces_stale_knowledge_with_the_commit(tmp_path):
     db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
 

@@ -88,10 +88,25 @@ def confirm_commits(service: Service, rev_range: str, outcome: str, cwd: str | N
     return {"reported": reported, "unknown_records": unknown}
 
 
-def add_recalled(service: Service, message_file: str, cwd: str | None = None) -> list[str]:
-    """Add a Cortex-Recalled trailer for what the committer was handed since the previous commit."""
+def _amending(cwd: str | None = None) -> bool:
+    """Whether the commit being made rewrites HEAD. Git does not tell a
+    commit-msg hook, but it hands it the author date, and an amended commit
+    keeps the one it had. (`--amend --reset-author` therefore looks like a
+    new commit, and so does a commit made in the same second as HEAD.)"""
+    stamp = re.match(r"@(\d+)", os.environ.get("GIT_AUTHOR_DATE", ""))
     try:
-        since: datetime | None = datetime.fromisoformat(_git("log", "-1", "--format=%cI", cwd=cwd).strip())
+        return bool(stamp) and stamp.group(1) == _git("log", "-1", "--format=%at", cwd=cwd).strip()
+    except subprocess.CalledProcessError:
+        return False
+
+
+def add_recalled(service: Service, message_file: str, cwd: str | None = None) -> list[str]:
+    """Add a Cortex-Recalled trailer for what the committer was handed since
+    the previous commit: HEAD, or HEAD's parent when HEAD is being amended,
+    so that rewriting a commit's message does not drop what it named."""
+    previous = "HEAD~1" if _amending(cwd) else "HEAD"
+    try:
+        since: datetime | None = datetime.fromisoformat(_git("log", "-1", "--format=%cI", previous, cwd=cwd).strip())
     except (subprocess.CalledProcessError, ValueError):
         since = None  # first commit of the repository
     ids = service.recalled(since)
