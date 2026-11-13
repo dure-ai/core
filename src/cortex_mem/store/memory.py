@@ -1,21 +1,53 @@
-"""In-memory stores for tests and harness runs. Token-overlap scoring;
-ties keep insertion order so results are deterministic."""
+"""In-memory stores for tests and harness runs. BM25 over the visible documents,
+with the SQLite store's tokens; ties keep append order for events and id order
+for knowledge, so results are deterministic."""
 
 import json
-import re
-from collections.abc import Collection, Iterator, Mapping, Set
+import math
+from collections import Counter
+from collections.abc import Collection, Iterator, Mapping, Sequence, Set
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from ..access import event_visible, knowledge_visible
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
+from .sqlite import _bigrams, _words
 
-_WORD = re.compile(r"\w+", re.UNICODE)
+# The harness's all_store baseline uses these, so a score gap between it and an
+# engine on this store comes from the engine rather than from the ranking formula.
+_K1 = 1.5
+_B = 0.75
 
 
-def _tokens(text: str) -> set[str]:
-    return set(_WORD.findall(text.lower()))
+def _tokens(text: str) -> list[str]:
+    return _words(text) + _bigrams(text)
+
+
+def _bm25(query: str, texts: Sequence[str]) -> list[float]:
+    """Score each text against the query; `texts` is the whole corpus for IDF."""
+    # IDF counts only the texts passed in (visible to the caller, of the requested
+    # kinds), like the harness all_store. SQLite FTS5 counts every row of the table
+    # and uses k1=1.2 with an unshifted IDF, so the two stores rank differently;
+    # harness comparisons use this store only (contract §4).
+    # Every search re-tokenizes the corpus: harness scenarios are small, so this
+    # stays simple on purpose instead of keeping an index.
+    docs =[Counter(_tokens(text)) for text in texts]
+    lengths = [sum(doc.values()) for doc in docs]
+    average = sum(lengths) / len(docs) if docs else 0.0
+    scores = [0.0] * len(docs)
+    # Sorted so the float sums do not depend on the hash seed.
+    for term in sorted(set(_tokens(query))):
+        df = sum(1 for doc in docs if term in doc)
+        if df == 0:
+            continue
+        idf = math.log(1 + (len(docs) - df + 0.5) / (df + 0.5))
+        for i, doc in enumerate(docs):
+            f = doc[term]
+            if f:
+                norm = 1 - _B + _B * lengths[i] / average
+                scores[i] += idf * f * (_K1 + 1) / (f + _K1 * norm)
+    return scores
 
 
 def _copy(value: Any) -> Any:
@@ -51,16 +83,12 @@ class InMemoryEventStore:
         k: int = 20,
         kinds: Collection[Kind] | None = None,
     ) -> list[tuple[Event, float]]:
-        q = _tokens(query)
-        scored = []
-        for e in self._log:
-            if kinds is not None and e.kind not in kinds:
-                continue
-            if not event_visible(e, caller, scope):
-                continue
-            score = len(q & _tokens(e.text))
-            if score:
-                scored.append((e, float(score)))
+        visible = [
+            e for e in self._log
+            if (kinds is None or e.kind in kinds) and event_visible(e, caller, scope)
+        ]
+        scores = _bm25(query, [e.text for e in visible])
+        scored = [(e, score) for e, score in zip(visible, scores) if score > 0]
         scored.sort(key=lambda pair: -pair[1])  # stable: ties keep insertion order
         return scored[:k]
 
@@ -84,14 +112,9 @@ class InMemoryKnowledgeBase:
     def search(
         self, query: str, caller: Caller, scope: Scope, k: int = 20
     ) -> list[tuple[Knowledge, float]]:
-        q = _tokens(query)
-        scored = []
-        for item in self.all():
-            if not knowledge_visible(item, caller, scope):
-                continue
-            score = len(q & _tokens(f"{item.title} {item.body}"))
-            if score:
-                scored.append((item, float(score)))
+        visible = [item for item in self.all() if knowledge_visible(item, caller, scope)]
+        scores = _bm25(query, [f"{item.title} {item.body}" for item in visible])
+        scored = [(item, score) for item, score in zip(visible, scores) if score > 0]
         scored.sort(key=lambda pair: -pair[1])
         return scored[:k]
 

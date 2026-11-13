@@ -85,6 +85,18 @@ class EventStoreContract(_Contract):
 
         assert [e.id for e, _ in store.search("deploy release tags", caller(), "personal")] == ["strong", "weak"]
 
+    def test_search_ranks_a_rare_word_above_a_common_one(self, store):
+        for i in range(3):
+            store.append(ev(f"common{i}", "deploy notes"))
+        store.append(ev("rare", "canary notes"))
+
+        assert next(e.id for e, _ in store.search("deploy canary", caller(), "personal")) == "rare"
+
+    def test_search_matches_korean_with_a_particle_attached(self, store):
+        store.append(ev("e1", "배포가 실패했다"))
+
+        assert [e.id for e, _ in store.search("배포", caller(), "personal")] == ["e1"]
+
     def test_search_scores_are_descending(self, store):
         for i, text in enumerate(["deploy", "deploy tags", "deploy release tags"]):
             store.append(ev(f"e{i}", text))
@@ -151,6 +163,13 @@ class KnowledgeStoreContract(_Contract):
         kb.put(original)
 
         assert kb.get(["deploy/tags"]) == [original]
+
+    def test_knowledge_search_ranks_a_rare_word_above_a_common_one(self, kb):
+        for i in range(3):
+            kb.put(item(f"common{i}", "deploy notes"))
+        kb.put(item("rare", "canary notes"))
+
+        assert next(i.id for i, _ in kb.search("deploy canary", caller(), "team")) == "rare"
 
     def test_knowledge_search_respects_scope(self, kb):
         kb.put(item("mine", scope="personal", owner="u1"))
