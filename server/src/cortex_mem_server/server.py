@@ -49,6 +49,7 @@ ENGINE_ALIASES = {
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
 TRAILER = "Cortex-Record"  # commit message trailer naming a record the commit bears out
+RECALLED_TRAILER = "Cortex-Recalled"  # ... naming knowledge the committer was handed while making it
 log = logging.getLogger("cortex_mem_server")
 
 
@@ -179,12 +180,13 @@ class Service:
         refs: Sequence[str] = (),
         repo: str | None = None,
         rev: str | None = None,
+        signal: Signal = "self",
     ) -> dict:
         caller = self._caller(repo)
         self._cited.update(refs)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered = self._append(
-            caller, kind="record", scope=effective, text=text, signal="self",
+            caller, kind="record", scope=effective, text=text, signal=signal,
             conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
         result: dict = {"id": id, "scope": effective, "delivered": delivered, "commit_trailer": f"{TRAILER}: {id}"}
@@ -284,6 +286,21 @@ class Service:
             conditions=dict(mine.conditions), refs=tuple(refs), repo=mine.repo, rev=mine.rev,
         )
         return id
+
+    def recalled(self, since: datetime | None = None) -> list[str]:
+        """Ids of what this user was handed in this repo since then and that is
+        team knowledge now, oldest first. Read off the recall events, so it
+        does not depend on the agent reporting anything."""
+        caller = self._caller()
+        handed: dict[str, None] = {}
+        for _, event in self.runtime.events.since(0):
+            if event.kind != "recall" or event.user != self.user or event.repo != self.repo:
+                continue
+            if since is not None and event.at <= since:
+                continue
+            handed.update(dict.fromkeys(event.refs))
+        known = {k.id for k in self.runtime.knowledge.get(list(handed)) if knowledge_visible(k, caller, "org")}
+        return [id for id in handed if id in known]
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is

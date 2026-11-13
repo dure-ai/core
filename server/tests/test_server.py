@@ -566,3 +566,84 @@ def test_a_failure_report_after_citing_the_memory_asks_nothing():
 
     assert "next" not in fixer.report_outcome("failure", [old_id])
     assert "next" not in fixer.report_outcome("success", [old_id])
+
+
+# ── what was handed over before a commit, with no help from the agent ───────
+
+from cortex_mem_server.cli import add_recalled, install_hook, to_review
+
+
+def handed_then_committed(tmp_path, message="Take the cache lock before the index lock\n\nFixes the test run hang."):
+    """u1's workaround is knowledge; u2 recalls it, records nothing, and commits a fix."""
+    db = SqliteDatabase()
+    author, ci, fixer, lead = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS, repo="acme/app")
+                               for u in ("u1", "ci", "u2", "lead"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    git(tmp_path, "init", "-q")
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--allow-empty", "-m",
+                    "start"], cwd=tmp_path, check=True, capture_output=True,
+                   env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-01T00:00:00+00:00"})  # before the test clock
+    [handed] = fixer.recall("test run hang")
+    msg = tmp_path / "MSG"
+    msg.write_text(message + "\n")
+    add_recalled(fixer, str(msg), cwd=str(tmp_path))
+    sha = commit(tmp_path, msg.read_text())
+    return db, fixer, lead, handed["id"], sha
+
+
+def test_the_hook_names_what_the_committer_was_handed_since_the_last_commit(tmp_path):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+
+    review_list = to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path))
+
+    [item] = review_list["to_review"]
+    assert item["id"] == old_id and OLD_WAY in item["content"]
+    assert [c["commit"] for c in item["commits"]] == [sha]
+    msg = tmp_path / "MSG2"
+    msg.write_text("unrelated follow-up\n")
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == []  # nothing handed since that commit
+
+
+def test_someone_elses_recalls_and_other_repos_are_not_named(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+    elsewhere = service(db, user="u2", session="s-x", policy=TEAM, engine=TIERS, repo="acme/other")
+    elsewhere.recall("test run hang")
+    lead.recall("test run hang")
+    commit(tmp_path, "later")
+
+    assert fixer.recalled() == [old_id]
+    assert fixer.recalled(since=datetime.now(UTC) + timedelta(days=1)) == []
+
+
+def test_a_reviewer_replaces_stale_knowledge_with_the_commit(tmp_path):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+
+    out = review(lead, old_id, "replace", commit="HEAD", cwd=str(tmp_path))
+
+    assert out["commit"] == sha
+    [now] = [m for m in service(db, user="u3", session="s-u3", policy=TEAM, engine=TIERS, repo="acme/app")
+             .recall("test run hang") if m["status"] == "knowledge"]
+    assert "cache lock before the index lock" in now["content"] and "Cortex-Recalled" not in now["content"]
+    assert to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path)) == {"to_review": [], "no_longer_knowledge": [old_id]}
+
+
+def test_a_reviewer_keeps_knowledge_that_still_holds(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+
+    review(lead, old_id, "keep")
+
+    assert [i["id"] for i in to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path))["to_review"]] == [old_id]
+
+
+def test_install_hook_writes_a_hook_that_never_blocks_a_commit(tmp_path, monkeypatch):
+    git(tmp_path, "init", "-q")
+    monkeypatch.setenv("CORTEX_TEAM", "t1")
+    monkeypatch.setenv("CORTEX_DB_PATH", str(tmp_path / "missing-dir" / "x.db"))
+
+    hook = install_hook(cwd=str(tmp_path))["installed"]
+
+    text = open(hook).read()
+    assert "commit-msg" in text and "CORTEX_TEAM=t1" in text and text.rstrip().endswith("|| true")
+    commit(tmp_path, "still commits")
+    install_hook(cwd=str(tmp_path))  # reinstalling over our own hook is fine
