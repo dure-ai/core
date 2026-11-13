@@ -37,7 +37,7 @@ from uuid import uuid4
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from cortex_mem.access import knowledge_visible
+from cortex_mem.access import event_visible, knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
@@ -48,6 +48,7 @@ ENGINE_ALIASES = {
     "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
+TRAILER = "Cortex-Record"  # commit message trailer naming a record the commit bears out
 log = logging.getLogger("cortex_mem_server")
 
 
@@ -129,6 +130,7 @@ class Service:
         self.policy = policy
         self.clock = clock
         self._skipped_logged = 0
+        self._cited: set[str] = set()  # what this session's records cite as handed (one process, one session)
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
         caller = Caller(
@@ -179,12 +181,42 @@ class Service:
         rev: str | None = None,
     ) -> dict:
         caller = self._caller(repo)
+        self._cited.update(refs)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered = self._append(
             caller, kind="record", scope=effective, text=text, signal="self",
             conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
-        return {"id": id, "scope": effective, "delivered": delivered}
+        result: dict = {"id": id, "scope": effective, "delivered": delivered, "commit_trailer": f"{TRAILER}: {id}"}
+        if delivered and (related := self._related(text, caller, id)):
+            result["related"] = related
+            result["next"] = (
+                "Existing team knowledge on the same topic is listed in 'related'. If what you just "
+                "recorded replaces one of them, call report_outcome(outcome='failure', refs=[its id], "
+                f"replaced_by='{id}'). It keeps standing until your record passes a test or a review. "
+                "If they are unrelated or still hold, do nothing."
+            )
+        return result
+
+    def _related(self, text: str, caller: Caller, record_id: str, k: int = 3) -> list[dict]:
+        """Knowledge the engine hands over for the record's own text. What is
+        handed back is logged as a recall, like any handoff, so the engine
+        knows this session has seen it; nothing is logged when nothing is
+        found. A failure here never fails the record."""
+        try:
+            handoffs = [
+                h for h in self.runtime.handoff(text, caller, "org", k + 1)
+                if h.status == "knowledge" and record_id not in h.sources
+            ][:k]
+            if handoffs:
+                self._append(
+                    caller, kind="recall", scope="personal", text=text, refs=tuple(h.id for h in handoffs),
+                    repo=caller.repo, conditions=caller.context,
+                )
+        except Exception:
+            log.exception("looking up knowledge related to record %s failed", record_id)
+            return []
+        return [{"id": h.id, "content": h.content, "conditions": dict(h.conditions)} for h in handoffs]
 
     def recall(
         self,
@@ -209,26 +241,61 @@ class Service:
         signal: Signal = "self",
         scope: Scope | None = None,
         repo: str | None = None,
+        replaced_by: str | None = None,
+        rev: str | None = None,
     ) -> dict:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
+        restated = self._restate(caller, replaced_by, outcome, refs) if replaced_by else None
         # The judgement must reach whoever sees the judged item, but the agent's
         # words follow the repo's policy: past it, only the judgement is shared.
         redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
         id, delivered = self._append(
             caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
+            signal=signal, refs=tuple(refs), repo=caller.repo, rev=rev, text_redacted=redacted,
         )
-        return {"id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered}
+        result = {"id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered}
+        if restated:
+            result["restated"] = restated
+            self._cited.update(refs)
+        elif outcome == "failure" and not self._cited.intersection(refs):
+            result["next"] = (
+                "You reported these memories as not holding, but memory does not yet say what holds instead: "
+                "the text of a report is not handed to anyone. If you know what is right, record it with "
+                f"record_episode(text=..., refs={list(refs)!r}). Recorded that way it stands in for them once "
+                "it passes an outside check. If you only know that they are wrong, do nothing."
+            )
+        return result
+
+    def _restate(self, caller: Caller, record_id: str, outcome: Outcome, refs: Sequence[str]) -> str:
+        """Say again, in this session, the caller's own record, this time citing
+        what it replaces. Events are never edited, so the tie is a new record:
+        same words, refs = the replaced items (docs/contract.md 3-2)."""
+        if outcome != "failure":
+            raise ValueError("replaced_by goes with outcome='failure': the refs are what your record replaces")
+        if not refs:
+            raise ValueError("refs must name what your record replaces")
+        found = self.runtime.events.get([record_id])
+        if not found or found[0].kind != "record" or found[0].user != caller.user:
+            raise ValueError(f"replaced_by must be the id of a record you wrote, got {record_id!r}")
+        mine = found[0]
+        id, _ = self._append(
+            caller, kind="record", scope=mine.scope, text=mine.text, signal="self",
+            conditions=dict(mine.conditions), refs=tuple(refs), repo=mine.repo, rev=mine.rev,
+        )
+        return id
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
         seen by the widest audience of the judged knowledge the caller can see.
         A team item can only be demoted by evidence the team sees."""
-        judged = [k for k in self.runtime.knowledge.get(refs) if knowledge_visible(k, caller, "org")]
-        if not judged:
+        scopes = [k.scope for k in self.runtime.knowledge.get(refs) if knowledge_visible(k, caller, "org")]
+        # A record that is not knowledge yet is judged before its audience too.
+        scopes += [e.scope for e in self.runtime.events.get(refs)
+                   if e.kind == "record" and event_visible(e, caller, "org")]
+        if not scopes:
             return self.policy.default_for(self.repo)
-        return max((k.scope for k in judged), key=_WIDTH.__getitem__)
+        return max(scopes, key=_WIDTH.__getitem__)
 
 
 mcp = MCPServer("cortex-mem")
@@ -257,25 +324,30 @@ def _max_failures() -> int:
     return int(raw)
 
 
+def service_from_env() -> Service:
+    """A service for this process, configured by the environment variables above."""
+    user, team = _identity()
+    path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return Service(
+        SqliteDatabase(path),
+        engine=os.environ.get("CORTEX_ENGINE", "promote_all"),
+        user=user,
+        team=team,
+        session=uuid4().hex,
+        agent=os.environ.get("CORTEX_AGENT"),
+        repo=os.environ.get("CORTEX_REPO") or None,
+        policy=ScopePolicy.parse(
+            os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
+        ),
+        max_failures=_max_failures(),
+    )
+
+
 def get_service() -> Service:
     global _service
     if _service is None:
-        user, team = _identity()
-        path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _service = Service(
-            SqliteDatabase(path),
-            engine=os.environ.get("CORTEX_ENGINE", "promote_all"),
-            user=user,
-            team=team,
-            session=uuid4().hex,
-            agent=os.environ.get("CORTEX_AGENT"),
-            repo=os.environ.get("CORTEX_REPO") or None,
-            policy=ScopePolicy.parse(
-                os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
-            ),
-            max_failures=_max_failures(),
-        )
+        _service = service_from_env()
     return _service
 
 
@@ -296,7 +368,11 @@ def record_episode(
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, and delivered:
     false means it is stored and will reach memory later, so do not record it
-    again."""
+    again. commit_trailer: if a commit carries out what you recorded, put that
+    line at the end of its message; the team's CI then reports the test result
+    for your record, which is what turns it into team knowledge.
+    When team knowledge on the same topic exists it comes back in
+    related, with next saying what to do if your record replaces one of them."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 
@@ -322,21 +398,33 @@ def report_outcome(
     outcome: Outcome,
     refs: list[str],
     text: str = "",
-    signal: Signal = "self",
     scope: Scope | None = None,
     repo: str | None = None,
+    replaced_by: str | None = None,
 ) -> dict:
-    """Report whether recalled memories (refs = their ids, at least one) helped:
-    "success", "failure", or "unknown". signal says who judged it: "self", "test",
-    "review", "human", or "doc". This is how memories earn or lose trust.
-    By default the judgement (outcome, signal, refs) is visible to whoever can
+    """Report whether what recalled memories say holds (refs = their ids, at
+    least one). This judges the content, not how useful the recall was:
+    "success": you did what the memory says and it worked as it says.
+    "failure": what it says is wrong, or should no longer be done (e.g. it is a
+    workaround and you fixed the cause).
+    "unknown": you did not act on it. A memory that only pointed you to the
+    right place is not a success; leave it unreported or use "unknown".
+    What you found out belongs in record_episode, not in text here: text only
+    explains the judgement and is not handed to anyone as a memory.
+    Your report counts as your own word, also when you ran the tests yourself.
+    Checks that count as outside evidence (CI, a review, a person) reach memory
+    through the team's own pipeline, not through this tool.
+    By default the judgement (outcome, refs) is visible to whoever can
     see the judged memories, e.g. the whole org for an org memory; scope can
     only narrow that. If that is wider than this repo's policy, text is not
     stored (text_redacted: true). Returns the id, the scope actually used,
     text_redacted, and delivered (false: stored, reaches memory later; do not
-    report it again)."""
+    report it again). replaced_by: with outcome "failure", the id of a record
+    you wrote that replaces the memories in refs. They keep standing until your
+    record passes an outside check."""
     try:
-        return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+        # The signal is fixed here: an agent cannot vouch for itself as a test or a reviewer.
+        return get_service().report_outcome(outcome, refs, text, "self", scope, repo, replaced_by)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
         raise ToolError(str(exc)) from exc
 

@@ -385,3 +385,184 @@ def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
     )
 
     assert result.returncode != 0 and message in result.stderr
+
+
+# ── a record that replaces existing knowledge ───────────────────────────────
+
+TIERS = "cortex_mem.engines.tiers:TierEngine"
+TEAM = ScopePolicy.parse("team")
+OLD_WAY = "when the test run hangs, pass --no-cache to the runner"
+NEW_WAY = "the test run hang is fixed by taking the cache lock before the index lock"
+
+
+def knowledge_then_replacement(db):
+    """u1's note is checked knowledge; u2 records something on the same topic."""
+    author, ci, fixer = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u1", "ci", "u2"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    return fixer, ci, fixer.record(NEW_WAY)
+
+
+def test_record_hands_back_related_knowledge_and_says_what_to_do():
+    fixer, _, new = knowledge_then_replacement(SqliteDatabase())
+
+    [related] = new["related"]
+    assert OLD_WAY in related["content"]
+    assert f"replaced_by='{new['id']}'" in new["next"]
+
+
+def test_record_with_nothing_related_asks_nothing():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+
+    assert "related" not in m.record(OLD_WAY)  # its own note is not "existing knowledge"
+
+
+def test_replacement_takes_effect_only_once_the_new_record_is_checked():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    out = fixer.report_outcome("failure", [old_id], replaced_by=new["id"])
+    assert out["restated"]
+    assert [m["id"] for m in fixer.recall("test run hang") if m["status"] == "knowledge"] == [old_id]
+
+    ci.report_outcome("success", [new["id"]], signal="test")
+    knowledge = [m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]
+    assert len(knowledge) == 1 and NEW_WAY in knowledge[0]["content"]
+
+
+def test_a_failure_report_without_replaced_by_replaces_nothing():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    fixer.report_outcome("failure", [old_id])
+    ci.report_outcome("success", [new["id"]], signal="test")
+
+    assert len([m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]) == 2
+
+
+def test_replaced_by_must_be_your_own_record_and_a_failure():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    with pytest.raises(ValueError, match="record you wrote"):
+        ci.report_outcome("failure", [old_id], replaced_by=new["id"])
+    with pytest.raises(ValueError, match="failure"):
+        fixer.report_outcome("success", [old_id], replaced_by=new["id"])
+
+
+def test_stdio_agent_cannot_vouch_for_itself_as_a_test(tmp_path):
+    db = tmp_path / "cortex.db"
+    recorded = call(db, "record_episode", {"text": "cloud sql needs the auth proxy"})
+
+    call(db, "report_outcome", {"outcome": "failure", "refs": [recorded["id"]], "signal": "test"}, raw=True)
+
+    signals = [e.signal for _, e in SqliteDatabase(db).events.since(0) if e.kind == "outcome"]
+    assert signals in ([], ["self"])  # refused as an unknown argument, or stored as the agent's own word
+
+
+# ── evidence that is not an agent's word: the cortex-mem command ────────────
+
+import subprocess
+
+from cortex_mem_server.cli import commit_records, confirm_commits, review
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+def commit(cwd, message):
+    git(cwd, "commit", "--allow-empty", "-m", message)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_record_names_the_trailer_to_put_in_a_commit():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+
+    r = m.record(NEW_WAY)
+
+    assert r["commit_trailer"] == f"Cortex-Record: {r['id']}"
+
+
+def test_ci_reports_the_test_run_for_records_named_in_commit_trailers(tmp_path):
+    db = SqliteDatabase()
+    agent, ci = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS, repo="acme/loader") for u in ("u2", "ci"))
+    note = agent.record(NEW_WAY)
+    git(tmp_path, "init", "-q")
+    commit(tmp_path, "start")
+    sha = commit(tmp_path, f"Fix the cache key\n\n{note['commit_trailer']}\nCortex-Record: no-such-record")
+
+    result = confirm_commits(ci, "HEAD~1..HEAD", "success", cwd=str(tmp_path))
+
+    assert commit_records("HEAD~1..HEAD", str(tmp_path)) == [(sha, [note["id"], "no-such-record"])]
+    assert [(r["commit"], r["records"]) for r in result["reported"]] == [(sha, [note["id"]])]
+    assert result["unknown_records"] == ["no-such-record"]
+    [outcome] = [e for _, e in db.events.since(0) if e.kind == "outcome"]
+    assert (outcome.signal, outcome.rev, outcome.scope) == ("test", sha, "team")
+    assert [m["status"] for m in agent.recall("test run hang")] == ["knowledge"]
+
+
+def test_a_failed_run_takes_the_knowledge_back(tmp_path):
+    db = SqliteDatabase()
+    agent, ci = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u2", "ci"))
+    note = agent.record(NEW_WAY)
+    git(tmp_path, "init", "-q")
+    commit(tmp_path, f"Fix\n\n{note['commit_trailer']}")
+    confirm_commits(ci, "HEAD", "success", cwd=str(tmp_path))
+    commit(tmp_path, f"Rework\n\n{note['commit_trailer']}")
+
+    confirm_commits(ci, "HEAD~1..HEAD", "failure", cwd=str(tmp_path))
+
+    assert agent.recall("test run hang") == []
+
+
+def test_a_person_approves_or_rejects_a_record():
+    db = SqliteDatabase()
+    agent, lead = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u2", "lead"))
+    note = agent.record(NEW_WAY)
+
+    review(lead, note["id"], "approve")
+    assert [m["status"] for m in agent.recall("test run hang")] == ["knowledge"]
+
+    review(lead, note["id"], "reject", "does not hold on the release branch")
+    [correction] = agent.recall("test run hang")  # the agent was handed it a moment ago, so it is told
+    assert correction["status"] == "invalidated" and "release branch" in correction["content"]
+
+
+def test_approving_your_own_record_does_nothing():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+    note = m.record(NEW_WAY)
+
+    review(m, note["id"], "approve")
+
+    assert [h["status"] for h in m.recall("test run hang")] == ["memory"]
+
+
+def test_a_failure_report_with_no_record_behind_it_asks_for_one():
+    db = SqliteDatabase()
+    author, ci, fixer = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u1", "ci", "u2"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    [handed] = fixer.recall("test run hang")
+
+    out = fixer.report_outcome("failure", [handed["id"]], text="only hides the bug; the cause is the lock order")
+    assert "record_episode" in out["next"] and handed["id"] in out["next"]
+
+    new = fixer.record(NEW_WAY, refs=[handed["id"]])  # following the hint is enough: no further call
+    ci.report_outcome("success", [new["id"]], signal="test")
+    knowledge = [m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]
+    assert len(knowledge) == 1 and NEW_WAY in knowledge[0]["content"]
+
+
+def test_a_failure_report_after_citing_the_memory_asks_nothing():
+    db = SqliteDatabase()
+    fixer, _, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+    fixer.record("another note on the same thing", refs=[old_id])
+
+    assert "next" not in fixer.report_outcome("failure", [old_id])
+    assert "next" not in fixer.report_outcome("success", [old_id])

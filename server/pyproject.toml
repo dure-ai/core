@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 cortex-mem-server = "cortex_mem_server.server:main"
+cortex-mem = "cortex_mem_server.cli:main"
 
 [build-system]
 requires = ["hatchling"]
