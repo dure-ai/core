@@ -191,11 +191,36 @@ def test_recall_passes_where_the_question_was_asked():
     m.record("deploy uses release tags")
 
     m.recall("deploy tags", context={"service": "billing"})
-    m.recall("deploy tags", repo="acme/web")
+    m.recall("deploy tags", repo="acme/web", context={"repo": "web"})
+    service(db, session="s2").recall("deploy tags", repo="acme/web")
 
-    first, second = [e for _, e in db.events.since(0) if e.kind == "recall"]
+    first, second, third = [e for _, e in db.events.since(0) if e.kind == "recall"]
     assert (first.repo, dict(first.conditions)) == ("acme/api", {"service": "billing"})
-    assert (second.repo, dict(second.conditions)) == ("acme/web", {})
+    assert (second.repo, dict(second.conditions)) == ("acme/api", {})  # the configured repo counts, not the agent's
+    assert third.repo == "acme/web"  # no configured repo: the caller's word stands
+
+
+def test_a_made_up_repo_does_not_hold_back_what_is_bound_to_this_repo():
+    db = SqliteDatabase()
+    m = service(db, repo="acme/api", engine=TIERS)
+    m.record("deploy uses release tags", conditions={"repo": "acme/api"})
+
+    for made_up in ({"repo": "api"}, {"context": {"repo": "T5-api"}}):
+        [got] = m.recall("deploy tags", **made_up)
+        assert got["conditions"] == {"repo": "acme/api"}
+    assert service(db, session="s2", repo="acme/web", engine=TIERS).recall("deploy tags") == []  # held back elsewhere
+
+
+def test_a_record_cannot_bind_itself_to_a_repo_the_session_is_not_in():
+    db = SqliteDatabase()
+    m = service(db, repo="acme/api")
+
+    with pytest.raises(ValueError, match="this project's repo is 'acme/api'"):
+        m.record("deploy uses release tags", conditions={"repo": "T5/api"})
+
+    assert [e for _, e in db.events.since(0)] == []
+    m.record("deploy uses release tags", conditions={"repo": "acme/api", "service": "api"})
+    service(db, session="s2").record("x", conditions={"repo": "anything"})  # no configured repo: not checked
 
 
 def test_outcome_without_refs_is_refused():
@@ -629,7 +654,7 @@ def test_a_repo_argument_the_agent_made_up_does_not_hide_the_recall_from_the_hoo
 
     assert fixer.recalled(since=since) == [old_id]
     asked_in = [e.repo for _, e in db.events.since(0) if e.kind == "recall" and e.at > since]
-    assert asked_in == ["acme/app", "T5-app"]  # the events still say where the agent said it asked
+    assert asked_in == ["acme/other", "acme/app"]  # where each session is configured to work
 
 
 def test_amending_the_commit_keeps_what_it_named(tmp_path, monkeypatch):

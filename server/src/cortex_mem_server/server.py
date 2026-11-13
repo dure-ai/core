@@ -27,7 +27,7 @@ import importlib
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -48,7 +48,6 @@ ENGINE_ALIASES = {
     "no_memory": "cortex_mem.engines.baseline:NoMemoryEngine",
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
-_SERVER_STATE = "cortex_mem_server"  # name of the server's own key-value state in the database
 TRAILER = "Cortex-Record"  # commit message trailer naming a record the commit bears out
 RECALLED_TRAILER = "Cortex-Recalled"  # ... naming knowledge the committer was handed while making it
 log = logging.getLogger("cortex_mem_server")
@@ -133,8 +132,6 @@ class Service:
         self.clock = clock
         self._skipped_logged = 0
         self._cited: set[str] = set()  # what this session's records cite as handed (one process, one session)
-        self._sessions = db.state(_SERVER_STATE)  # the server's own notes: which project a session runs in
-        self._session_noted = False
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
         caller = Caller(
@@ -185,12 +182,19 @@ class Service:
         rev: str | None = None,
         signal: Signal = "self",
     ) -> dict:
+        conditions = dict(conditions or {})
+        if self.repo and conditions.get("repo", self.repo) != self.repo:
+            # A wrong repo condition hides the record from everyone working here.
+            raise ValueError(
+                f"conditions['repo'] is {conditions['repo']!r}, but this project's repo is {self.repo!r}. "
+                "Leave 'repo' out of conditions: the record is already tied to this project."
+            )
         caller = self._caller(repo)
         self._cited.update(refs)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered = self._append(
             caller, kind="record", scope=effective, text=text, signal=signal,
-            conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
+            conditions=conditions, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
         result: dict = {"id": id, "scope": effective, "delivered": delivered, "commit_trailer": f"{TRAILER}: {id}"}
         if delivered and (related := self._related(text, caller, id)):
@@ -203,35 +207,32 @@ class Service:
             )
         return result
 
-    def _note_session(self) -> None:
-        """Note that this session runs in the configured repo. A recall event's
-        repo is where the agent said the question was asked, and agents make
-        that up; which project the server runs in is the server's own
-        knowledge. recalled() goes by this note. Never fails the tool call."""
-        if self._session_noted or not self.repo:
-            return
-        try:
-            at = self._sessions.cursor()
-            self._sessions.commit(at, at, {f"session:{self.session}": self.repo}, frozenset())
-            self._session_noted = True
-        except Exception:
-            log.exception("noting the project of session %s failed", self.session)
+    def _here(self, caller: Caller) -> Caller:
+        """The caller as asking from the configured repo. Where a session works
+        is the server's knowledge, like the signal of an agent's report: a
+        repo the agent passes (as the argument or inside context) would
+        otherwise decide which repo-bound facts are held back from it, and
+        agents make it up. Without a configured repo the caller's word stands."""
+        if not self.repo:
+            return caller
+        context = {k: v for k, v in caller.context.items() if k != "repo"}
+        return replace(caller, repo=self.repo, context=context)
 
     def _related(self, text: str, caller: Caller, record_id: str, k: int = 3) -> list[dict]:
         """Knowledge the engine hands over for the record's own text. What is
         handed back is logged as a recall, like any handoff, so the engine
         knows this session has seen it; nothing is logged when nothing is
         found. A failure here never fails the record."""
+        here = self._here(caller)
         try:
             handoffs = [
-                h for h in self.runtime.handoff(text, caller, "org", k + 1)
+                h for h in self.runtime.handoff(text, here, "org", k + 1)
                 if h.status == "knowledge" and record_id not in h.sources
             ][:k]
             if handoffs:
-                self._note_session()
                 self._append(
-                    caller, kind="recall", scope="personal", text=text, refs=tuple(h.id for h in handoffs),
-                    repo=caller.repo, conditions=caller.context,
+                    here, kind="recall", scope="personal", text=text, refs=tuple(h.id for h in handoffs),
+                    repo=here.repo, conditions=here.context,
                 )
         except Exception:
             log.exception("looking up knowledge related to record %s failed", record_id)
@@ -246,8 +247,7 @@ class Service:
         repo: str | None = None,
         context: Mapping[str, str] | None = None,
     ) -> list[dict]:
-        caller = self._caller(repo, context)
-        self._note_session()
+        caller = self._here(self._caller(repo, context))
         handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
@@ -309,15 +309,12 @@ class Service:
     def recalled(self, since: datetime | None = None) -> list[str]:
         """Ids of what this user was handed in this repo since then and that is
         team knowledge now, oldest first. Read off the recall events, so it
-        does not depend on the agent reporting anything. "In this repo" is the
-        repo the handing session was configured with, whatever repo argument
-        the agent passed; a session with no such note counts by its event's repo."""
+        does not depend on the agent reporting anything. A recall event's repo
+        is the handing session's configured repo, whatever the agent passed."""
         caller = self._caller()
         handed: dict[str, None] = {}
         for _, event in self.runtime.events.since(0):
-            if event.kind != "recall" or event.user != self.user:
-                continue
-            if (self._sessions.get(f"session:{event.session}") or event.repo) != self.repo:
+            if event.kind != "recall" or event.user != self.user or event.repo != self.repo:
                 continue
             if since is not None and event.at <= since:
                 continue
@@ -403,7 +400,8 @@ def record_episode(
     """Record something learned while working (a fix, a cause, a convention) so
     future sessions can recall it. Who may see it is set by the server for the
     repo; scope can only narrow that (e.g. "personal" for a private note).
-    conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
+    conditions: when it holds, e.g. {"service": "api"}; not the repo, the
+    record is tied to the project's repo already. refs: ids of recalled
     memories this builds on. repo/rev: where the evidence is (repo, commit);
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, and delivered:
@@ -413,7 +411,10 @@ def record_episode(
     for your record, which is what turns it into team knowledge.
     When team knowledge on the same topic exists it comes back in
     related, with next saying what to do if your record replaces one of them."""
-    return get_service().record(text, scope, conditions, refs or (), repo, rev)
+    try:
+        return get_service().record(text, scope, conditions, refs or (), repo, rev)
+    except ValueError as exc:  # tell the agent why, not just that it failed
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -426,10 +427,11 @@ def recall(
 ) -> dict:
     """Recall memories relevant to the current task. Call before starting work
     that past sessions may have covered. By default searches everything you may
-    see (your own, your team's, the org's); scope narrows it. repo and context
-    say where you are working (e.g. context={"service": "api"}), so facts that
-    hold only elsewhere can be left out; repo defaults to the project's
-    configured repo. Returns up to k memories, best first."""
+    see (your own, your team's, the org's); scope narrows it. context says
+    where you are working (e.g. context={"service": "api"}), so facts that hold
+    only elsewhere can be left out. repo is used only when the server has no
+    configured repo; otherwise the configured one counts. Returns up to k
+    memories, best first."""
     return {"memories": get_service().recall(query, scope, k, repo, context)}
 
 
