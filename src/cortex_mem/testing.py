@@ -97,6 +97,11 @@ class EventStoreContract(_Contract):
 
         assert [e.id for e, _ in store.search("배포", caller(), "personal")] == ["e1"]
 
+    def test_search_matches_a_latin_word_with_a_korean_particle_attached(self, store):
+        store.append(ev("e1", "pytest가 ResourceWarning으로 실패했다"))
+
+        assert [e.id for e, _ in store.search("pytest resourcewarning", caller(), "personal")] == ["e1"]
+
     def test_search_scores_are_descending(self, store):
         for i, text in enumerate(["deploy", "deploy tags", "deploy release tags"]):
             store.append(ev(f"e{i}", text))
@@ -170,6 +175,11 @@ class KnowledgeStoreContract(_Contract):
         kb.put(item("rare", "canary notes"))
 
         assert next(i.id for i, _ in kb.search("deploy canary", caller(), "team")) == "rare"
+
+    def test_knowledge_search_matches_a_latin_word_with_a_korean_particle_attached(self, kb):
+        kb.put(item("k1", "pytest가 ResourceWarning으로 실패했다"))
+
+        assert [i.id for i, _ in kb.search("pytest", caller(), "team")] == ["k1"]
 
     def test_knowledge_search_respects_scope(self, kb):
         kb.put(item("mine", scope="personal", owner="u1"))
