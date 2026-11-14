@@ -206,7 +206,6 @@ class Service:
         outcome: Outcome,
         refs: Sequence[str],
         text: str = "",
-        signal: Signal = "self",
         scope: Scope | None = None,
         repo: str | None = None,
     ) -> dict:
@@ -217,9 +216,13 @@ class Service:
         redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
         id, delivered = self._append(
             caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
+            # An agent's report is its own judgement, like its records: a test,
+            # review or person must report through another path to count as one.
+            signal="self", refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
         )
-        return {"id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered}
+        return {
+            "id": id, "scope": effective, "signal": "self", "text_redacted": redacted, "delivered": delivered,
+        }
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
@@ -327,16 +330,18 @@ def report_outcome(
     repo: str | None = None,
 ) -> dict:
     """Report whether recalled memories (refs = their ids, at least one) helped:
-    "success", "failure", or "unknown". signal says who judged it: "self", "test",
-    "review", "human", or "doc". This is how memories earn or lose trust.
-    By default the judgement (outcome, signal, refs) is visible to whoever can
-    see the judged memories, e.g. the whole org for an org memory; scope can
-    only narrow that. If that is wider than this repo's policy, text is not
-    stored (text_redacted: true). Returns the id, the scope actually used,
-    text_redacted, and delivered (false: stored, reaches memory later; do not
-    report it again)."""
+    "success", "failure", or "unknown". This is how memories earn or lose trust.
+    The report is stored as your own judgement (signal "self") whatever signal
+    you pass; test, review and human results count only when they report
+    themselves. By default the judgement (outcome, signal, refs) is visible to
+    whoever can see the judged memories, e.g. the whole org for an org memory;
+    scope can only narrow that. If that is wider than this repo's policy, text
+    is not stored (text_redacted: true). Returns the id, the scope and signal
+    actually used, text_redacted, and delivered (false: stored, reaches memory
+    later; do not report it again)."""
+    del signal  # kept so clients that send it still work; the server sets the signal
     try:
-        return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+        return get_service().report_outcome(outcome, refs, text, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
         raise ToolError(str(exc)) from exc
 

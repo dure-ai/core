@@ -106,10 +106,10 @@ def test_report_outcome_refs_judged_ids():
     m = service(db)
     rid = m.record("deploy uses release tags")["id"]
 
-    oid = m.report_outcome("failure", [rid], text="tag missing", signal="test")["id"]
+    oid = m.report_outcome("failure", [rid], text="tag missing")["id"]
 
     [event] = db.events.get([oid])
-    assert (event.kind, event.outcome, event.signal, event.refs) == ("outcome", "failure", "test", (rid,))
+    assert (event.kind, event.outcome, event.signal, event.refs) == ("outcome", "failure", "self", (rid,))
 
 
 def test_outcome_on_team_knowledge_is_seen_by_the_team_and_demotes_it():
@@ -385,3 +385,18 @@ def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
     )
 
     assert result.returncode != 0 and message in result.stderr
+
+
+def test_agent_cannot_claim_an_outside_signal(tmp_path):
+    # An agent's report is its own judgement whatever signal it names: a claimed
+    # "test" success would otherwise lift a memory no test ever checked.
+    db = tmp_path / "cortex.db"
+    rid = call(db, "record_episode", {"text": "deploy uses release tags"})["id"]
+
+    report = call(db, "report_outcome", {"outcome": "success", "refs": [rid], "signal": "test"})
+
+    assert report["signal"] == "self"
+    store = SqliteDatabase(db)
+    [event] = store.events.get([report["id"]])
+    store.con.close()
+    assert event.signal == "self"
