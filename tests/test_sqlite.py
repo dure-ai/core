@@ -106,8 +106,28 @@ def test_schema_2_file_gains_text_redacted(tmp_path):
 
     db = SqliteDatabase(path)
 
-    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 4
     [old] = db.events.get(["e1"])
     assert (old.text, old.text_redacted) == ("old", False)
     db.events.append(ev("e2", "new"))
     assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
+
+
+def test_schema_3_file_is_reindexed_with_the_current_tokens(tmp_path):
+    path = tmp_path / "v3.db"
+    db = SqliteDatabase(path)
+    db.events.append(ev("e1", "pytest가 실패했다"))
+    db.knowledge.put(Knowledge(id="k1", kind="knowledge", title="t", body="pytest가 실패했다",
+                               scope="personal", owner="u1", sources=("e1",)))
+    # Rewrite the index rows the way schema 3 tokenized them: a Latin word kept its Korean particle.
+    db.con.execute("UPDATE events_fts SET words = 'pytest가 실패했다'")
+    db.con.execute("UPDATE knowledge_fts SET words = 't pytest가 실패했다'")
+    db.con.execute("PRAGMA user_version = 3")
+    db.con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert [e.id for e, _ in db.events.search("pytest", caller(), "personal")] == ["e1"]
+    assert [k.id for k, _ in db.knowledge.search("pytest", caller(), "personal")] == ["k1"]
+    db.con.close()

@@ -26,9 +26,11 @@ from typing import Any
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
-_WORD = re.compile(r"\w+")
+# A Hangul run and a run of other word characters are separate words, so "pytest가"
+# indexes "pytest" (the harness tokenizer splits the same way).
+_WORD = re.compile(r"[가-힣]+|[^\W가-힣]+")
 _HANGUL = re.compile(r"[가-힣]")
 _EVENT_COLUMNS = (
     "id, kind, at, user, team, session, scope, text, agent, signal, outcome, "
@@ -98,8 +100,11 @@ class SqliteDatabase:
         if has_tables and version == 2:
             with self.transaction():  # 2 -> 3: events.text_redacted
                 self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
-                self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif has_tables and version != SCHEMA_VERSION:
+                self.con.execute("PRAGMA user_version = 3")
+            version = 3
+        # 3 -> 4: search words split at Hangul boundaries; reindexed below once the tables exist.
+        reindex = has_tables and version == 3
+        if has_tables and version not in (3, SCHEMA_VERSION):
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
             self.con.execute(
@@ -118,7 +123,25 @@ class SqliteDatabase:
             self.con.execute(
                 "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
             )
+            if reindex:
+                self._reindex()
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _reindex(self) -> None:
+        """Rebuild both search indexes from the stored text with the current tokens."""
+        self.con.execute("DELETE FROM events_fts")
+        for seq, text in self.con.execute("SELECT seq, text FROM events").fetchall():
+            self.con.execute(
+                "INSERT INTO events_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (seq, " ".join(_words(text)), " ".join(_bigrams(text))),
+            )
+        self.con.execute("DELETE FROM knowledge_fts")
+        for rowid, title, body in self.con.execute("SELECT rowid, title, body FROM knowledge").fetchall():
+            text = f"{title} {body}"
+            self.con.execute(
+                "INSERT INTO knowledge_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (rowid, " ".join(_words(text)), " ".join(_bigrams(text))),
+            )
 
     def state(self, engine: str) -> "SqliteStateBackend":
         return SqliteStateBackend(self, engine)
