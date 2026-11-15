@@ -2,6 +2,7 @@
 between the in-memory and SQLite stores, two runtimes on one file embed each
 text once, and an engine that ignores ctx.similar behaves as without an index."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -125,6 +126,9 @@ def test_stores_agree_on_groups_and_search(tmp_path):
     memory = flow("memory", None)
     sqlite = flow("sqlite", tmp_path / "a.db")
 
+    assert any(hits for hits in memory[1].values())  # equality is not vacuous
+    assert any(hits for hits in memory[2].values())
+    assert any(g and len(g.members) > 1 for g in memory[0].values())
     assert memory[0] == sqlite[0]
     assert memory[1] == sqlite[1]  # scores compared exactly: both stores keep float64
     assert memory[2] == sqlite[2]
@@ -152,27 +156,64 @@ def test_groups_are_what_the_scenario_intends(kind, tmp_path):
         assert groups[id] is None  # never embedded
 
 
-def test_two_runtimes_on_one_file_embed_each_text_once(tmp_path):
+def embeddable(all_events):
+    return [e for e in all_events if e.kind == "record" and not e.text_redacted and e.text]
+
+
+def assert_indexed_once(db, all_events):
+    """Every embeddable event has exactly one vector and one group slot."""
+    want = {e.id for e in embeddable(all_events)}
+    vectors = [id for id, _ in db.vectors.vectors("event")]
+    assert len(vectors) == len(want) and set(vectors) == want
+    assert db.vectors.indexed() == list(db.events.since(0))[-1][0]
+    seen = []
+    for id in sorted(want):
+        gid = db.vectors.group_of(id)
+        members = db.vectors.members(gid)
+        assert len(members) == len(set(members)) and id in members
+        if members[0] == id:
+            seen.extend(members)
+    assert sorted(seen) == sorted(want)  # every event is a member of exactly one group
+
+
+def unique(all_events):
+    """Same events, but every record has words of its own, so every embedding
+    is a real call and a re-index could not hide behind the text cache."""
+    return [
+        e if not e.text or e.kind != "record" else replace(e, text=f"{e.text} number {e.id}")
+        for e in all_events
+    ]
+
+
+# who appends event i, and who syncs afterwards: b falls several events behind
+# between its turns, so it must catch up on events another runtime indexed
+PLAN = "aabbaaaaabaaabbbabab"
+
+
+@pytest.mark.parametrize("texts", ["repeated", "unique"])
+def test_two_runtimes_on_one_file_index_each_event_once(texts, tmp_path):
     path = tmp_path / "shared.db"
     embedder = CountingEmbedder()
     db_a, db_b = SqliteDatabase(path), SqliteDatabase(path)
-    rt_a = runtime(db_a, embedder)
-    rt_b = runtime(db_b, embedder)
+    runtimes = {"a": runtime(db_a, embedder), "b": runtime(db_b, embedder)}
+    all_events = events() if texts == "repeated" else unique(events())
 
-    all_events = events()
-    for i, e in enumerate(all_events):
-        (rt_a if i % 2 == 0 else rt_b).append(e)
-    rt_a.sync()
-    rt_b.sync()
+    for who, e in zip(PLAN, all_events, strict=True):
+        runtimes[who].append(e)
+        if who == "a" and e.id in ("p5", "t2", "o1"):
+            runtimes["b"].sync()  # b catches up only now
+    runtimes["a"].sync()
+    runtimes["b"].sync()
 
-    embedded = [e.text for e in all_events if e.kind == "record" and not e.text_redacted and e.text]
     passages = [t for t, kind in embedder.calls if kind == "passage"]
-    # Each distinct text once (the text cache covers repeats), and nothing else.
-    assert sorted(passages) == sorted(set(embedded))
+    texts_wanted = [e.text for e in embeddable(all_events)]
+    assert sorted(passages) == sorted(set(texts_wanted))
+    if texts == "unique":
+        assert len(passages) == len(embeddable(all_events))  # one call per event, none cached away
     assert all(kind == "passage" for _, kind in embedder.calls)
-
-    # Both runtimes read the same index afterwards.
-    assert observe(db_a, rt_a) == observe(db_b, rt_b)
+    assert_indexed_once(db_a, all_events)
+    assert_indexed_once(db_b, all_events)
+    assert observe(db_a, runtimes["a"]) == observe(db_b, runtimes["b"])
 
 
 def evidence_scenario(with_index):
