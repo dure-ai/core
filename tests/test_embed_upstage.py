@@ -52,7 +52,7 @@ def fake():
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     state.base_url = f"http://127.0.0.1:{server.server_address[1]}"
     yield state
@@ -94,7 +94,7 @@ def test_batches_large_inputs(fake):
 def test_dim_is_known_after_the_first_call(fake):
     emb = make(fake)
     with pytest.raises(ValueError):
-        emb.dim
+        _ = emb.dim
     emb.embed(["a"], "passage")
     assert emb.dim == 3
 
@@ -126,3 +126,68 @@ def test_timeout_raises_embedding_error(fake):
 def test_empty_input_makes_no_request(fake):
     assert make(fake).embed([], "passage") == []
     assert fake.requests == []
+
+
+def test_truncated_body_raises_embedding_error(fake):
+    import socket
+
+    # Raw server that promises more bytes than it sends, then closes.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"data\"")
+        conn.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    emb = UpstageEmbedder(KEY, "p", "q", base_url=f"http://127.0.0.1:{srv.getsockname()[1]}")
+    try:
+        with pytest.raises(EmbeddingError) as info:
+            emb.embed(["a"], "passage")
+    finally:
+        srv.close()
+        t.join(timeout=5)
+    assert KEY not in str(info.value)
+
+
+def test_duplicate_index_raises(fake):
+    fake.body = lambda req: {"data": [{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}]}
+    with pytest.raises(EmbeddingError):
+        make(fake).embed(["a", "b"], "passage")
+
+
+def test_out_of_range_index_raises(fake):
+    fake.body = lambda req: {"data": [{"index": 0, "embedding": [1.0]}, {"index": 5, "embedding": [2.0]}]}
+    with pytest.raises(EmbeddingError):
+        make(fake).embed(["a", "b"], "passage")
+
+
+def test_empty_embedding_raises_and_dim_stays_unknown(fake):
+    fake.body = lambda req: {"data": [{"index": 0, "embedding": []}]}
+    emb = make(fake)
+    with pytest.raises(EmbeddingError):
+        emb.embed(["a"], "passage")
+    with pytest.raises(ValueError):
+        _ = emb.dim
+
+
+def test_inconsistent_lengths_within_a_response_raise(fake):
+    fake.body = lambda req: {"data": [{"index": 0, "embedding": [1.0]}, {"index": 1, "embedding": [1.0, 2.0]}]}
+    emb = make(fake)
+    with pytest.raises(EmbeddingError):
+        emb.embed(["a", "b"], "passage")
+    with pytest.raises(ValueError):
+        _ = emb.dim
+
+
+def test_length_change_on_a_later_call_raises(fake):
+    emb = make(fake)
+    emb.embed(["a"], "passage")
+    fake.body = lambda req: {"data": [{"index": 0, "embedding": [1.0, 2.0]}]}
+    with pytest.raises(EmbeddingError):
+        emb.embed(["a"], "passage")
+    assert emb.dim == 3

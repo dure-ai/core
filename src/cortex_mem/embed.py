@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import urllib.error
@@ -124,15 +125,25 @@ class UpstageEmbedder:
             if isinstance(exc.reason, TimeoutError):
                 raise EmbeddingError(f"embedding request timed out after {self.timeout}s") from None
             raise EmbeddingError(f"embedding request failed: {exc.reason}") from None
+        except http.client.HTTPException as exc:
+            raise EmbeddingError(f"embedding response was malformed: {type(exc).__name__}") from None
         except OSError as exc:
             raise EmbeddingError(f"embedding request failed: {type(exc).__name__}") from None
         try:
-            items = sorted(json.loads(raw)["data"], key=lambda item: item["index"])
-            vectors = [[float(x) for x in item["embedding"]] for item in items]
+            items = json.loads(raw)["data"]
+            by_index = {item["index"]: item["embedding"] for item in items}
+            if len(items) != len(by_index):
+                raise EmbeddingError("embedding response repeats an index")
+            if set(by_index) != set(range(len(chunk))):
+                raise EmbeddingError(f"expected indexes 0..{len(chunk) - 1} in the embedding response")
+            vectors = [[float(x) for x in by_index[i]] for i in range(len(chunk))]
+        except EmbeddingError:
+            raise
         except (ValueError, KeyError, TypeError):
             raise EmbeddingError("embedding response is not valid embeddings JSON") from None
-        if len(vectors) != len(chunk):
-            raise EmbeddingError(f"expected {len(chunk)} embeddings, got {len(vectors)}")
+        width = self._dim if self._dim is not None else len(vectors[0]) if vectors else 0
+        if vectors and (width == 0 or any(len(v) != width for v in vectors)):
+            raise EmbeddingError("embedding response has empty or inconsistent vector lengths")
         if self._dim is None and vectors:
-            self._dim = len(vectors[0])
+            self._dim = width
         return vectors
