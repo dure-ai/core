@@ -89,7 +89,7 @@ from ..contract import (
 )
 
 OUTSIDE = ("test", "doc", "review", "human")  # signals that are not the author's own word
-ON_TOPIC = 0.4  # relevance, relative to the best hit, that counts as on topic
+ON_TOPIC = 0.4  # share of the question covered, relative to the best hit, that counts as on topic
 _POOL = 30  # search candidates read before ordering
 _SEP = "\x1f"  # inside state keys; ids may contain ':' or '/'
 
@@ -351,17 +351,23 @@ class TierEngine:
         if caller.repo:
             context.setdefault("repo", caller.repo)
 
-        # 1. What the shared search finds, and how relevant (0..1 within each list).
-        #    A verdict that matches the query makes the claims it judged relevant.
+        # 1. What the shared search finds, and how much of the question each hit
+        #    covers (0..1, relative to the best). A verdict that matches the
+        #    query makes the claims it judged relevant.
+        k_hits = ctx.knowledge.search(query, caller, scope, k=max(k, _POOL))
+        e_hits = ctx.events.search(query, caller, scope, k=max(k, _POOL),
+                                   kinds=("record", "outcome", "human_confirm"))
+        k_rel, e_rel = _relevance(query, [i.body for i, _ in k_hits], [e.text for e, _ in e_hits])
         rel: dict[str, float] = {}
+        # Where the search put it: its best position among the events, where notes
+        # and knowledge compete; knowledge found only as knowledge comes after those.
+        place: dict[str, int] = {}
         items: dict[str, Knowledge] = {}
-        hits = ctx.knowledge.search(query, caller, scope, k=max(k, _POOL))
-        for (item, _), r in zip(hits, _relevance(hits)):
+        for at, ((item, _), r) in enumerate(zip(k_hits, k_rel)):
             items[item.id] = item
             rel[item.id] = max(rel.get(item.id, 0.0), r)
-        hits = ctx.events.search(query, caller, scope, k=max(k, _POOL),
-                                 kinds=("record", "outcome", "human_confirm"))
-        for (event, _), r in zip(hits, _relevance(hits)):
+            place[item.id] = len(e_hits) + at
+        for at, ((event, _), r) in enumerate(zip(e_hits, e_rel)):
             if event.kind == "record":
                 cid = ctx.state.get(_of_key(event.id))
                 cids = [] if cid is None else [cid]
@@ -369,6 +375,7 @@ class TierEngine:
                 cids = ctx.state.get(_judged_key(event.id)) or []
             for cid in cids:
                 rel[cid] = max(rel.get(cid, 0.0), r)
+                place[cid] = min(place.get(cid, at), at)
 
         # 2. Claims the judge linked share relevance: a note in other words is as
         #    on topic as the note the search matched.
@@ -376,6 +383,7 @@ class TierEngine:
             for key, _ in ctx.state.scan(_link_prefix(cid)):
                 other = key[len(_link_prefix(cid)):]
                 rel[other] = max(rel.get(other, 0.0), r)
+                place[other] = min(place.get(other, place[cid]), place[cid])
 
         # 3. Tier each claim; collect corrections owed to this user.
         ranked: list[tuple[tuple[float, ...], str, Handoff]] = []
@@ -385,7 +393,7 @@ class TierEngine:
             if claim is None:  # knowledge this engine's state does not know (state was reset)
                 item = items.get(cid)
                 if item is not None and (miss := _unmet(item.conditions, context)) is not None:
-                    ranked.append((_rank(CHECKED, miss, r), cid, Handoff(
+                    ranked.append((_rank(CHECKED, miss, r, place[cid]), cid, Handoff(
                         id=cid, content=item.body, sources=item.sources, status="knowledge",
                         conditions=item.conditions)))
                 continue
@@ -395,7 +403,7 @@ class TierEngine:
             standing = self._standing(cid, ctx)
             if claim["status"] == "knowledge":
                 sources = tuple(claim["sources"])
-                ranked.append((_rank(CHECKED, miss, r), cid, Handoff(
+                ranked.append((_rank(CHECKED, miss, r, place[cid]), cid, Handoff(
                     id=cid, content=_with_basis(claim["text"], standing, checked=True), sources=sources,
                     status="knowledge", conditions=claim["conditions"])))
             elif claim["status"] == "memory":
@@ -405,7 +413,7 @@ class TierEngine:
                     tier = DISPUTED
                 else:
                     tier = BACKED if standing.witnesses >= 2 else SINGLE
-                ranked.append((_rank(tier, miss, r), cid, Handoff(
+                ranked.append((_rank(tier, miss, r, place[cid]), cid, Handoff(
                     id=cid, content=_with_basis(claim["text"], standing, checked=False),
                     sources=(claim["first"],), status="memory", conditions=claim["conditions"])))
             elif standing.refuters and ctx.state.get(_seen_key(caller.user, cid)) and r >= ON_TOPIC:
@@ -639,21 +647,27 @@ def _retraction(text: str, standing: Standing, ctx: EngineContext, replaced_by: 
     return "\n".join(lines)
 
 
-def _rank(tier: int, unmet: int, rel: float) -> tuple[float, ...]:
-    """Sort key, smallest first. Relevance decides what is on topic; among
-    what is on topic the tier decides, then how well the conditions fit where
-    the question was asked, then relevance again."""
-    return (0.0 if rel >= ON_TOPIC else 1.0, float(tier), float(unmet), -rel)
+def _rank(tier: int, unmet: int, rel: float, place: int) -> tuple[int, ...]:
+    """Sort key, smallest first. A tier above a single unchecked note counts
+    only for what is on topic; then how well the conditions fit where the
+    question was asked; then the order the search gave. When nothing has been
+    checked or backed, that leaves the search's own order."""
+    return (tier if rel >= ON_TOPIC else max(tier, SINGLE), unmet, place)
 
 
-def _relevance(hits: Sequence[tuple[Any, float]]) -> list[float]:
-    """Scores scaled to 0..1 within one result list (store scores are not comparable)."""
-    if not hits:
-        return []
-    top = max(score for _, score in hits)
-    if top <= 0:
-        return [1.0 / (i + 1) for i in range(len(hits))]
-    return [max(0.0, score / top) for _, score in hits]
+def _relevance(query: str, *lists: Sequence[str]) -> list[list[float]]:
+    """For each text, the share of the question's tokens it contains, scaled
+    so the best text of all lists is 1. Counted here rather than taken from
+    the stores: their scores depend on the ranking formula and cannot be
+    compared between two result lists, so a store decides which texts are
+    candidates and in what order equals stand, not what is on topic. When
+    nothing shares a token with the question, order within each list stands."""
+    asked = tokens(query)
+    shared = [[len(asked & tokens(text)) for text in texts] for texts in lists]
+    top = max((n for counts in shared for n in counts), default=0)
+    if top == 0:
+        return [[1.0 / (i + 1) for i in range(len(counts))] for counts in shared]
+    return [[n / top for n in counts] for counts in shared]
 
 
 def _unmet(conditions: Mapping[str, str], context: Mapping[str, str]) -> int | None:
