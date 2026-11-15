@@ -191,11 +191,36 @@ def test_recall_passes_where_the_question_was_asked():
     m.record("deploy uses release tags")
 
     m.recall("deploy tags", context={"service": "billing"})
-    m.recall("deploy tags", repo="acme/web")
+    m.recall("deploy tags", repo="acme/web", context={"repo": "web"})
+    service(db, session="s2").recall("deploy tags", repo="acme/web")
 
-    first, second = [e for _, e in db.events.since(0) if e.kind == "recall"]
+    first, second, third = [e for _, e in db.events.since(0) if e.kind == "recall"]
     assert (first.repo, dict(first.conditions)) == ("acme/api", {"service": "billing"})
-    assert (second.repo, dict(second.conditions)) == ("acme/web", {})
+    assert (second.repo, dict(second.conditions)) == ("acme/api", {})  # the configured repo counts, not the agent's
+    assert third.repo == "acme/web"  # no configured repo: the caller's word stands
+
+
+def test_a_made_up_repo_does_not_hold_back_what_is_bound_to_this_repo():
+    db = SqliteDatabase()
+    m = service(db, repo="acme/api", engine=TIERS)
+    m.record("deploy uses release tags", conditions={"repo": "acme/api"})
+
+    for made_up in ({"repo": "api"}, {"context": {"repo": "T5-api"}}):
+        [got] = m.recall("deploy tags", **made_up)
+        assert got["conditions"] == {"repo": "acme/api"}
+    assert service(db, session="s2", repo="acme/web", engine=TIERS).recall("deploy tags") == []  # held back elsewhere
+
+
+def test_a_record_cannot_bind_itself_to_a_repo_the_session_is_not_in():
+    db = SqliteDatabase()
+    m = service(db, repo="acme/api")
+
+    with pytest.raises(ValueError, match="this project's repo is 'acme/api'"):
+        m.record("deploy uses release tags", conditions={"repo": "T5/api"})
+
+    assert [e for _, e in db.events.since(0)] == []
+    m.record("deploy uses release tags", conditions={"repo": "acme/api", "service": "api"})
+    service(db, session="s2").record("x", conditions={"repo": "anything"})  # no configured repo: not checked
 
 
 def test_outcome_without_refs_is_refused():
@@ -385,3 +410,295 @@ def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
     )
 
     assert result.returncode != 0 and message in result.stderr
+
+
+# ── a record that replaces existing knowledge ───────────────────────────────
+
+TIERS = "cortex_mem.engines.tiers:TierEngine"
+TEAM = ScopePolicy.parse("team")
+OLD_WAY = "when the test run hangs, pass --no-cache to the runner"
+NEW_WAY = "the test run hang is fixed by taking the cache lock before the index lock"
+
+
+def knowledge_then_replacement(db):
+    """u1's note is checked knowledge; u2 records something on the same topic."""
+    author, ci, fixer = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u1", "ci", "u2"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    return fixer, ci, fixer.record(NEW_WAY)
+
+
+def test_record_hands_back_related_knowledge_and_says_what_to_do():
+    fixer, _, new = knowledge_then_replacement(SqliteDatabase())
+
+    [related] = new["related"]
+    assert OLD_WAY in related["content"]
+    assert f"replaced_by='{new['id']}'" in new["next"]
+
+
+def test_record_with_nothing_related_asks_nothing():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+
+    assert "related" not in m.record(OLD_WAY)  # its own note is not "existing knowledge"
+
+
+def test_replacement_takes_effect_only_once_the_new_record_is_checked():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    out = fixer.report_outcome("failure", [old_id], replaced_by=new["id"])
+    assert out["restated"]
+    assert [m["id"] for m in fixer.recall("test run hang") if m["status"] == "knowledge"] == [old_id]
+
+    ci.report_outcome("success", [new["id"]], signal="test")
+    knowledge = [m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]
+    assert len(knowledge) == 1 and NEW_WAY in knowledge[0]["content"]
+
+
+def test_a_failure_report_without_replaced_by_replaces_nothing():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    fixer.report_outcome("failure", [old_id])
+    ci.report_outcome("success", [new["id"]], signal="test")
+
+    assert len([m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]) == 2
+
+
+def test_replaced_by_must_be_your_own_record_and_a_failure():
+    db = SqliteDatabase()
+    fixer, ci, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+
+    with pytest.raises(ValueError, match="record you wrote"):
+        ci.report_outcome("failure", [old_id], replaced_by=new["id"])
+    with pytest.raises(ValueError, match="failure"):
+        fixer.report_outcome("success", [old_id], replaced_by=new["id"])
+
+
+def test_stdio_agent_cannot_vouch_for_itself_as_a_test(tmp_path):
+    db = tmp_path / "cortex.db"
+    recorded = call(db, "record_episode", {"text": "cloud sql needs the auth proxy"})
+
+    call(db, "report_outcome", {"outcome": "failure", "refs": [recorded["id"]], "signal": "test"}, raw=True)
+
+    signals = [e.signal for _, e in SqliteDatabase(db).events.since(0) if e.kind == "outcome"]
+    assert signals in ([], ["self"])  # refused as an unknown argument, or stored as the agent's own word
+
+
+# ── evidence that is not an agent's word: the cortex-mem command ────────────
+
+import subprocess
+
+from cortex_mem_server.cli import commit_records, confirm_commits, review
+
+
+def git(cwd, *args):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+def commit(cwd, message):
+    git(cwd, "commit", "--allow-empty", "-m", message)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_record_names_the_trailer_to_put_in_a_commit():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+
+    r = m.record(NEW_WAY)
+
+    assert r["commit_trailer"] == f"Cortex-Record: {r['id']}"
+
+
+def test_ci_reports_the_test_run_for_records_named_in_commit_trailers(tmp_path):
+    db = SqliteDatabase()
+    agent, ci = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS, repo="acme/loader") for u in ("u2", "ci"))
+    note = agent.record(NEW_WAY)
+    git(tmp_path, "init", "-q")
+    commit(tmp_path, "start")
+    sha = commit(tmp_path, f"Fix the cache key\n\n{note['commit_trailer']}\nCortex-Record: no-such-record")
+
+    result = confirm_commits(ci, "HEAD~1..HEAD", "success", cwd=str(tmp_path))
+
+    assert commit_records("HEAD~1..HEAD", str(tmp_path)) == [(sha, [note["id"], "no-such-record"])]
+    assert [(r["commit"], r["records"]) for r in result["reported"]] == [(sha, [note["id"]])]
+    assert result["unknown_records"] == ["no-such-record"]
+    [outcome] = [e for _, e in db.events.since(0) if e.kind == "outcome"]
+    assert (outcome.signal, outcome.rev, outcome.scope) == ("test", sha, "team")
+    assert [m["status"] for m in agent.recall("test run hang")] == ["knowledge"]
+
+
+def test_a_failed_run_takes_the_knowledge_back(tmp_path):
+    db = SqliteDatabase()
+    agent, ci = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u2", "ci"))
+    note = agent.record(NEW_WAY)
+    git(tmp_path, "init", "-q")
+    commit(tmp_path, f"Fix\n\n{note['commit_trailer']}")
+    confirm_commits(ci, "HEAD", "success", cwd=str(tmp_path))
+    commit(tmp_path, f"Rework\n\n{note['commit_trailer']}")
+
+    confirm_commits(ci, "HEAD~1..HEAD", "failure", cwd=str(tmp_path))
+
+    assert agent.recall("test run hang") == []
+
+
+def test_a_person_approves_or_rejects_a_record():
+    db = SqliteDatabase()
+    agent, lead = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u2", "lead"))
+    note = agent.record(NEW_WAY)
+
+    review(lead, note["id"], "approve")
+    assert [m["status"] for m in agent.recall("test run hang")] == ["knowledge"]
+
+    review(lead, note["id"], "reject", "does not hold on the release branch")
+    [correction] = agent.recall("test run hang")  # the agent was handed it a moment ago, so it is told
+    assert correction["status"] == "invalidated" and "release branch" in correction["content"]
+
+
+def test_approving_your_own_record_does_nothing():
+    m = service(SqliteDatabase(), policy=TEAM, engine=TIERS)
+    note = m.record(NEW_WAY)
+
+    review(m, note["id"], "approve")
+
+    assert [h["status"] for h in m.recall("test run hang")] == ["memory"]
+
+
+def test_a_failure_report_with_no_record_behind_it_asks_for_one():
+    db = SqliteDatabase()
+    author, ci, fixer = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS) for u in ("u1", "ci", "u2"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    [handed] = fixer.recall("test run hang")
+
+    out = fixer.report_outcome("failure", [handed["id"]], text="only hides the bug; the cause is the lock order")
+    assert "record_episode" in out["next"] and handed["id"] in out["next"]
+
+    new = fixer.record(NEW_WAY, refs=[handed["id"]])  # following the hint is enough: no further call
+    ci.report_outcome("success", [new["id"]], signal="test")
+    knowledge = [m for m in fixer.recall("test run hang") if m["status"] == "knowledge"]
+    assert len(knowledge) == 1 and NEW_WAY in knowledge[0]["content"]
+
+
+def test_a_failure_report_after_citing_the_memory_asks_nothing():
+    db = SqliteDatabase()
+    fixer, _, new = knowledge_then_replacement(db)
+    old_id = new["related"][0]["id"]
+    fixer.record("another note on the same thing", refs=[old_id])
+
+    assert "next" not in fixer.report_outcome("failure", [old_id])
+    assert "next" not in fixer.report_outcome("success", [old_id])
+
+
+# ── what was handed over before a commit, with no help from the agent ───────
+
+from cortex_mem_server.cli import add_recalled, install_hook, to_review
+
+
+def handed_then_committed(tmp_path, message="Take the cache lock before the index lock\n\nFixes the test run hang."):
+    """u1's workaround is knowledge; u2 recalls it, records nothing, and commits a fix."""
+    db = SqliteDatabase()
+    author, ci, fixer, lead = (service(db, user=u, session=f"s-{u}", policy=TEAM, engine=TIERS, repo="acme/app")
+                               for u in ("u1", "ci", "u2", "lead"))
+    old = author.record(OLD_WAY)
+    ci.report_outcome("success", [old["id"]], signal="test")
+    git(tmp_path, "init", "-q")
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--allow-empty", "-m",
+                    "start"], cwd=tmp_path, check=True, capture_output=True,
+                   env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-01T00:00:00+00:00"})  # before the test clock
+    [handed] = fixer.recall("test run hang")
+    msg = tmp_path / "MSG"
+    msg.write_text(message + "\n")
+    add_recalled(fixer, str(msg), cwd=str(tmp_path))
+    sha = commit(tmp_path, msg.read_text())
+    return db, fixer, lead, handed["id"], sha
+
+
+def test_the_hook_names_what_the_committer_was_handed_since_the_last_commit(tmp_path):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+
+    review_list = to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path))
+
+    [item] = review_list["to_review"]
+    assert item["id"] == old_id and OLD_WAY in item["content"]
+    assert [c["commit"] for c in item["commits"]] == [sha]
+    msg = tmp_path / "MSG2"
+    msg.write_text("unrelated follow-up\n")
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == []  # nothing handed since that commit
+
+
+def test_someone_elses_recalls_and_other_repos_are_not_named(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+    elsewhere = service(db, user="u2", session="s-x", policy=TEAM, engine=TIERS, repo="acme/other")
+    elsewhere.recall("test run hang")
+    lead.recall("test run hang")
+    commit(tmp_path, "later")
+
+    assert fixer.recalled() == [old_id]
+    assert fixer.recalled(since=datetime.now(UTC) + timedelta(days=1)) == []
+
+
+def test_a_repo_argument_the_agent_made_up_does_not_hide_the_recall_from_the_hook(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+    since = datetime.now(UTC) + timedelta(days=1)  # past everything handed so far
+    other, again = (service(db, user="u2", session=f"s-{r}", policy=TEAM, engine=TIERS, repo=f"acme/{r}")
+                    for r in ("other", "app"))
+    other.clock = again.clock = lambda: since + timedelta(hours=1)
+
+    other.recall("test run hang", repo="acme/app")  # asked from another project: not this repo's commit
+    assert fixer.recalled(since=since) == []
+    assert [m["id"] for m in again.recall("test run hang", repo="T5-app")] == [old_id]
+
+    assert fixer.recalled(since=since) == [old_id]
+    asked_in = [e.repo for _, e in db.events.since(0) if e.kind == "recall" and e.at > since]
+    assert asked_in == ["acme/other", "acme/app"]  # where each session is configured to work
+
+
+def test_amending_the_commit_keeps_what_it_named(tmp_path, monkeypatch):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+    msg = tmp_path / "MSG2"
+    msg.write_text("Reworded fix\n")
+    authored = subprocess.run(["git", "log", "-1", "--format=%at"], cwd=tmp_path, check=True, capture_output=True,
+                              text=True).stdout.strip()
+    monkeypatch.setenv("GIT_AUTHOR_DATE", f"@{authored} +0000")
+
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == [old_id]  # as git runs the hook for --amend -m
+
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "@1 +0000")
+    assert add_recalled(fixer, str(msg), cwd=str(tmp_path)) == []  # a new commit on top names nothing new
+
+
+def test_a_reviewer_replaces_stale_knowledge_with_the_commit(tmp_path):
+    db, fixer, lead, old_id, sha = handed_then_committed(tmp_path)
+
+    out = review(lead, old_id, "replace", commit="HEAD", cwd=str(tmp_path))
+
+    assert out["commit"] == sha
+    [now] = [m for m in service(db, user="u3", session="s-u3", policy=TEAM, engine=TIERS, repo="acme/app")
+             .recall("test run hang") if m["status"] == "knowledge"]
+    assert "cache lock before the index lock" in now["content"] and "Cortex-Recalled" not in now["content"]
+    assert to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path)) == {"to_review": [], "no_longer_knowledge": [old_id]}
+
+
+def test_a_reviewer_keeps_knowledge_that_still_holds(tmp_path):
+    db, fixer, lead, old_id, _ = handed_then_committed(tmp_path)
+
+    review(lead, old_id, "keep")
+
+    assert [i["id"] for i in to_review(lead, "HEAD~1..HEAD", cwd=str(tmp_path))["to_review"]] == [old_id]
+
+
+def test_install_hook_writes_a_hook_that_never_blocks_a_commit(tmp_path, monkeypatch):
+    git(tmp_path, "init", "-q")
+    monkeypatch.setenv("CORTEX_TEAM", "t1")
+    monkeypatch.setenv("CORTEX_DB_PATH", str(tmp_path / "missing-dir" / "x.db"))
+
+    hook = install_hook(cwd=str(tmp_path))["installed"]
+
+    text = open(hook).read()
+    assert "commit-msg" in text and "CORTEX_TEAM=t1" in text and text.rstrip().endswith("|| true")
+    commit(tmp_path, "still commits")
+    install_hook(cwd=str(tmp_path))  # reinstalling over our own hook is fine
