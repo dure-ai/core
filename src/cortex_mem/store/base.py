@@ -5,11 +5,11 @@ A durable implementation (SQLite, PostgreSQL) passes the contract when it
 passes the suites in cortex_mem.testing.
 """
 
-from collections.abc import Iterator, Mapping, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence, Set
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
-from ..contract import Event, EventReader, Knowledge, KnowledgeReader
+from ..contract import Event, EventReader, Knowledge, KnowledgeReader, Scope
 
 
 class CursorConflict(Exception):
@@ -68,6 +68,63 @@ class EngineStateBackend(Protocol):
         ...
 
 
+class VectorBackend(Protocol):
+    """Embedding vectors, similarity groups and the embedding cache. Vectors are
+    float64 (list[float]); callers get copies. All writes happen inside the
+    runtime's transaction()."""
+
+    # Index state
+    def meta(self) -> dict | None:
+        """{"model": str, "group_threshold": float}, None until reset() is called."""
+        ...
+
+    def reset(self, meta: dict) -> None:
+        """Drop every vector and group, move the cursor to 0 and record meta.
+        The embedding cache stays."""
+        ...
+
+    def indexed(self) -> int:
+        """Position of the last event indexed (0 = none)."""
+        ...
+
+    def set_indexed(self, seq: int) -> None: ...
+
+    # Vectors (kind: "event" | "knowledge")
+    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+        """Store or replace. Replacing keeps the id's original position."""
+        ...
+
+    def vector(self, kind: str, id: str) -> list[float] | None: ...
+
+    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
+        """Event vectors in first-insertion order, knowledge vectors by id."""
+        ...
+
+    def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
+        """Remove vectors only (not groups); unknown ids are ignored."""
+        ...
+
+    # Groups
+    def put_group(
+        self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int
+    ) -> None: ...
+
+    def group_of(self, event_id: str) -> str | None: ...
+
+    def members(self, group_id: str) -> list[str]:
+        """Event ids of the group ordered by seq; unknown group gives []."""
+        ...
+
+    def partition(self, scope: Scope, owner: str) -> list[str]:
+        """Grouped event ids of that (scope, owner), ordered by seq."""
+        ...
+
+    # Embedding cache
+    def cached(self, model: str, digest: str) -> list[float] | None: ...
+
+    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None: ...
+
+
 class Database(Protocol):
     """All stores behind one connection. The runtime takes them apart:
     Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)."""
@@ -77,6 +134,9 @@ class Database(Protocol):
 
     @property
     def knowledge(self) -> KnowledgeStore: ...
+
+    @property
+    def vectors(self) -> VectorBackend: ...
 
     def state(self, engine: str) -> EngineStateBackend:
         """State and cursor of the engine with this name (its import path)."""

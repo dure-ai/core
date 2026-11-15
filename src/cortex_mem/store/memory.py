@@ -157,12 +157,87 @@ class InMemoryStateBackend:
         self._version = version
 
 
+class InMemoryVectorBackend:
+    def __init__(self) -> None:
+        self._vectors: dict[str, dict[str, list[float]]] = {
+            "event": {},
+            "knowledge": {},
+        }
+        self._groups: dict[str, tuple[str, Scope, str, int]] = {}
+        self._cache: dict[tuple[str, str], list[float]] = {}
+        self._meta: dict | None = None
+        self._indexed = 0
+
+    def meta(self) -> dict | None:
+        return None if self._meta is None else dict(self._meta)
+
+    def reset(self, meta: dict) -> None:
+        for table in self._vectors.values():
+            table.clear()
+        self._groups.clear()
+        self._indexed = 0
+        self._meta = dict(meta)
+
+    def indexed(self) -> int:
+        return self._indexed
+
+    def set_indexed(self, seq: int) -> None:
+        self._indexed = seq
+
+    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+        # Assigning to an existing dict key keeps its original position.
+        self._vectors[kind][id] = [float(x) for x in vector]
+
+    def vector(self, kind: str, id: str) -> list[float] | None:
+        found = self._vectors[kind].get(id)
+        return None if found is None else list(found)
+
+    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
+        table = self._vectors[kind]
+        ids = sorted(table) if kind == "knowledge" else list(table)
+        for id in ids:
+            yield id, list(table[id])
+
+    def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
+        for id in ids:
+            self._vectors[kind].pop(id, None)
+
+    def put_group(
+        self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int
+    ) -> None:
+        self._groups[event_id] = (group_id, scope, owner, seq)
+
+    def group_of(self, event_id: str) -> str | None:
+        found = self._groups.get(event_id)
+        return None if found is None else found[0]
+
+    def members(self, group_id: str) -> list[str]:
+        rows = [(g[3], e) for e, g in self._groups.items() if g[0] == group_id]
+        return [e for _, e in sorted(rows)]
+
+    def partition(self, scope: Scope, owner: str) -> list[str]:
+        rows = [
+            (g[3], e)
+            for e, g in self._groups.items()
+            if g[1] == scope and g[2] == owner
+        ]
+        return [e for _, e in sorted(rows)]
+
+    def cached(self, model: str, digest: str) -> list[float] | None:
+        found = self._cache.get((model, digest))
+        return None if found is None else list(found)
+
+    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None:
+        self._cache[(model, digest)] = [float(x) for x in vector]
+
+
 class InMemoryDatabase:
     """Every store in memory: one per harness scenario run, or per test."""
 
     def __init__(self) -> None:
         self.events = InMemoryEventStore()
         self.knowledge = InMemoryKnowledgeBase()
+        self.vectors = InMemoryVectorBackend()
         self._states: dict[str, InMemoryStateBackend] = {}
 
     def state(self, engine: str) -> InMemoryStateBackend:

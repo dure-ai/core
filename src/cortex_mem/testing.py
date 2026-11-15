@@ -232,6 +232,124 @@ class EngineStateBackendContract(_Contract):
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
 
 
+class VectorBackendContract(_Contract):
+    @pytest.fixture
+    def vb(self):
+        return self.make()
+
+    def test_meta_starts_empty_and_reset_records_it(self, vb):
+        assert vb.meta() is None
+        assert vb.indexed() == 0
+
+        meta = {"model": "m1", "group_threshold": 0.8}
+        vb.reset(meta)
+
+        assert vb.meta() == meta
+        vb.meta()["model"] = "changed"
+        assert vb.meta() == meta
+
+    def test_vectors_round_trip_as_float64(self, vb):
+        vb.put_vector("event", "e1", [0.1, 1 / 3, -2.5])
+
+        got = vb.vector("event", "e1")
+        assert got == [0.1, 1 / 3, -2.5]
+        assert all(type(x) is float for x in got)
+        assert vb.vector("event", "missing") is None
+        assert vb.vector("knowledge", "e1") is None
+        got.append(9.0)
+        assert vb.vector("event", "e1") == [0.1, 1 / 3, -2.5]
+
+    def test_event_vectors_keep_insertion_order_and_knowledge_vectors_sort_by_id(
+        self, vb
+    ):
+        for id in ("e3", "e1", "e2"):
+            vb.put_vector("event", id, [1.0])
+        for id in ("k3", "k1", "k2"):
+            vb.put_vector("knowledge", id, [2.0])
+
+        assert [i for i, _ in vb.vectors("event")] == ["e3", "e1", "e2"]
+        assert [i for i, _ in vb.vectors("knowledge")] == ["k1", "k2", "k3"]
+        for _, vec in vb.vectors("event"):
+            vec.append(5.0)
+        assert vb.vector("event", "e3") == [1.0]
+
+    def test_put_vector_replaces_the_same_id(self, vb):
+        vb.put_vector("event", "e1", [1.0])
+        vb.put_vector("event", "e2", [2.0])
+        vb.put_vector("event", "e1", [9.0, 8.0])
+
+        assert vb.vector("event", "e1") == [9.0, 8.0]
+        assert list(vb.vectors("event")) == [("e1", [9.0, 8.0]), ("e2", [2.0])]
+
+    def test_delete_vectors_removes_only_the_named_ids(self, vb):
+        for id in ("e1", "e2", "e3"):
+            vb.put_vector("event", id, [1.0])
+        vb.put_vector("knowledge", "e1", [3.0])
+        vb.put_group("e1", "g1", "team", "t1", 1)
+
+        vb.delete_vectors("event", {"e1", "nope"})
+
+        assert [i for i, _ in vb.vectors("event")] == ["e2", "e3"]
+        assert vb.vector("knowledge", "e1") == [3.0]
+        assert vb.group_of("e1") == "g1"
+
+    def test_groups_members_and_partition_are_in_seq_order(self, vb):
+        vb.put_group("e3", "g1", "team", "t1", 3)
+        vb.put_group("e1", "g1", "team", "t1", 1)
+        vb.put_group("e2", "g1", "team", "t1", 2)
+
+        assert vb.members("g1") == ["e1", "e2", "e3"]
+        assert vb.partition("team", "t1") == ["e1", "e2", "e3"]
+        assert vb.group_of("e2") == "g1"
+        assert vb.group_of("unknown") is None
+        assert vb.members("unknown") == []
+
+    def test_partition_is_per_scope_and_owner(self, vb):
+        vb.put_group("a", "g1", "team", "t1", 1)
+        vb.put_group("b", "g2", "team", "t2", 2)
+        vb.put_group("c", "g3", "personal", "u1", 3)
+
+        assert vb.partition("team", "t1") == ["a"]
+        assert vb.partition("team", "t2") == ["b"]
+        assert vb.partition("personal", "u1") == ["c"]
+        assert vb.partition("org", "t1") == []
+
+    def test_reset_clears_vectors_groups_and_cursor_but_keeps_the_cache(self, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.put_vector("event", "e1", [1.0])
+        vb.put_vector("knowledge", "k1", [1.0])
+        vb.put_group("e1", "g1", "team", "t1", 1)
+        vb.cache("m1", "d1", [0.5])
+        vb.set_indexed(7)
+
+        vb.reset({"model": "m2", "group_threshold": 0.9})
+
+        assert list(vb.vectors("event")) == []
+        assert list(vb.vectors("knowledge")) == []
+        assert vb.group_of("e1") is None
+        assert vb.members("g1") == []
+        assert vb.partition("team", "t1") == []
+        assert vb.indexed() == 0
+        assert vb.meta() == {"model": "m2", "group_threshold": 0.9}
+        assert vb.cached("m1", "d1") == [0.5]
+
+    def test_cache_is_per_model(self, vb):
+        assert vb.cached("m1", "d1") is None
+        vb.cache("m1", "d1", [0.1, 0.2])
+
+        assert vb.cached("m1", "d1") == [0.1, 0.2]
+        assert vb.cached("m2", "d1") is None
+        assert vb.cached("m1", "d2") is None
+        vb.cached("m1", "d1").append(1.0)
+        assert vb.cached("m1", "d1") == [0.1, 0.2]
+
+    def test_set_indexed_moves_the_cursor(self, vb):
+        vb.set_indexed(5)
+        assert vb.indexed() == 5
+        vb.set_indexed(9)
+        assert vb.indexed() == 9
+
+
 class _Counting:
     """Records each delivery in `seen` and in its state, promotes each event."""
 
