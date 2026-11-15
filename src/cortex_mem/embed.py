@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from typing import Literal, Protocol
 
@@ -60,3 +63,76 @@ class HashEmbedder:
         if norm == 0.0:
             return vec
         return [x / norm for x in vec]
+
+
+class UpstageEmbedder:
+    """Embedder backed by the Upstage embeddings HTTP API."""
+
+    def __init__(
+        self,
+        api_key: str,
+        passage_model: str,
+        query_model: str,
+        base_url: str = "https://api.upstage.ai/v1",
+        timeout: float = 30.0,
+        batch: int = 64,
+    ) -> None:
+        self._api_key = api_key
+        self.passage_model = passage_model
+        self.query_model = query_model
+        self.model = passage_model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.batch = max(1, batch)
+        self._dim: int | None = None
+
+    @property
+    def dim(self) -> int:
+        """Vector length learned from the first successful response."""
+        if self._dim is None:
+            raise ValueError("dim is unknown until the first successful embed call")
+        return self._dim
+
+    def __repr__(self) -> str:
+        return f"UpstageEmbedder(passage_model={self.passage_model!r}, query_model={self.query_model!r})"
+
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
+        """Embed texts in batches with the model matching kind."""
+        model = self.passage_model if kind == "passage" else self.query_model
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch):
+            out.extend(self._post(model, list(texts[i : i + self.batch])))
+        return out
+
+    def _post(self, model: str, chunk: list[str]) -> list[list[float]]:
+        body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/embeddings",
+            data=body,
+            method="POST",
+            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise EmbeddingError(f"embedding request failed with HTTP {exc.code}") from None
+        except TimeoutError:
+            raise EmbeddingError(f"embedding request timed out after {self.timeout}s") from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise EmbeddingError(f"embedding request timed out after {self.timeout}s") from None
+            raise EmbeddingError(f"embedding request failed: {exc.reason}") from None
+        except OSError as exc:
+            raise EmbeddingError(f"embedding request failed: {type(exc).__name__}") from None
+        try:
+            items = sorted(json.loads(raw)["data"], key=lambda item: item["index"])
+            vectors = [[float(x) for x in item["embedding"]] for item in items]
+        except (ValueError, KeyError, TypeError):
+            raise EmbeddingError("embedding response is not valid embeddings JSON") from None
+        if len(vectors) != len(chunk):
+            raise EmbeddingError(f"expected {len(chunk)} embeddings, got {len(vectors)}")
+        if self._dim is None and vectors:
+            self._dim = len(vectors[0])
+        return vectors
