@@ -17,7 +17,8 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Collection, Iterator, Mapping, Set
+from array import array
+from collections.abc import Collection, Iterator, Mapping, Sequence, Set
 from contextlib import contextmanager
 from datetime import datetime
 from os import PathLike
@@ -26,7 +27,7 @@ from typing import Any
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _WORD = re.compile(r"\w+")
 _HANGUL = re.compile(r"[가-힣]")
@@ -91,6 +92,7 @@ class SqliteDatabase:
         self._create()
         self.events = SqliteEventStore(self)
         self.knowledge = SqliteKnowledgeBase(self)
+        self.vectors = SqliteVectorBackend(self)
 
     def _create(self) -> None:
         version = self.con.execute("PRAGMA user_version").fetchone()[0]
@@ -98,8 +100,10 @@ class SqliteDatabase:
         if has_tables and version == 2:
             with self.transaction():  # 2 -> 3: events.text_redacted
                 self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
-                self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif has_tables and version != SCHEMA_VERSION:
+                self.con.execute("PRAGMA user_version = 3")
+            version = 3
+        # 3 -> 4 only adds the vector tables, which the CREATE IF NOT EXISTS below makes.
+        if has_tables and version not in (3, SCHEMA_VERSION):
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
             self.con.execute(
@@ -118,6 +122,23 @@ class SqliteDatabase:
             self.con.execute(
                 "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
             )
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, "
+                "PRIMARY KEY (kind, id))"
+            )
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS vector_groups (event_id TEXT PRIMARY KEY, group_id TEXT, "
+                "scope TEXT, owner TEXT, seq INTEGER)"
+            )
+            self.con.execute(
+                "CREATE INDEX IF NOT EXISTS vector_groups_partition ON vector_groups (scope, owner, seq)"
+            )
+            self.con.execute("CREATE INDEX IF NOT EXISTS vector_groups_group ON vector_groups (group_id, seq)")
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS embed_cache (model TEXT, digest TEXT, vec BLOB, "
+                "PRIMARY KEY (model, digest))"
+            )
+            self.con.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT)")
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def state(self, engine: str) -> "SqliteStateBackend":
@@ -336,4 +357,108 @@ class SqliteStateBackend:
                 "INSERT INTO engine_cursor (engine, cursor, version) VALUES (?, 0, ?) "
                 "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version",
                 (self.engine, version),
+            )
+
+
+def _pack(vector: Sequence[float]) -> bytes:
+    return array("d", vector).tobytes()
+
+
+def _unpack(blob: bytes) -> list[float]:
+    values = array("d")
+    values.frombytes(blob)
+    return values.tolist()
+
+
+class SqliteVectorBackend:
+    def __init__(self, db: SqliteDatabase) -> None:
+        self.db = db
+
+    def meta(self) -> dict | None:
+        rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'meta'")
+        return json.loads(rows[0][0]) if rows else None
+
+    def reset(self, meta: dict) -> None:
+        with self.db.transaction():
+            self.db.con.execute("DELETE FROM vectors")
+            self.db.con.execute("DELETE FROM vector_groups")
+            self.db.con.execute("DELETE FROM vector_meta WHERE key = 'indexed'")
+            self.db.con.execute(
+                "INSERT INTO vector_meta (key, value) VALUES ('meta', ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (json.dumps(meta),),
+            )
+
+    def indexed(self) -> int:
+        rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
+        return int(rows[0][0]) if rows else 0
+
+    def set_indexed(self, seq: int) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO vector_meta (key, value) VALUES ('indexed', ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (str(seq),),
+            )
+
+    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+        with self.db.transaction():
+            # seq is assigned on first insert; replacing keeps it (and the position).
+            self.db.con.execute(
+                "INSERT INTO vectors (kind, id, seq, vec) VALUES "
+                "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM vectors WHERE kind = ?), ?) "
+                "ON CONFLICT (kind, id) DO UPDATE SET vec = excluded.vec",
+                (kind, id, kind, _pack(vector)),
+            )
+
+    def vector(self, kind: str, id: str) -> list[float] | None:
+        rows = self.db.query("SELECT vec FROM vectors WHERE kind = ? AND id = ?", (kind, id))
+        return _unpack(rows[0][0]) if rows else None
+
+    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
+        order = "id" if kind == "knowledge" else "seq"
+        rows = self.db.query(f"SELECT id, vec FROM vectors WHERE kind = ? ORDER BY {order}", (kind,))
+        for id, blob in rows:
+            yield id, _unpack(blob)
+
+    def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
+        with self.db.transaction():
+            self.db.con.executemany("DELETE FROM vectors WHERE kind = ? AND id = ?", [(kind, i) for i in ids])
+
+    def put_group(self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO vector_groups (event_id, group_id, scope, owner, seq) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (event_id) DO UPDATE SET group_id = excluded.group_id, scope = excluded.scope, "
+                "owner = excluded.owner, seq = excluded.seq",
+                (event_id, group_id, scope, owner, seq),
+            )
+
+    def group_of(self, event_id: str) -> str | None:
+        rows = self.db.query("SELECT group_id FROM vector_groups WHERE event_id = ?", (event_id,))
+        return rows[0][0] if rows else None
+
+    def members(self, group_id: str) -> list[str]:
+        rows = self.db.query(
+            "SELECT event_id FROM vector_groups WHERE group_id = ? ORDER BY seq, event_id", (group_id,)
+        )
+        return [r[0] for r in rows]
+
+    def partition(self, scope: Scope, owner: str) -> list[str]:
+        rows = self.db.query(
+            "SELECT event_id FROM vector_groups WHERE scope = ? AND owner = ? ORDER BY seq, event_id",
+            (scope, owner),
+        )
+        return [r[0] for r in rows]
+
+    def cached(self, model: str, digest: str) -> list[float] | None:
+        rows = self.db.query("SELECT vec FROM embed_cache WHERE model = ? AND digest = ?", (model, digest))
+        return _unpack(rows[0][0]) if rows else None
+
+    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO embed_cache (model, digest, vec) VALUES (?, ?, ?) "
+                "ON CONFLICT (model, digest) DO UPDATE SET vec = excluded.vec",
+                (model, digest, _pack(vector)),
             )
