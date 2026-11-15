@@ -17,6 +17,11 @@ Environment variables (only CORTEX_TEAM is required):
     CORTEX_REPO_SCOPES   per-repo defaults, comma-separated fnmatch pattern=scope,
                          e.g. "acme/*=team,acme/handbook=org"
     CORTEX_MAX_FAILURES  failed deliveries of one event before it is skipped (default: 3)
+    CORTEX_EMBEDDER      none | hash | upstage: embeddings for grouping and similar recall (default: none)
+    CORTEX_EMBED_PASSAGE_MODEL, CORTEX_EMBED_QUERY_MODEL
+                         Upstage model names; required when CORTEX_EMBEDDER=upstage
+    UPSTAGE_API_KEY      Upstage key; required when CORTEX_EMBEDDER=upstage; never printed
+    CORTEX_GROUP_THRESHOLD  similarity from 0 to 1 at which records are grouped (default: 0.9)
 
 One server process is one session: Claude Code starts a process per session.
 Processes share the SQLite file; the runtime delivers each event once.
@@ -25,6 +30,7 @@ Processes share the SQLite file; the runtime delivers each event once.
 import getpass
 import importlib
 import logging
+import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -39,6 +45,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from cortex_mem.access import knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
+from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder
+from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -119,10 +127,12 @@ class Service:
         policy: ScopePolicy = ScopePolicy(),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         max_failures: int | None = None,
+        index: Index | None = None,
     ) -> None:
         name, built = load_engine(engine)
         self.runtime = Runtime(
-            built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures
+            built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures,
+            index=index,
         )
         self.user, self.team, self.session, self.agent = user, team, session, agent
         self.repo = repo  # the configured repo: picks the scope policy; a tool argument only says where
@@ -257,14 +267,50 @@ def _max_failures() -> int:
     return int(raw)
 
 
+def _embedder() -> Embedder | None:
+    name = os.environ.get("CORTEX_EMBEDDER", "none").strip().lower()
+    if name == "none":
+        return None
+    if name == "hash":
+        return HashEmbedder()
+    if name == "upstage":
+        passage = os.environ.get("CORTEX_EMBED_PASSAGE_MODEL", "").strip()
+        query = os.environ.get("CORTEX_EMBED_QUERY_MODEL", "").strip()
+        key = os.environ.get("UPSTAGE_API_KEY", "").strip()
+        missing = [
+            var
+            for var, value in (
+                ("CORTEX_EMBED_PASSAGE_MODEL", passage), ("CORTEX_EMBED_QUERY_MODEL", query), ("UPSTAGE_API_KEY", key)
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER=upstage also needs {', '.join(missing)}")
+        return UpstageEmbedder(key, passage, query)
+    raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER must be none, hash or upstage, got {name!r}")
+
+
+def _group_threshold() -> float:
+    raw = os.environ.get("CORTEX_GROUP_THRESHOLD", "0.9")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not 0.0 <= value <= 1.0:  # false for nan too
+        raise SystemExit(f"cortex-mem: CORTEX_GROUP_THRESHOLD must be a number from 0 to 1, got {raw!r}")
+    return value
+
+
 def get_service() -> Service:
     global _service
     if _service is None:
         user, team = _identity()
         path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
+        db = SqliteDatabase(path)
+        embedder, threshold = _embedder(), _group_threshold()
         _service = Service(
-            SqliteDatabase(path),
+            db,
             engine=os.environ.get("CORTEX_ENGINE", "promote_all"),
             user=user,
             team=team,
@@ -275,6 +321,7 @@ def get_service() -> Service:
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
             max_failures=_max_failures(),
+            index=None if embedder is None else Index(db.vectors, embedder, threshold),
         )
     return _service
 
@@ -345,6 +392,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")  # stderr
     _identity()  # fail at start, not at the first tool call
     _max_failures()
+    _embedder()
+    _group_threshold()
     mcp.run()
 
 

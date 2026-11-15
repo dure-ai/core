@@ -9,6 +9,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from cortex_mem.contract import Demote
+from cortex_mem.embed import UpstageEmbedder
+from cortex_mem.index import Index
+from cortex_mem_server import server as srv
 from cortex_mem_server.server import ScopePolicy, Service, load_engine
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -385,3 +388,93 @@ def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
     )
 
     assert result.returncode != 0 and message in result.stderr
+
+
+# ── embeddings config ───────────────────────────────────────────────────────
+
+_EMBED_VARS = ("CORTEX_EMBEDDER", "CORTEX_EMBED_PASSAGE_MODEL", "CORTEX_EMBED_QUERY_MODEL", "UPSTAGE_API_KEY",
+               "CORTEX_GROUP_THRESHOLD", "CORTEX_TEAM", "CORTEX_USER")
+
+
+def _service_from_env(monkeypatch, tmp_path, **env):
+    for name in _EMBED_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TEAM", "t1")
+    monkeypatch.setenv("CORTEX_USER", "u1")
+    monkeypatch.setenv("CORTEX_DB_PATH", str(tmp_path / "cortex.db"))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(srv, "_service", None)
+    return srv.get_service()
+
+
+def test_embedder_none_by_default_runs_without_an_index(monkeypatch, tmp_path):
+    svc = _service_from_env(monkeypatch, tmp_path)
+
+    assert svc.runtime.index is None
+    assert srv._embedder() is None
+
+
+def test_hash_embedder_builds_an_index(monkeypatch, tmp_path):
+    svc = _service_from_env(monkeypatch, tmp_path, CORTEX_EMBEDDER=" Hash ")
+    first = svc.record("deploy uses release tags")["id"]
+    svc.record("deploy uses release tags")
+
+    index = svc.runtime.index
+    assert isinstance(index, Index)
+    group = index.reader(svc.runtime.events, svc.runtime.knowledge).group(first)
+    assert group is not None and len(group.members) == 2
+
+
+def test_upstage_needs_models_and_key(monkeypatch):
+    for name in _EMBED_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_EMBEDDER", "upstage")
+    monkeypatch.setenv("CORTEX_EMBED_PASSAGE_MODEL", "passage-m")
+    with pytest.raises(SystemExit) as exc:
+        srv._embedder()
+    message = str(exc.value)
+    assert "CORTEX_EMBED_QUERY_MODEL" in message and "UPSTAGE_API_KEY" in message
+    assert "CORTEX_EMBED_PASSAGE_MODEL" not in message
+
+    monkeypatch.setenv("CORTEX_EMBED_QUERY_MODEL", "query-m")
+    monkeypatch.setenv("UPSTAGE_API_KEY", "   ")
+    with pytest.raises(SystemExit, match="UPSTAGE_API_KEY"):
+        srv._embedder()
+
+    monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
+    built = srv._embedder()  # builds the client; makes no request
+    assert isinstance(built, UpstageEmbedder)
+    assert "sk-secret-value" not in repr(built)
+
+
+def test_upstage_error_never_prints_the_key(monkeypatch):
+    monkeypatch.setenv("CORTEX_EMBEDDER", "upstage")
+    monkeypatch.delenv("CORTEX_EMBED_PASSAGE_MODEL", raising=False)
+    monkeypatch.delenv("CORTEX_EMBED_QUERY_MODEL", raising=False)
+    monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
+    with pytest.raises(SystemExit) as exc:
+        srv._embedder()
+    assert "sk-secret-value" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [("CORTEX_EMBEDDER", "foo"), ("CORTEX_GROUP_THRESHOLD", "1.5"), ("CORTEX_GROUP_THRESHOLD", "abc"),
+     ("CORTEX_GROUP_THRESHOLD", "-0.1"), ("CORTEX_GROUP_THRESHOLD", "nan")],
+)
+def test_bad_embedder_name_and_threshold_stop_the_server(monkeypatch, name, value):
+    for var in _EMBED_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(name, value)
+    check = srv._embedder if name == "CORTEX_EMBEDDER" else srv._group_threshold
+    with pytest.raises(SystemExit) as exc:
+        check()
+    assert value in str(exc.value)
+
+
+def test_group_threshold_defaults_to_point_nine(monkeypatch):
+    monkeypatch.delenv("CORTEX_GROUP_THRESHOLD", raising=False)
+    assert srv._group_threshold() == 0.9
+    monkeypatch.setenv("CORTEX_GROUP_THRESHOLD", "0")
+    assert srv._group_threshold() == 0.0
