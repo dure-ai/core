@@ -253,6 +253,45 @@ def test_embedding_failure_delivers_nothing_and_retries(store, tmp_path):
     assert rt.skipped == []
 
 
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_promoted_item_embedding_failure_commits_nothing_and_retries(store, tmp_path):
+    db = make_db(store, tmp_path)
+    emb = FailingEmbedder({"deploy\nboom item"})  # the promoted item's passage, not the event
+    engine = ProbeEngine(
+        decisions={
+            "e1": [Promote(item("k1", ("e1",)))],
+            "e2": [Promote(item("k2", ("e2",), body="boom item"))],
+        }
+    )
+    rt = runtime(engine, db, emb, max_failures=1)
+    rt.append(ev("e1", "fine"))
+
+    def observed():
+        return (
+            rt.state.cursor(),
+            rt.state.get("n"),
+            [i.id for i in db.knowledge.all()],
+            list(db.vectors.vectors("knowledge")),
+            [(type(v.decision).__name__, v.accepted) for v in rt.verdicts],
+        )
+
+    before = observed()
+    with pytest.raises(EmbeddingError):
+        rt.append(ev("e2", "fine too"))
+    with pytest.raises(EmbeddingError):  # not counted toward max_failures
+        rt.sync()
+    assert observed() == before
+    assert rt.skipped == []
+
+    emb.fail_on.clear()
+    assert rt.sync() == 1
+    assert (rt.state.cursor(), rt.state.get("n")) == (2, 2)
+    assert [i.id for i in db.knowledge.all()] == ["k1", "k2"]
+    assert db.vectors.vector("knowledge", "k2") is not None
+    assert [v.accepted for v in rt.verdicts] == [True, True]
+    assert rt.skipped == []
+
+
 # ── index version ───────────────────────────────────────────────────────────
 
 

@@ -78,6 +78,11 @@ class Index:
             if seq >= upto:
                 break
 
+    def prepare_knowledge(self, item: Knowledge) -> None:
+        """Embed and cache an item's passage without writing its vector, so a
+        caller can fail before any write; put_knowledge then hits the cache."""
+        self._passage_vector(_passage(item))
+
     def put_knowledge(self, item: Knowledge) -> None:
         self._backend.put_vector("knowledge", item.id, self._passage_vector(_passage(item)))
 

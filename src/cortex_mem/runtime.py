@@ -297,6 +297,12 @@ class Runtime:
                 pending[decision.item.id] = decision.item
             else:
                 pending[decision.id] = None
+        if self.index is not None:
+            # Embed before any write: an EmbeddingError then leaves nothing behind,
+            # even without rollback. Only the embedding cache may be written.
+            for decision in accepted:
+                if isinstance(decision, Promote):
+                    self.index.prepare_knowledge(decision.item)
         self.state.commit(expected, cursor, staged.writes, staged.deletes)
         self.verdicts.extend(verdicts)
         for decision in accepted:

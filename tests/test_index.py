@@ -254,6 +254,23 @@ def test_knowledge_vectors_follow_put_and_remove():
     assert list(db.vectors.vectors("knowledge")) == []
 
 
+def test_prepare_knowledge_embeds_and_caches_without_writing_a_vector():
+    db = InMemoryDatabase()
+    emb = FailingEmbedder({"deploy\nboom"})
+    index = Index(db.vectors, emb, 0.9)
+    with pytest.raises(EmbeddingError):
+        index.prepare_knowledge(item("k0", body="boom"))
+    assert db.vectors.cached(emb.model, text_digest("deploy\nboom")) is None
+
+    index.prepare_knowledge(item("k1", body="uses tags"))
+    assert db.vectors.vector("knowledge", "k1") is None
+    assert db.vectors.cached(emb.model, text_digest("deploy\nuses tags")) is not None
+    calls = len(emb.calls)
+    index.put_knowledge(item("k1", body="uses tags"))  # served from the cache
+    assert len(emb.calls) == calls
+    assert db.vectors.vector("knowledge", "k1") == db.vectors.cached(emb.model, text_digest("deploy\nuses tags"))
+
+
 def test_rebuild_resets_and_reembeds_knowledge():
     emb = CountingEmbedder()
     db, index = build([ev("e1"), ev("e2", "other words")], emb)
