@@ -58,3 +58,33 @@ claude mcp add cortex-mem -s local -e CORTEX_REPO=acme/api -e CORTEX_TEAM=paymen
 공개 범위는 에이전트가 아니라 서버 설정이 정한다. 에이전트는 `scope`로 기본값보다 좁히는 것만 할 수 있고(예: 팀 저장소에서 `personal` 메모), 넓히려 하면 기본값이 쓰인다. `recall`은 기본으로 볼 수 있는 범위 전체(본인·팀·조직)를 찾고, `repo`·`context`(예: `{"service": "api"}`)로 질문한 곳을 엔진에 알린다. `report_outcome`은 기본으로 판정 대상 지식을 볼 수 있는 범위에 남는다(팀 지식에 대한 실패 보고는 팀에 보여야 강등 근거가 된다). 대상이 지식 항목이 아니면 저장소 설정을 따른다. 그 범위가 저장소 설정보다 넓으면 판정(`outcome`·`signal`·`refs`)만 남고 에이전트가 쓴 `text`는 저장하지 않는다(응답과 이벤트의 `text_redacted`).
 
 엔진이 실패해도 도구는 멈추지 않는다. 기록이 저장됐지만 엔진에 전달되지 못하면 `delivered: false`로 응답하고(다시 기록할 필요 없음, 나중에 전달됨), 같은 이벤트에서 `CORTEX_MAX_FAILURES`번 실패하면 그 이벤트를 건너뛰고 stderr에 남긴다.
+
+## 임베딩
+
+core는 `record` 이벤트와 지식 항목을 임베딩해 저장하고, 같은 (범위, 소유자) 안에서 비슷한 기록을 묶음(group)으로 묶는다. 엔진은 `ctx.similar`로 이 색인을 읽는다. 임베딩을 켜지 않으면 `ctx.similar`는 `None`이고 동작은 이전과 같다. 이벤트는 엔진에 전달되기 전 같은 트랜잭션에서 색인되고, 인메모리·SQLite 저장소에서 묶음과 검색 결과가 같다.
+
+| 환경변수 | 기본값 | |
+|---|---|---|
+| `CORTEX_EMBEDDER` | `none` | `none` \| `hash` \| `upstage` |
+| `CORTEX_EMBED_PASSAGE_MODEL` | 없음 | Upstage 기록·지식용 모델. `upstage`일 때 필수 |
+| `CORTEX_EMBED_QUERY_MODEL` | 없음 | Upstage 질의용 모델. `upstage`일 때 필수 |
+| `UPSTAGE_API_KEY` | 없음 | `upstage`일 때 필수. 출력하지 않는다 |
+| `CORTEX_GROUP_THRESHOLD` | `0.9` | 이 코사인 유사도 이상이면 같은 묶음 |
+
+`HashEmbedder`(`hash`)는 단어를 해시로 세는 어휘 기반 특징 해싱이라 의미를 이해하지 못한다. 같은 단어를 쓰면 가깝고, 뜻이 같아도 단어가 다르면 멀다. 테스트와 오프라인 확인용이다. 모델을 바꾸면 색인이 낡은 것으로 판정돼 다시 만들어지고 엔진은 처음부터 다시 전달받는다.
+
+엔진이 읽는 포트는 `SimilarityReader`다.
+
+- `search(query, caller, scope, k, kinds)`: 질의와 가까운 이벤트
+- `neighbors(event_id, caller, scope, k)`: 이벤트와 가까운 다른 이벤트
+- `knowledge(query, caller, scope, k)`: 질의와 가까운 지식 항목
+- `group(event_id)`: 이벤트가 속한 묶음(없으면 `None`)
+
+점수는 코사인 유사도(-1~1)이고 텍스트 검색 점수와 섞어 비교하면 안 된다. 보이는 범위(`access`)는 호출자 기준으로 걸러진다.
+
+한계:
+
+- 묶기는 single-link라서 A~B, B~C가 가까우면 A와 C가 멀어도 한 묶음이 될 수 있다.
+- 질의마다 전체를 훑는다. 작은 팀에는 충분하다.
+- 임베딩 서비스가 멈추면 `record_episode`·`recall` 도구가 이벤트를 건너뛰지 않고 오류를 낸다.
+- PostgreSQL(pgvector) 구현은 아직 없다. 삭제도 아직 지원하지 않는다.
