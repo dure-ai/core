@@ -26,6 +26,7 @@ from .contract import (
     Promote,
     Scope,
 )
+from .index import Index
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
 
 _ABSENT = object()
@@ -115,6 +116,12 @@ class Runtime:
     server sets it so one bad event cannot block every caller; the harness
     leaves it None so an engine failure is never hidden. Failures are counted
     per Runtime (per process), and skipped events are listed in `skipped`.
+
+    `index` turns on embeddings. Each event is indexed in its delivery
+    transaction before `observe`, and engines read the index through
+    `ctx.similar`. An embedding failure is raised and the event is not
+    delivered; it is retried next time and never counted toward
+    `max_failures`. None (the default) leaves `ctx.similar` None.
     """
 
     def __init__(
@@ -125,6 +132,7 @@ class Runtime:
         state: EngineStateBackend,
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
         max_failures: int | None = None,
+        index: Index | None = None,
     ) -> None:
         if max_failures is not None and max_failures < 1:
             raise ValueError("max_failures must be at least 1, or None to never skip")
@@ -134,17 +142,20 @@ class Runtime:
         self.state = state
         self.transaction = transaction
         self.max_failures = max_failures
+        self.index = index
         self.verdicts: list[Verdict] = []
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._version_checked = False
+        self._index_checked = False
 
     @property
     def rejections(self) -> list[Verdict]:
         return [v for v in self.verdicts if not v.accepted]
 
     def _ctx(self, state: _StagedState) -> EngineContext:
-        return EngineContext(events=self.events, knowledge=self.knowledge, state=state)
+        similar = None if self.index is None else self.index.reader(self.events, self.knowledge)
+        return EngineContext(events=self.events, knowledge=self.knowledge, state=state, similar=similar)
 
     def append(self, event: Event) -> str:
         """Append an event and deliver everything not yet delivered. An outcome
@@ -159,8 +170,11 @@ class Runtime:
         """Deliver events appended since the cursor, in order, one transaction
         each. Returns how many this call delivered. If the engine raises, that
         event stays undelivered and is retried next time, until `max_failures`
-        attempts have failed; then it is skipped (see `skipped`)."""
+        attempts have failed; then it is skipped (see `skipped`). With an
+        index, an EmbeddingError while indexing the event is raised as is: the
+        event stays undelivered and is never skipped for it."""
         self._check_state_version()
+        self._check_index_version()
         delivered = 0
         while True:
             with self.transaction():
@@ -169,6 +183,9 @@ class Runtime:
                 if pending is None:
                     return delivered
                 seq, event = pending
+                if self.index is not None:
+                    # Outside the observe try: an embedding failure is not the engine's.
+                    self.index.catch_up(self.events, seq)
                 staged = _StagedState(self.state)
                 try:
                     decisions = self.engine.observe(event, self._ctx(staged))
@@ -208,6 +225,22 @@ class Runtime:
             if self.state.version() != want:
                 self.state.reset(want)
         self._version_checked = True
+
+    def _check_index_version(self) -> None:
+        """When the index was built with another model or threshold (or never),
+        rebuild it and start delivery over, as a changed state_version does.
+        The state keeps its version: the engine's, else the stored one."""
+        if self.index is None or self._index_checked:
+            return
+        with self.transaction():
+            if self.index.stale():
+                version = getattr(self.engine, "state_version", None)
+                if version is None:
+                    version = self.state.version()
+                # State first: without rollback, a failed rebuild still replays.
+                self.state.reset("" if version is None else version)
+                self.index.rebuild(self.knowledge)
+        self._index_checked = True
 
     def tick(self, now: datetime) -> None:
         self.sync()
@@ -269,8 +302,12 @@ class Runtime:
         for decision in accepted:
             if isinstance(decision, Promote):
                 self.knowledge.put(decision.item)
+                if self.index is not None:
+                    self.index.put_knowledge(decision.item)
             else:
                 self.knowledge.remove(decision.id)
+                if self.index is not None:
+                    self.index.remove_knowledge(decision.id)
 
     def _current(self, id: str, pending: dict[str, Knowledge | None]) -> Knowledge | None:
         found = pending.get(id, _ABSENT)
