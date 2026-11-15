@@ -1,4 +1,4 @@
-"""Engine port contract v0.1.
+"""Engine port contract v0.2.
 
 Everything the MCP server, the evaluation harness, and every engine share.
 The engine is the only swappable part. It reads the fixed stores through
@@ -14,7 +14,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
-CONTRACT_VERSION = "0.1.0"
+CONTRACT_VERSION = "0.2.0"
 
 Kind = Literal["record", "recall", "outcome", "human_confirm", "commit"]
 Signal = Literal["self", "test", "review", "human", "doc"]
@@ -215,12 +215,63 @@ class StateStore(Protocol):
 
 
 @dataclass(frozen=True)
+class Group:
+    """Records that core judged to be about the same thing, within one
+    (scope, owner) cell. Built by core when it indexes an event."""
+
+    id: str  # id of the first member event
+    scope: Scope
+    owner: str  # same rule as access.owner_for
+    members: tuple[str, ...]  # record event ids of the same (scope, owner), in append order
+
+
+class SimilarityReader(Protocol):
+    """Read-only similarity search over the shared embedding index. Scores are
+    cosine similarity (-1..1), higher = closer; do not mix them with the text
+    search scores."""
+
+    model: str  # embedding model that built the index (informational)
+
+    def search(
+        self,
+        query: str,
+        caller: Caller,
+        scope: Scope,
+        k: int = 20,
+        kinds: Collection[Kind] | None = None,
+    ) -> list[tuple[Event, float]]:
+        """Up to k events visible to caller under scope, closest first.
+        Visibility is access.event_visible."""
+        ...
+
+    def neighbors(
+        self, event_id: str, caller: Caller, scope: Scope, k: int = 20
+    ) -> list[tuple[Event, float]]:
+        """Up to k events closest to the given event, visible to caller."""
+        ...
+
+    def knowledge(
+        self, query: str, caller: Caller, scope: Scope, k: int = 20
+    ) -> list[tuple[Knowledge, float]]:
+        """Up to k items visible to caller under scope, closest first.
+        Visibility is access.knowledge_visible."""
+        ...
+
+    def group(self, event_id: str) -> Group | None:
+        """The group the event belongs to, or None if it is not grouped.
+        Takes no caller: an engine observes every event anyway."""
+        ...
+
+
+@dataclass(frozen=True)
 class EngineContext:
-    """What the fixed part hands an engine on every call."""
+    """What the fixed part hands an engine on every call. `similar` is None
+    when embeddings are not configured; an engine must handle that."""
 
     events: EventReader
     knowledge: KnowledgeReader
     state: StateStore
+    similar: SimilarityReader | None = None
 
 
 @runtime_checkable
