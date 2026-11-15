@@ -23,7 +23,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder, cosine
+from cortex_mem.embed import (
+    Embedder,
+    EmbeddingError,
+    HashEmbedder,
+    UpstageEmbedder,
+    cosine,
+)
 
 DEFAULT_THRESHOLDS = "0.5,0.6,0.7,0.8,0.85,0.9,0.95"
 RIVAL_LIMIT = 0.01
@@ -65,15 +71,40 @@ def report(pairs: Sequence[dict[str, Any]], embedder: Embedder, thresholds: Sequ
 
 
 def _parse_thresholds(text: str) -> list[float]:
-    return [float(part) for part in text.split(",") if part.strip()]
+    thresholds = []
+    for part in text.split(","):
+        if not part.strip():
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            raise ValueError(f"threshold {part!r} is not a number") from None
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"threshold {value} is outside 0 to 1")
+        thresholds.append(value)
+    if not thresholds:
+        raise ValueError("--thresholds needs at least one value")
+    return thresholds
 
 
 def _read_pairs(path: Path) -> list[dict[str, Any]]:
     pairs = []
     with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.strip():
-                pairs.append(json.loads(line))
+        for lineno, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            where = f"{path}:{lineno}"
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                raise ValueError(f"{where}: not valid JSON") from None
+            if not isinstance(obj, dict):
+                raise ValueError(f"{where}: expected a JSON object")  # noqa: TRY004
+            if not isinstance(obj.get("a"), str) or not isinstance(obj.get("b"), str):
+                raise ValueError(f"{where}: 'a' and 'b' must be strings")  # noqa: TRY004
+            if not isinstance(obj.get("same"), bool):
+                raise ValueError(f"{where}: 'same' must be true or false")  # noqa: TRY004
+            pairs.append(obj)
     return pairs
 
 
@@ -98,6 +129,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--thresholds", default=DEFAULT_THRESHOLDS)
     args = parser.parse_args(argv)
 
+    try:
+        thresholds = _parse_thresholds(args.thresholds)
+        pairs = _read_pairs(args.pairs)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    n_same = sum(1 for p in pairs if p["same"])
+    n_rival = len(pairs) - n_same
+    if n_same == 0 or n_rival == 0:
+        print(
+            f"error: the measurement needs both same and rival pairs "
+            f"(found {n_same} same, {n_rival} rival)",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.embedder == "hash":
         embedder: Embedder = HashEmbedder()
     else:
@@ -110,7 +157,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         embedder = UpstageEmbedder(api_key, args.passage_model, args.query_model)
 
-    rows = report(_read_pairs(args.pairs), embedder, _parse_thresholds(args.thresholds))
+    try:
+        rows = report(pairs, embedder, thresholds)
+    except EmbeddingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(_format(rows))
     return 0
 

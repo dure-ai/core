@@ -122,3 +122,66 @@ def test_cli_upstage_without_models_exits_2(tmp_path):
     assert result.returncode == 2
     assert "--passage-model" in result.stderr or "--query-model" in result.stderr
     assert "test-key" not in result.stdout + result.stderr
+
+
+def test_embedding_error_exits_1_without_leaking_the_key(tmp_path, monkeypatch, capsys):
+    from cortex_mem.embed import EmbeddingError
+
+    class FailingEmbedder:
+        def __init__(self, api_key, passage_model, query_model):
+            self._key = api_key
+
+        def embed(self, texts, kind):
+            raise EmbeddingError("embedding request failed with HTTP 401")
+
+    monkeypatch.setattr(grouping_report, "UpstageEmbedder", FailingEmbedder)
+    monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-test")
+    path = _write_pairs(tmp_path)
+    rc = grouping_report.main(
+        [str(path), "--embedder", "upstage", "--passage-model", "p", "--query-model", "q"]
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error: embedding request failed with HTTP 401" in captured.err
+    assert "sk-secret-test" not in captured.out + captured.err
+
+
+def test_malformed_json_line_is_reported_with_its_line_number(tmp_path):
+    path = tmp_path / "pairs.jsonl"
+    path.write_text(json.dumps(PAIRS[0]) + "\n{not json\n", encoding="utf-8")
+    result = _run([str(path), "--embedder", "hash"])
+    assert result.returncode == 2
+    assert f"{path}:2:" in result.stderr
+
+
+def test_non_bool_same_is_rejected_and_not_coerced(tmp_path):
+    path = tmp_path / "pairs.jsonl"
+    bad = {"a": "x", "b": "y", "same": "false"}
+    path.write_text(json.dumps(PAIRS[0]) + "\n" + json.dumps(bad) + "\n", encoding="utf-8")
+    result = _run([str(path), "--embedder", "hash"])
+    assert result.returncode == 2
+    assert f"{path}:2:" in result.stderr
+    assert "same" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["0.5,1.5", "abc", "-0.1", ""])
+def test_bad_threshold_exits_2(tmp_path, value):
+    path = _write_pairs(tmp_path)
+    result = _run([str(path), "--embedder", "hash", "--thresholds", value])
+    assert result.returncode == 2
+    assert "threshold" in result.stderr
+
+
+def test_empty_file_exits_2_and_asks_for_both_kinds(tmp_path):
+    path = tmp_path / "pairs.jsonl"
+    path.write_text("", encoding="utf-8")
+    result = _run([str(path), "--embedder", "hash"])
+    assert result.returncode == 2
+    assert "both" in result.stderr
+
+
+def test_file_without_rival_pairs_exits_2(tmp_path):
+    path = _write_pairs(tmp_path, [PAIRS[0], PAIRS[1]])
+    result = _run([str(path), "--embedder", "hash"])
+    assert result.returncode == 2
+    assert "both" in result.stderr
