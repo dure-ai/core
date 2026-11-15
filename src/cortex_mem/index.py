@@ -21,7 +21,7 @@ from .contract import (
     Scope,
     SimilarityReader,
 )
-from .embed import Embedder, cosine, text_digest
+from .embed import Embedder, EmbeddingError, EmbedKind, cosine, text_digest
 from .store.base import EventStore, VectorBackend
 
 _QUERY_CACHE_SIZE = 256
@@ -94,9 +94,15 @@ class Index:
         found = self._backend.cached(model, digest)
         if found is not None:
             return found
-        vector = [float(x) for x in self._embedder.embed([text], "passage")[0]]
+        vector = self._embed_one(text, "passage")
         self._backend.cache(model, digest, vector)
         return vector
+
+    def _embed_one(self, text: str, kind: EmbedKind) -> list[float]:
+        out = self._embedder.embed([text], kind)
+        if len(out) != 1:
+            raise EmbeddingError(f"embedder returned {len(out)} vectors for 1 text")
+        return [float(x) for x in out[0]]
 
     def _group_for(self, vector: list[float], scope: Scope, owner: str, event_id: str) -> str:
         """Single link within the cell: join the group of the closest member if
@@ -122,7 +128,7 @@ class Index:
         """Embed a query once per process; an LRU of _QUERY_CACHE_SIZE entries."""
         found = self._queries.pop(query, None)
         if found is None:
-            found = [float(x) for x in self._embedder.embed([query], "query")[0]]
+            found = self._embed_one(query, "query")
         self._queries[query] = found  # most recently used goes last
         while len(self._queries) > _QUERY_CACHE_SIZE:
             del self._queries[next(iter(self._queries))]
@@ -149,7 +155,7 @@ def _rank[T](scored: list[tuple[T, float]], k: int) -> list[tuple[T, float]]:
     order the candidates came in."""
     kept = [pair for pair in scored if pair[1] > 0]
     kept.sort(key=lambda pair: -pair[1])
-    return kept[:k]
+    return kept[: max(k, 0)]
 
 
 class _Reader:
@@ -177,6 +183,11 @@ class _Reader:
     def neighbors(
         self, event_id: str, caller: Caller, scope: Scope, k: int = 20
     ) -> list[tuple[Event, float]]:
+        # Unknown or unseen start: even filtered scores would tell the caller
+        # how close visible events are to text they may not read.
+        start = self._events.get([event_id])
+        if not start or not event_visible(start[0], caller, scope):
+            return []
         target = self._index._vector(event_id)
         if target is None:
             return []

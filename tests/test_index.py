@@ -459,3 +459,87 @@ def test_reader_is_read_only_and_names_the_model():
 def test_group_of_unknown_event_is_none():
     db, index = build([ev("e1")])
     assert reader(db, index).group("nope") is None
+
+
+# ── fix round 1 ─────────────────────────────────────────────────────────────
+
+
+def test_neighbors_of_an_event_the_caller_cannot_see_is_empty():
+    db, index = visibility_world()
+    r = reader(db, index)
+    me = caller("u1", "t1")
+    for scope in ["personal", "team", "org"]:
+        assert r.neighbors("theirs", me, scope) == []  # u2's personal record
+        assert r.neighbors("other-team", me, scope) == []
+    assert r.neighbors("my-team", me, "personal") == []  # team record, personal scope
+    assert ids(r.neighbors("my-team", me, "team")) == ["mine", "my-team-by-me"]
+    assert ids(r.neighbors("theirs", caller("u2", "t1"), "personal")) == ["my-team"]
+
+
+class CountMismatchEmbedder:
+    """Returns a fixed list of vectors whatever it is asked to embed."""
+
+    model = "broken"
+    dim = 3
+
+    def __init__(self, out):
+        self.out = out
+
+    def embed(self, texts, kind):
+        return [list(v) for v in self.out]
+
+
+@pytest.mark.parametrize("out", [[], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+def test_wrong_vector_count_raises_embedding_error(out):
+    db = InMemoryDatabase()
+    db.events.append(ev("e1"))
+    index = Index(db.vectors, CountMismatchEmbedder(out), 0.9)
+    with pytest.raises(EmbeddingError):
+        index.catch_up(db.events, 1)
+    assert db.vectors.indexed() == 0
+    assert db.vectors.vector("event", "e1") is None
+    assert db.vectors.cached("broken", text_digest("deploy uses tags")) is None
+    with pytest.raises(EmbeddingError):
+        index.put_knowledge(item("k1"))
+    assert db.vectors.vector("knowledge", "k1") is None
+    r = reader(db, index)
+    with pytest.raises(EmbeddingError):
+        r.search("deploy", caller(), "org")
+    with pytest.raises(EmbeddingError):
+        r.knowledge("deploy", caller(), "org")
+
+
+def test_record_joins_the_closest_member_not_the_first_above_the_threshold():
+    emb = TableEmbedder({"a": [1, 0, 0], "b": [0, 1, 0], "c": [0.6, 0.8, 0]})
+    db, index = build([ev("e1", "a"), ev("e2", "b"), ev("e3", "c")], emb, threshold=0.5)
+    r = reader(db, index)
+    assert cosine(emb.table["c"], emb.table["a"]) >= 0.5  # e1 clears the threshold too
+    assert r.group("e1").members == ("e1",)
+    assert r.group("e3") == Group("e2", "personal", "u1", ("e2", "e3"))
+
+
+def test_query_lru_keeps_recently_used_queries():
+    emb = CountingEmbedder()
+    db, index = build([ev("e1")], emb)
+    r = reader(db, index)
+    for i in range(256):  # fill the cache
+        r.search(f"query {i}", caller(), "org")
+    r.search("query 0", caller(), "org")  # touch the oldest
+    for i in range(256, 356):  # 100 more: FIFO would evict query 0..99
+        r.search(f"query {i}", caller(), "org")
+    r.search("query 0", caller(), "org")
+    assert emb.calls.count(("query 0", "query")) == 1  # still cached
+    r.search("query 1", caller(), "org")
+    assert emb.calls.count(("query 1", "query")) == 2  # untouched, evicted
+
+
+def test_negative_k_returns_nothing():
+    db, index = visibility_world()
+    k = item("k1")
+    db.knowledge.put(k)
+    index.put_knowledge(k)
+    r = reader(db, index)
+    me = caller()
+    assert r.search("deploy uses tags", me, "org", k=-1) == []
+    assert r.neighbors("mine", me, "org", k=-1) == []
+    assert r.knowledge("deploy\ndeploy uses tags", me, "org", k=-1) == []
