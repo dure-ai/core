@@ -20,7 +20,7 @@ from cortex_mem.contract import (
 )
 from cortex_mem.embed import EmbeddingError, HashEmbedder
 from cortex_mem.index import Index
-from cortex_mem.runtime import Runtime
+from cortex_mem.runtime import INDEX_STATE_KEY, Runtime
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -122,10 +122,10 @@ def make_db(kind, tmp_path):
     return InMemoryDatabase() if kind == "memory" else SqliteDatabase(tmp_path / "core.db")
 
 
-def runtime(engine, db, embedder=None, threshold=0.9, max_failures=None, with_index=True):
+def runtime(engine, db, embedder=None, threshold=0.9, max_failures=None, with_index=True, name="probe"):
     index = Index(db.vectors, embedder or HashEmbedder(), threshold) if with_index else None
     return Runtime(
-        engine, db.events, db.knowledge, db.state("probe"), db.transaction, max_failures, index=index
+        engine, db.events, db.knowledge, db.state(name), db.transaction, max_failures, index=index
     )
 
 
@@ -491,3 +491,81 @@ def test_a_failing_text_in_a_warm_batch_stops_only_its_own_event():
     assert (rt.state.cursor(), db.vectors.indexed(), rt.skipped) == (1, 1, [])
     emb.fail_on.clear()
     assert rt.sync() == 2
+
+
+# ── every engine on one store follows the index version ─────────────────────
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_every_engine_on_the_store_is_replayed_after_the_index_changes(store, tmp_path):
+    shared = InMemoryDatabase()
+
+    def reopen():  # a new process on the same storage
+        return shared if store == "memory" else SqliteDatabase(tmp_path / "core.db")
+
+    a_old, b_old = ProbeEngine(), ProbeEngine()
+    rt_a = runtime(a_old, reopen(), TableEmbedder(TABLE), threshold=0.9, name="a")
+    rt_b = runtime(b_old, reopen(), TableEmbedder(TABLE), threshold=0.9, name="b")
+    for id, text in [("e1", "alpha"), ("e2", "alpha-ish"), ("e3", "gamma")]:
+        rt_a.append(ev(id, text))
+    rt_b.sync()
+    assert a_old.groups["e2"].members == b_old.groups["e2"].members == ("e2",)  # 0.7 < 0.9
+
+    # Engine a restarts with a lower threshold: the index is rebuilt and a is replayed.
+    a_new = ProbeEngine()
+    rt_a = runtime(a_new, reopen(), TableEmbedder(TABLE), threshold=0.5, name="a")
+    assert rt_a.sync() == 3
+    assert a_new.groups["e2"] == Group("e1", "personal", "u1", ("e1", "e2"))
+
+    # Engine b restarts with the same new config: the index is already current,
+    # but b's state was built on the old groups, so b is replayed too.
+    b_new = ProbeEngine()
+    emb = TableEmbedder(TABLE)
+    rt_b = runtime(b_new, reopen(), emb, threshold=0.5, name="b")
+    assert rt_b.sync() == 3
+    assert b_new.seen == ["e1", "e2", "e3"]
+    assert b_new.groups["e2"] == Group("e1", "personal", "u1", ("e1", "e2"))
+    assert (rt_b.state.cursor(), rt_b.state.get("n")) == (3, 3)  # reset, not added to
+    assert emb.calls == []
+
+    # Both are current now: nothing is replayed again.
+    again = ProbeEngine()
+    assert runtime(again, reopen(), TableEmbedder(TABLE), threshold=0.5, name="b").sync() == 0
+    assert again.seen == []
+
+
+def test_the_index_is_checked_on_every_sync_not_once_per_process():
+    db = InMemoryDatabase()
+    engine = ProbeEngine()
+    rt = runtime(engine, db, TableEmbedder(TABLE), threshold=0.9, name="a")
+    for id, text in [("e1", "alpha"), ("e2", "alpha-ish")]:
+        rt.append(ev(id, text))
+    # Another process on the store rebuilds the index with a new threshold
+    # while this runtime keeps running.
+    runtime(ProbeEngine(), db, TableEmbedder(TABLE), threshold=0.5, name="other").sync()
+    engine.seen.clear()
+
+    rt.sync()
+
+    assert engine.seen == ["e1", "e2"]  # rebuilt back to 0.9 and replayed
+    assert db.vectors.meta() == {"model": "table", "group_threshold": 0.9}
+    assert engine.groups["e2"].members == ("e2",)
+
+
+def test_the_index_marker_is_hidden_from_the_engine():
+    class Peeks(ProbeEngine):
+        def observe(self, event, ctx):
+            self.keys = [k for k, _ in ctx.state.scan()]
+            self.marker = ctx.state.get(INDEX_STATE_KEY)
+            with pytest.raises(ValueError, match="reserved"):
+                ctx.state.put(INDEX_STATE_KEY, "mine")
+            with pytest.raises(ValueError, match="reserved"):
+                ctx.state.delete(INDEX_STATE_KEY)
+            return super().observe(event, ctx)
+
+    engine = Peeks()
+    rt = runtime(engine, InMemoryDatabase())
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    assert engine.keys == ["n"] and engine.marker is None
+    assert rt.state.get(INDEX_STATE_KEY) == {"model": "hash-256", "group_threshold": 0.9}

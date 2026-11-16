@@ -32,6 +32,8 @@ from .store.base import CursorConflict, EngineStateBackend, EventStore, Knowledg
 
 _ABSENT = object()
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
+RESERVED_STATE_PREFIX = "_runtime/"  # with an index, the runtime's own keys in the engine's state
+INDEX_STATE_KEY = RESERVED_STATE_PREFIX + "index"  # the index version the engine's state was built on
 
 
 @dataclass(frozen=True)
@@ -62,9 +64,10 @@ class _StagedState:
     Pending values are kept as JSON text, so a value is copied on the way in
     and on the way out, as it is once committed."""
 
-    def __init__(self, backend: EngineStateBackend, read_only: bool = False) -> None:
+    def __init__(self, backend: EngineStateBackend, read_only: bool = False, reserved: str | None = None) -> None:
         self._backend = backend
         self._read_only = read_only
+        self._reserved = reserved  # key prefix the engine may neither see nor write
         self._writes: dict[str, str] = {}
         self.deletes: set[str] = set()
 
@@ -74,7 +77,7 @@ class _StagedState:
         return {key: json.loads(raw) for key, raw in self._writes.items()}
 
     def get(self, key: str) -> Any | None:
-        if key in self.deletes:
+        if key in self.deletes or self._is_reserved(key):
             return None
         if key in self._writes:
             return json.loads(self._writes[key])
@@ -82,6 +85,7 @@ class _StagedState:
 
     def put(self, key: str, value: Any) -> None:
         self._check_writable()
+        self._check_not_reserved(key)
         raw = json.dumps(value)
         size = len(raw.encode())
         if size > MAX_STATE_VALUE_BYTES:
@@ -91,6 +95,7 @@ class _StagedState:
 
     def delete(self, key: str) -> None:
         self._check_writable()
+        self._check_not_reserved(key)
         self._writes.pop(key, None)
         self.deletes.add(key)
 
@@ -98,12 +103,19 @@ class _StagedState:
         merged = dict(self._backend.scan(prefix))
         merged.update((k, json.loads(v)) for k, v in self._writes.items() if k.startswith(prefix))
         for key in sorted(merged):
-            if key not in self.deletes:
+            if key not in self.deletes and not self._is_reserved(key):
                 yield key, merged[key]
 
     def _check_writable(self) -> None:
         if self._read_only:
             raise PermissionError("state is read-only during handoff")
+
+    def _is_reserved(self, key: str) -> bool:
+        return self._reserved is not None and key.startswith(self._reserved)
+
+    def _check_not_reserved(self, key: str) -> None:
+        if self._is_reserved(key):
+            raise ValueError(f"state keys starting with {self._reserved!r} are reserved for the runtime")
 
 
 class Runtime:
@@ -155,11 +167,14 @@ class Runtime:
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._version_checked = False
-        self._index_checked = False
 
     @property
     def rejections(self) -> list[Verdict]:
         return [v for v in self.verdicts if not v.accepted]
+
+    def _staged(self, read_only: bool = False) -> _StagedState:
+        reserved = None if self.index is None else RESERVED_STATE_PREFIX
+        return _StagedState(self.state, read_only=read_only, reserved=reserved)
 
     def _ctx(self, state: _StagedState) -> EngineContext:
         similar = None if self.index is None else self.index.reader(self.events, self.knowledge)
@@ -211,7 +226,7 @@ class Runtime:
                 # Outside the observe try: an embedding failure is not the engine's.
                 # Cache only: embedding here would hold the write lock.
                 self.index.catch_up(self.events, seq, embed=False)
-            staged = _StagedState(self.state)
+            staged = self._staged()
             try:
                 decisions = self.engine.observe(event, self._ctx(staged))
             except Exception as exc:
@@ -264,33 +279,44 @@ class Runtime:
         self._version_checked = True
 
     def _check_index_version(self) -> None:
-        """When the index was built with another model or threshold (or never),
-        rebuild it and start delivery over, as a changed state_version does.
-        The state keeps its version: the engine's, else the stored one.
-        Knowledge passages are embedded before the transaction; the rebuild
-        inside it only reads the cache."""
-        if self.index is None or self._index_checked:
+        """Runs on every sync. The index version (model, threshold) is one per
+        store, but each engine's state was built on the version it saw. So:
+        when the stored index has another version than this Index wants (or
+        none), rebuild it; and when this engine's state was built on another
+        version than the current one, or the index was just rebuilt (it starts
+        again at position 0, behind this engine's cursor), reset the state and
+        deliver from the start, as a changed state_version does. The state keeps its version:
+        the engine's, else the stored one. Knowledge passages are embedded
+        before the transaction; the rebuild inside it only reads the cache."""
+        if self.index is None:
             return
-        while self.index.stale():
-            self.index.warm_knowledge(self.knowledge.all(), self.transaction)
+        while True:
+            stale = self.index.stale()
+            if not stale and self.state.get(INDEX_STATE_KEY) == self.index.want():
+                return  # two reads: the common case takes no lock
+            if stale:
+                self.index.warm_knowledge(self.knowledge.all(), self.transaction)
             try:
                 with self.transaction():
-                    if self.index.stale():
+                    rebuilt = self.index.stale()
+                    if rebuilt:
+                        self.index.rebuild(self.knowledge, embed=False)
+                    current = self.index.want()  # what the store holds now
+                    if rebuilt or self.state.get(INDEX_STATE_KEY) != current:
                         version = getattr(self.engine, "state_version", None)
                         if version is None:
                             version = self.state.version()
-                        # State first: without rollback, a failed rebuild still replays.
                         self.state.reset("" if version is None else version)
-                        self.index.rebuild(self.knowledge, embed=False)
+                        self.state.commit(0, 0, {INDEX_STATE_KEY: current}, set())
             except PassageNotCached:
                 continue  # an item promoted meanwhile; warm again
-        self._index_checked = True
+            return
 
     def tick(self, now: datetime) -> None:
         self.sync()
         with self.transaction():
             cursor = self.state.cursor()
-            staged = _StagedState(self.state)
+            staged = self._staged()
             decisions = self.engine.tick(now, self._ctx(staged))
             try:
                 self._commit(decisions, staged, cursor, cursor, now)
@@ -299,7 +325,7 @@ class Runtime:
 
     def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
         self.sync()
-        staged = _StagedState(self.state, read_only=True)
+        staged = self._staged(read_only=True)
         handoffs = self.engine.handoff(query, caller, scope, self._ctx(staged), k)
         return [h for h in handoffs if self._may_see(h, caller, scope)][:k]
 
