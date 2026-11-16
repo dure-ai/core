@@ -185,35 +185,101 @@ def unique(all_events):
     ]
 
 
-# who appends event i, and who syncs afterwards: b falls several events behind
-# between its turns, so it must catch up on events another runtime indexed
+class RecordingBackend:
+    """Delegates to a VectorBackend and logs every vector and group write, so a
+    re-index is visible even though the writes are upserts."""
+
+    def __init__(self, inner, log, indexed_override=None):
+        self._inner = inner
+        self.log = log
+        self._indexed_override = indexed_override
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def put_vector(self, kind, id, vector):
+        self.log.append(("put_vector", kind, id))
+        self._inner.put_vector(kind, id, vector)
+
+    def put_group(self, event_id, *args, **kw):
+        self.log.append(("put_group", event_id))
+        self._inner.put_group(event_id, *args, **kw)
+
+    def indexed(self):
+        if self._indexed_override is not None:
+            return self._indexed_override()
+        return self._inner.indexed()
+
+
+def recording_runtime(db, embedder, log, indexed_override=None):
+    backend = RecordingBackend(db.vectors, log, indexed_override)
+    index = Index(backend, embedder, 0.9)
+    return Runtime(Quiet(), db.events, db.knowledge, db.state("probe"), db.transaction, index=index)
+
+
+def writes(log, kind):
+    return [entry[-1] for entry in log if entry[0] == kind and (kind == "put_group" or entry[1] == "event")]
+
+
+def assert_written_once(log, all_events, complete):
+    """No event was written twice; when complete, every embeddable one was."""
+    want = sorted(e.id for e in embeddable(all_events))
+    for kind in ("put_vector", "put_group"):
+        got = writes(log, kind)
+        assert len(got) == len(set(got)), f"{kind} wrote an event twice: {sorted(got)}"
+        assert set(got) <= set(want)
+        if complete:
+            assert sorted(got) == want
+
+
+# who appends event i: b falls several events behind between its turns, so it
+# must catch up on events another runtime indexed, and each sync is checked
 PLAN = "aabbaaaaabaaabbbabab"
+
+
+def run_two_runtimes(path, all_events, embedder, log, b_cursor=None):
+    db_a, db_b = SqliteDatabase(path), SqliteDatabase(path)
+    runtimes = {
+        "a": recording_runtime(db_a, embedder, log),
+        "b": recording_runtime(db_b, embedder, log, b_cursor),
+    }
+    for i, (who, e) in enumerate(zip(PLAN, all_events, strict=True)):
+        runtimes[who].append(e)
+        assert_written_once(log, all_events, complete=False)
+        runtimes["a"].sync()
+        assert_written_once(log, all_events, complete=False)
+        if who == "b" or i in (8, 12, 15):  # otherwise b stays behind for a stretch
+            runtimes["b"].sync()
+            assert_written_once(log, all_events, complete=False)
+    runtimes["a"].sync()
+    runtimes["b"].sync()
+    return db_a, db_b, runtimes
 
 
 @pytest.mark.parametrize("texts", ["repeated", "unique"])
 def test_two_runtimes_on_one_file_index_each_event_once(texts, tmp_path):
-    path = tmp_path / "shared.db"
-    embedder = CountingEmbedder()
-    db_a, db_b = SqliteDatabase(path), SqliteDatabase(path)
-    runtimes = {"a": runtime(db_a, embedder), "b": runtime(db_b, embedder)}
+    embedder, log = CountingEmbedder(), []
     all_events = events() if texts == "repeated" else unique(events())
 
-    for who, e in zip(PLAN, all_events, strict=True):
-        runtimes[who].append(e)
-        if who == "a" and e.id in ("p5", "t2", "o1"):
-            runtimes["b"].sync()  # b catches up only now
-    runtimes["a"].sync()
-    runtimes["b"].sync()
+    db_a, db_b, runtimes = run_two_runtimes(tmp_path / "shared.db", all_events, embedder, log)
 
+    assert_written_once(log, all_events, complete=True)  # the writes themselves, across both runtimes
     passages = [t for t, kind in embedder.calls if kind == "passage"]
-    texts_wanted = [e.text for e in embeddable(all_events)]
-    assert sorted(passages) == sorted(set(texts_wanted))
+    assert sorted(passages) == sorted({e.text for e in embeddable(all_events)})
     if texts == "unique":
-        assert len(passages) == len(embeddable(all_events))  # one call per event, none cached away
+        assert len(passages) == len(embeddable(all_events))
     assert all(kind == "passage" for _, kind in embedder.calls)
     assert_indexed_once(db_a, all_events)
     assert_indexed_once(db_b, all_events)
     assert observe(db_a, runtimes["a"]) == observe(db_b, runtimes["b"])
+
+
+def test_the_write_log_catches_a_runtime_that_ignores_the_shared_cursor(tmp_path):
+    """Control for the test above: runtime b told its cursor is always 0
+    re-indexes events a already indexed, and the log shows it."""
+    log = []
+    with pytest.raises(AssertionError, match="wrote an event twice"):
+        run_two_runtimes(tmp_path / "shared.db", events(), CountingEmbedder(), log, b_cursor=lambda: 0)
 
 
 def evidence_scenario(with_index):
