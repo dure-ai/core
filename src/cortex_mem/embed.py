@@ -78,6 +78,11 @@ class UpstageEmbedder:
         timeout: float = 30.0,
         batch: int = 64,
     ) -> None:
+        # The key goes into a header: a control or non-ASCII character would make
+        # http.client raise an error that quotes the header, key included.
+        # The message never quotes the key.
+        if not api_key or api_key != api_key.strip() or not all(" " <= c <= "~" for c in api_key):
+            raise ValueError("the API key must be non-empty printable ASCII, without control characters")
         self._api_key = api_key
         self.passage_model = passage_model
         self.query_model = query_model
@@ -107,13 +112,14 @@ class UpstageEmbedder:
 
     def _post(self, model: str, chunk: list[str]) -> list[list[float]]:
         body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/embeddings",
-            data=body,
-            method="POST",
-            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-        )
+        unsendable: str | None = None
         try:
+            request = urllib.request.Request(
+                f"{self.base_url}/embeddings",
+                data=body,
+                method="POST",
+                headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+            )
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
@@ -129,6 +135,13 @@ class UpstageEmbedder:
             raise EmbeddingError(f"embedding response was malformed: {type(exc).__name__}") from None
         except OSError as exc:
             raise EmbeddingError(f"embedding request failed: {type(exc).__name__}") from None
+        except ValueError as exc:  # UnicodeEncodeError included
+            # http.client quotes the offending header, key included: keep only the type.
+            unsendable = type(exc).__name__
+        if unsendable is not None:
+            # Raised outside the except block, so the original error (which may
+            # quote the key) is not even kept as __context__.
+            raise EmbeddingError(f"embedding request could not be built or sent ({unsendable})")
         try:
             items = json.loads(raw)["data"]
             by_index = {item["index"]: item["embedding"] for item in items}

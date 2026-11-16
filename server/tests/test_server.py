@@ -478,3 +478,15 @@ def test_group_threshold_defaults_to_point_nine(monkeypatch):
     assert srv._group_threshold() == 0.9
     monkeypatch.setenv("CORTEX_GROUP_THRESHOLD", "0")
     assert srv._group_threshold() == 0.0
+
+
+@pytest.mark.parametrize("key", ["sk-secret\r\nX: 1", "sk-비밀-key"])
+def test_upstage_key_that_cannot_be_sent_stops_the_server_without_printing_it(monkeypatch, key):
+    monkeypatch.setenv("CORTEX_EMBEDDER", "upstage")
+    monkeypatch.setenv("CORTEX_EMBED_PASSAGE_MODEL", "passage-m")
+    monkeypatch.setenv("CORTEX_EMBED_QUERY_MODEL", "query-m")
+    monkeypatch.setenv("UPSTAGE_API_KEY", key)
+    with pytest.raises(SystemExit) as exc:
+        srv._embedder()
+    assert "UPSTAGE_API_KEY" in str(exc.value)
+    assert "sk-secret" not in str(exc.value) and "비밀" not in str(exc.value)

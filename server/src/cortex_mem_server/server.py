@@ -286,7 +286,12 @@ def _embedder() -> Embedder | None:
         ]
         if missing:
             raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER=upstage also needs {', '.join(missing)}")
-        return UpstageEmbedder(key, passage, query)
+        try:
+            return UpstageEmbedder(key, passage, query)
+        except ValueError:
+            pass  # exit after the handler, so nothing is chained; the message names no value
+
+        raise SystemExit("cortex-mem: UPSTAGE_API_KEY must be printable ASCII without control characters")
     raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER must be none, hash or upstage, got {name!r}")
 
 

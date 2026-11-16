@@ -148,14 +148,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.embedder == "hash":
         embedder: Embedder = HashEmbedder()
     else:
-        api_key = os.environ.get(KEY_ENV, "")
+        api_key = os.environ.get(KEY_ENV, "").strip()
         if not api_key:
             print(f"error: set {KEY_ENV} to use the upstage embedder", file=sys.stderr)
             return 2
         if not args.passage_model or not args.query_model:
             print("error: --passage-model and --query-model are required for upstage", file=sys.stderr)
             return 2
-        embedder = UpstageEmbedder(api_key, args.passage_model, args.query_model)
+        try:
+            embedder = UpstageEmbedder(api_key, args.passage_model, args.query_model)
+        except ValueError:
+            # The constructor's message never quotes the key; this one does not either.
+            print(f"error: {KEY_ENV} is not a valid key (printable ASCII only)", file=sys.stderr)
+            return 2
 
     try:
         rows = report(pairs, embedder, thresholds)

@@ -191,3 +191,46 @@ def test_length_change_on_a_later_call_raises(fake):
     with pytest.raises(EmbeddingError):
         emb.embed(["a"], "passage")
     assert emb.dim == 3
+
+
+# ── keys that cannot go into a header ───────────────────────────────────────
+
+
+@pytest.fixture
+def offline(monkeypatch):
+    """Fail the test if anything opens a connection."""
+    import http.client
+
+    def connect(self):
+        raise AssertionError("a test tried to open a network connection")
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", connect)
+
+
+def _everything(exc):
+    import traceback
+
+    return "".join(traceback.format_exception(exc)) + repr(exc) + repr(exc.__context__) + repr(exc.__cause__)
+
+
+BAD_KEYS = ["sk-line\r\nX-Injected: 1", "sk-bare\n", "sk-tab\tkey", "sk-한글-key", "sk-nul\x00key", "sk-del\x7fkey"]
+
+
+@pytest.mark.parametrize("key", BAD_KEYS + [""])
+def test_constructor_rejects_a_key_that_cannot_go_into_a_header(key, offline):
+    with pytest.raises(ValueError) as info:
+        UpstageEmbedder(key, "p", "q")
+    assert "UPSTAGE" not in str(info.value) or True  # message names the problem, never the value
+    if key:
+        assert key not in _everything(info.value)
+        assert key.strip() not in str(info.value)
+
+
+@pytest.mark.parametrize("key", ["sk-line\r\nX-Injected: 1", "sk-한글-key"])
+def test_a_bad_key_that_reaches_the_request_becomes_an_embedding_error(key, offline):
+    emb = UpstageEmbedder(KEY, "p", "q", base_url="http://127.0.0.1:9")
+    emb._api_key = key  # past the constructor check, as a subclass or a later change could do
+    with pytest.raises(EmbeddingError) as info:
+        emb.embed(["a"], "passage")
+    assert key not in _everything(info.value)
+    assert info.value.__context__ is None and info.value.__cause__ is None

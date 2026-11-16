@@ -185,3 +185,47 @@ def test_file_without_rival_pairs_exits_2(tmp_path):
     result = _run([str(path), "--embedder", "hash"])
     assert result.returncode == 2
     assert "both" in result.stderr
+
+
+def _offline_upstage(monkeypatch):
+    """Record the Authorization header the embedder would send, then fail
+    like an unreachable server; nothing touches the network."""
+    import urllib.error
+
+    from cortex_mem import embed
+
+    sent = []
+
+    def urlopen(request, timeout=None):
+        sent.append(request.get_header("Authorization"))
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(embed.urllib.request, "urlopen", urlopen)
+    return sent
+
+
+def test_a_key_ending_in_a_carriage_return_is_stripped(tmp_path, monkeypatch, capsys):
+    sent = _offline_upstage(monkeypatch)
+    monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-cr\r")
+    rc = grouping_report.main(
+        [str(_write_pairs(tmp_path)), "--embedder", "upstage", "--passage-model", "p", "--query-model", "q"]
+    )
+    out = capsys.readouterr()
+    assert rc == 1  # the offline request failed, as an EmbeddingError
+    assert sent == ["Bearer sk-secret-cr"]
+    assert "sk-secret-cr" not in out.out + out.err
+
+
+@pytest.mark.parametrize("key", ["sk-secret\r\nX: 1", "sk-비밀"])
+def test_a_key_that_cannot_be_sent_exits_2_without_printing_it(tmp_path, monkeypatch, capsys, key):
+    sent = _offline_upstage(monkeypatch)
+    monkeypatch.setenv("UPSTAGE_API_KEY", key)
+    rc = grouping_report.main(
+        [str(_write_pairs(tmp_path)), "--embedder", "upstage", "--passage-model", "p", "--query-model", "q"]
+    )
+    out = capsys.readouterr()
+    assert rc == 2
+    assert "UPSTAGE_API_KEY" in out.err
+    assert sent == []
+    for part in ("sk-secret", "sk-비밀"):
+        assert part not in out.out + out.err
