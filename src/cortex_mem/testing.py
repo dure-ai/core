@@ -343,6 +343,21 @@ class VectorBackendContract(_Contract):
         vb.cached("m1", "d1").append(1.0)
         assert vb.cached("m1", "d1") == [0.1, 0.2]
 
+    def test_members_and_event_vectors_up_to_a_position(self, vb):
+        for seq, id in enumerate(["e1", "e2", "e3"], start=1):
+            vb.put_vector("event", id, [float(seq)])
+            vb.put_group(id, "g1", "team", "t1", seq * 10)  # positions 10, 20, 30
+        vb.put_vector("knowledge", "k1", [1.0])
+
+        assert vb.members("g1", upto=20) == ["e1", "e2"]
+        assert vb.members("g1", upto=9) == []
+        assert vb.members("g1", upto=None) == vb.members("g1") == ["e1", "e2", "e3"]
+        assert [i for i, _ in vb.vectors("event", upto=20)] == ["e1", "e2"]
+        assert list(vb.vectors("event", upto=30)) == list(vb.vectors("event"))
+        assert list(vb.vectors("event", upto=0)) == []
+        with pytest.raises(ValueError):
+            list(vb.vectors("knowledge", upto=20))
+
     def test_set_indexed_moves_the_cursor(self, vb):
         vb.set_indexed(5)
         assert vb.indexed() == 5

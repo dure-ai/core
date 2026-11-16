@@ -192,9 +192,13 @@ class InMemoryVectorBackend:
         found = self._vectors[kind].get(id)
         return None if found is None else list(found)
 
-    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
+    def vectors(self, kind: str, upto: int | None = None) -> Iterator[tuple[str, list[float]]]:
         table = self._vectors[kind]
         ids = sorted(table) if kind == "knowledge" else list(table)
+        if upto is not None:
+            if kind != "event":
+                raise ValueError("upto bounds event vectors only")
+            ids = [id for id in ids if id in self._groups and self._groups[id][3] <= upto]
         for id in ids:
             yield id, list(table[id])
 
@@ -211,8 +215,12 @@ class InMemoryVectorBackend:
         found = self._groups.get(event_id)
         return None if found is None else found[0]
 
-    def members(self, group_id: str) -> list[str]:
-        rows = [(g[3], e) for e, g in self._groups.items() if g[0] == group_id]
+    def members(self, group_id: str, upto: int | None = None) -> list[str]:
+        rows = [
+            (g[3], e)
+            for e, g in self._groups.items()
+            if g[0] == group_id and (upto is None or g[3] <= upto)
+        ]
         return [e for _, e in sorted(rows)]
 
     def partition(self, scope: Scope, owner: str) -> list[str]:

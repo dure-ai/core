@@ -222,13 +222,21 @@ class Group:
     id: str  # id of the first member event
     scope: Scope
     owner: str  # same rule as access.owner_for
-    members: tuple[str, ...]  # record event ids of the same (scope, owner), in append order
+    # Record event ids of the same (scope, owner), in append order, up to the
+    # last event the engine has been given (see SimilarityReader).
+    members: tuple[str, ...]
 
 
 class SimilarityReader(Protocol):
     """Read-only similarity search over the shared embedding index. Scores are
     cosine similarity (-1..1), higher = closer; do not mix them with the text
-    search scores."""
+    search scores.
+
+    Bounded to what the engine has seen: during observe, events up to and
+    including the one observed; during tick and handoff, events up to the
+    engine's cursor. Later events are not searched, not neighbors and not
+    group members, so a replay reads what live delivery read. Knowledge is
+    the knowledge base as it stands now."""
 
     model: str  # embedding model that built the index (informational)
 
@@ -258,8 +266,9 @@ class SimilarityReader(Protocol):
         ...
 
     def group(self, event_id: str) -> Group | None:
-        """The group the event belongs to, or None if it is not grouped.
-        Takes no caller: an engine observes every event anyway."""
+        """The group the event belongs to, or None if it is not grouped or
+        comes after the reader's bound. Takes no caller: an engine observes
+        every event anyway."""
         ...
 
 

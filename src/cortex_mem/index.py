@@ -144,8 +144,14 @@ class Index:
     def remove_knowledge(self, id: str) -> None:
         self._backend.delete_vectors("knowledge", [id])
 
-    def reader(self, events: EventReader, knowledge: KnowledgeReader) -> SimilarityReader:
-        return _Reader(self, events, knowledge)
+    def reader(
+        self, events: EventReader, knowledge: KnowledgeReader, upto: int | None = None
+    ) -> SimilarityReader:
+        """A reader over the events at positions <= upto (all when None): the
+        runtime passes the event being observed, or the engine's cursor, so an
+        engine never reads events it has not been given, live or on replay.
+        Knowledge is the knowledge base as it stands now."""
+        return _Reader(self, events, knowledge, upto)
 
     # ── internals ───────────────────────────────────────────────────────────
 
@@ -199,20 +205,20 @@ class Index:
             del self._queries[next(iter(self._queries))]
         return found
 
-    def _event_vectors(self) -> Iterator[tuple[str, list[float]]]:
-        return self._backend.vectors("event")
+    def _event_vectors(self, upto: int | None) -> Iterator[tuple[str, list[float]]]:
+        return self._backend.vectors("event", upto)
 
     def _knowledge_vectors(self) -> Iterator[tuple[str, list[float]]]:
         return self._backend.vectors("knowledge")
 
-    def _group(self, event_id: str) -> tuple[str, list[str]] | None:
+    def _group(self, event_id: str, upto: int | None) -> tuple[str, list[str]] | None:
         group_id = self._backend.group_of(event_id)
         if group_id is None:
             return None
-        return group_id, self._backend.members(group_id)
-
-    def _vector(self, event_id: str) -> list[float] | None:
-        return self._backend.vector("event", event_id)
+        members = self._backend.members(group_id, upto)
+        if event_id not in members:
+            return None  # the event itself is past upto
+        return group_id, members
 
 
 def _rank[T](scored: list[tuple[T, float]], k: int) -> list[tuple[T, float]]:
@@ -226,10 +232,13 @@ def _rank[T](scored: list[tuple[T, float]], k: int) -> list[tuple[T, float]]:
 class _Reader:
     """SimilarityReader over an Index. Only read methods are public."""
 
-    def __init__(self, index: Index, events: EventReader, knowledge: KnowledgeReader) -> None:
+    def __init__(
+        self, index: Index, events: EventReader, knowledge: KnowledgeReader, upto: int | None
+    ) -> None:
         self._index = index
         self._events = events
         self._knowledge = knowledge
+        self._upto = upto
         self.model: str = index.want()["model"]
 
     def search(
@@ -243,7 +252,8 @@ class _Reader:
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
-        return self._rank_events(target, caller, scope, k, kinds, exclude=None)
+        stored = list(self._index._event_vectors(self._upto))
+        return self._rank_events(stored, target, caller, scope, k, kinds, exclude=None)
 
     def neighbors(
         self, event_id: str, caller: Caller, scope: Scope, k: int = 20
@@ -253,10 +263,13 @@ class _Reader:
         start = self._events.get([event_id])
         if not start or not event_visible(start[0], caller, scope):
             return []
-        target = self._index._vector(event_id)
+        if self._index._group(event_id, self._upto) is None:
+            return []  # not embedded, or past upto: every embedded event has a group
+        stored = list(self._index._event_vectors(self._upto))
+        target = next((vector for id, vector in stored if id == event_id), None)
         if target is None:
             return []
-        return self._rank_events(target, caller, scope, k, None, exclude=event_id)
+        return self._rank_events(stored, target, caller, scope, k, None, exclude=event_id)
 
     def knowledge(
         self, query: str, caller: Caller, scope: Scope, k: int = 20
@@ -274,7 +287,7 @@ class _Reader:
         return _rank(scored, k)
 
     def group(self, event_id: str) -> Group | None:
-        found = self._index._group(event_id)
+        found = self._index._group(event_id, self._upto)
         if found is None:
             return None
         group_id, members = found
@@ -285,6 +298,7 @@ class _Reader:
 
     def _rank_events(
         self,
+        vectors: list[tuple[str, list[float]]],
         target: list[float],
         caller: Caller,
         scope: Scope,
@@ -292,7 +306,7 @@ class _Reader:
         kinds: Collection[Kind] | None,
         exclude: str | None,
     ) -> list[tuple[Event, float]]:
-        stored = [(id, v) for id, v in self._index._event_vectors() if id != exclude]  # append order
+        stored = [(id, v) for id, v in vectors if id != exclude]  # append order
         events = {e.id: e for e in self._events.get([id for id, _ in stored])}
         scored = [
             (events[id], cosine(target, vector))

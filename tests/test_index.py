@@ -636,3 +636,39 @@ def test_pending_passages_are_the_unindexed_embeddable_texts():
     index.catch_up(db.events, 1)
     assert index.pending_passages(db.events) == ["two", "four"]
     assert index.pending_passages(db.events, upto=3) == ["two"]
+
+
+# ── a reader bounded to what the engine has seen ────────────────────────────
+
+
+def test_a_bounded_reader_sees_no_event_after_its_position():
+    events = [ev("e1"), ev("o1", kind="outcome", refs=("e1",)), ev("e2"), ev("e3"), ev("x1", scope="team")]
+    db, index = build(events)
+    full = reader(db, index)
+    assert full.group("e3").members == ("e1", "e2", "e3")
+
+    upto3 = index.reader(db.events, db.knowledge, upto=3)  # e1, o1, e2
+    assert upto3.group("e1") == Group("e1", "personal", "u1", ("e1", "e2"))
+    assert upto3.group("e2") == Group("e1", "personal", "u1", ("e1", "e2"))
+    assert upto3.group("e3") is None  # not seen yet
+    assert upto3.group("x1") is None
+    assert ids(upto3.search("deploy uses tags", caller(), "org")) == ["e1", "e2"]
+    assert ids(upto3.neighbors("e1", caller(), "org")) == ["e2"]
+    assert upto3.neighbors("e3", caller(), "org") == []
+
+    upto1 = index.reader(db.events, db.knowledge, upto=1)
+    assert upto1.group("e1").members == ("e1",)
+    assert upto1.neighbors("e1", caller(), "org") == []
+    assert ids(index.reader(db.events, db.knowledge, upto=5).search("deploy uses tags", caller(), "org")) == [
+        "e1", "e2", "e3", "x1",
+    ]
+
+
+def test_a_bounded_reader_still_searches_all_current_knowledge():
+    db, index = build([ev("e1")])
+    k = item("k1")
+    db.knowledge.put(k)
+    index.put_knowledge(k)
+    assert ids(index.reader(db.events, db.knowledge, upto=0).knowledge("deploy\ndeploy uses tags", caller(), "team")) == [
+        "k1"
+    ]

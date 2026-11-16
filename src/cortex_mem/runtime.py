@@ -176,8 +176,10 @@ class Runtime:
         reserved = None if self.index is None else RESERVED_STATE_PREFIX
         return _StagedState(self.state, read_only=read_only, reserved=reserved)
 
-    def _ctx(self, state: _StagedState) -> EngineContext:
-        similar = None if self.index is None else self.index.reader(self.events, self.knowledge)
+    def _ctx(self, state: _StagedState, upto: int) -> EngineContext:
+        """upto: the last event the engine has been given (the one it observes,
+        else its cursor); ctx.similar reads no event after it."""
+        similar = None if self.index is None else self.index.reader(self.events, self.knowledge, upto)
         return EngineContext(events=self.events, knowledge=self.knowledge, state=state, similar=similar)
 
     def append(self, event: Event) -> str:
@@ -228,7 +230,7 @@ class Runtime:
                 self.index.catch_up(self.events, seq, embed=False)
             staged = self._staged()
             try:
-                decisions = self.engine.observe(event, self._ctx(staged))
+                decisions = self.engine.observe(event, self._ctx(staged, seq))
             except Exception as exc:
                 if not self._give_up(seq, event, exc):
                     raise
@@ -317,7 +319,7 @@ class Runtime:
         with self.transaction():
             cursor = self.state.cursor()
             staged = self._staged()
-            decisions = self.engine.tick(now, self._ctx(staged))
+            decisions = self.engine.tick(now, self._ctx(staged, cursor))
             try:
                 self._commit(decisions, staged, cursor, cursor, now)
             except CursorConflict:
@@ -326,7 +328,7 @@ class Runtime:
     def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
         self.sync()
         staged = self._staged(read_only=True)
-        handoffs = self.engine.handoff(query, caller, scope, self._ctx(staged), k)
+        handoffs = self.engine.handoff(query, caller, scope, self._ctx(staged, self.state.cursor()), k)
         return [h for h in handoffs if self._may_see(h, caller, scope)][:k]
 
     def recall(

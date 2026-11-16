@@ -569,3 +569,60 @@ def test_the_index_marker_is_hidden_from_the_engine():
     rt.append(ev("e2"))
     assert engine.keys == ["n"] and engine.marker is None
     assert rt.state.get(INDEX_STATE_KEY) == {"model": "hash-256", "group_threshold": 0.9}
+
+
+# ── replay sees what live delivery saw ──────────────────────────────────────
+
+
+class Remembers(ProbeEngine):
+    """Also records what search and neighbors return while observing."""
+
+    state_version = "1"
+
+    def __init__(self):
+        super().__init__()
+        self.found = {}
+
+    def observe(self, event, ctx):
+        self.found[event.id] = (
+            [e.id for e, _ in ctx.similar.search("deploy uses tags", caller(), "org")],
+            [e.id for e, _ in ctx.similar.neighbors(event.id, caller(), "org")],
+        )
+        return super().observe(event, ctx)
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_replay_sees_the_same_groups_and_neighbors_as_live_delivery(store, tmp_path):
+    db = make_db(store, tmp_path)
+    live = Remembers()
+    rt = runtime(live, db)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    assert live.groups["e1"].members == ("e1",)
+    assert live.groups["e2"].members == ("e1", "e2")
+    assert live.found == {"e1": (["e1"], []), "e2": (["e1", "e2"], ["e1"])}
+
+    class Bumped(Remembers):
+        state_version = "2"
+
+    replay = Bumped()
+    assert runtime(replay, db).sync() == 2
+    assert replay.groups == live.groups  # e1 -> ('e1',), not ('e1', 'e2')
+    assert replay.found == live.found
+
+
+def test_tick_and_handoff_read_up_to_the_engines_cursor():
+    db = InMemoryDatabase()
+    engine = ProbeEngine()
+    rt = runtime(engine, db)
+    rt.append(ev("e1"))
+    # Indexed by another engine's runtime, not yet delivered to this one.
+    other = runtime(ProbeEngine(), db, name="other")
+    db.events.append(ev("e2"))
+    other.sync()
+    assert db.vectors.indexed() == 2 and rt.state.cursor() == 1
+
+    staged = rt._staged()
+    similar = rt._ctx(staged, rt.state.cursor()).similar
+    assert similar.group("e2") is None
+    assert [e.id for e, _ in similar.search("deploy uses tags", caller(), "personal")] == ["e1"]

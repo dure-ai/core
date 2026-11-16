@@ -96,8 +96,10 @@ class VectorBackend(Protocol):
 
     def vector(self, kind: str, id: str) -> list[float] | None: ...
 
-    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
-        """Event vectors in first-insertion order, knowledge vectors by id."""
+    def vectors(self, kind: str, upto: int | None = None) -> Iterator[tuple[str, list[float]]]:
+        """Event vectors in first-insertion order, knowledge vectors by id.
+        upto (events only; ValueError for knowledge): just the event vectors
+        whose event position, the seq given to put_group, is <= upto."""
         ...
 
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
@@ -111,8 +113,9 @@ class VectorBackend(Protocol):
 
     def group_of(self, event_id: str) -> str | None: ...
 
-    def members(self, group_id: str) -> list[str]:
-        """Event ids of the group ordered by seq; unknown group gives []."""
+    def members(self, group_id: str, upto: int | None = None) -> list[str]:
+        """Event ids of the group ordered by seq, only those with seq <= upto
+        when given; unknown group gives []."""
         ...
 
     def partition(self, scope: Scope, owner: str) -> list[str]:

@@ -416,9 +416,18 @@ class SqliteVectorBackend:
         rows = self.db.query("SELECT vec FROM vectors WHERE kind = ? AND id = ?", (kind, id))
         return _unpack(rows[0][0]) if rows else None
 
-    def vectors(self, kind: str) -> Iterator[tuple[str, list[float]]]:
-        order = "id" if kind == "knowledge" else "seq"
-        rows = self.db.query(f"SELECT id, vec FROM vectors WHERE kind = ? ORDER BY {order}", (kind,))
+    def vectors(self, kind: str, upto: int | None = None) -> Iterator[tuple[str, list[float]]]:
+        if upto is None:
+            order = "id" if kind == "knowledge" else "seq"
+            rows = self.db.query(f"SELECT id, vec FROM vectors WHERE kind = ? ORDER BY {order}", (kind,))
+        elif kind != "event":
+            raise ValueError("upto bounds event vectors only")
+        else:
+            rows = self.db.query(
+                "SELECT v.id, v.vec FROM vectors v JOIN vector_groups g ON g.event_id = v.id "
+                "WHERE v.kind = 'event' AND g.seq <= ? ORDER BY v.seq",
+                (upto,),
+            )
         for id, blob in rows:
             yield id, _unpack(blob)
 
@@ -439,10 +448,16 @@ class SqliteVectorBackend:
         rows = self.db.query("SELECT group_id FROM vector_groups WHERE event_id = ?", (event_id,))
         return rows[0][0] if rows else None
 
-    def members(self, group_id: str) -> list[str]:
-        rows = self.db.query(
-            "SELECT event_id FROM vector_groups WHERE group_id = ? ORDER BY seq, event_id", (group_id,)
-        )
+    def members(self, group_id: str, upto: int | None = None) -> list[str]:
+        if upto is None:
+            rows = self.db.query(
+                "SELECT event_id FROM vector_groups WHERE group_id = ? ORDER BY seq, event_id", (group_id,)
+            )
+        else:
+            rows = self.db.query(
+                "SELECT event_id FROM vector_groups WHERE group_id = ? AND seq <= ? ORDER BY seq, event_id",
+                (group_id, upto),
+            )
         return [r[0] for r in rows]
 
     def partition(self, scope: Scope, owner: str) -> list[str]:
