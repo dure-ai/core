@@ -268,7 +268,10 @@ class SimilarityReader(Protocol):
     def group(self, event_id: str) -> Group | None:
         """The group the event belongs to, or None if it is not grouped or
         comes after the reader's bound. Takes no caller: an engine observes
-        every event anyway."""
+        every event anyway. Members are not filtered for any caller: an
+        engine that puts members' words into a Handoff must list those
+        members in the Handoff's sources, since the handoff filter checks
+        only the events a Handoff cites."""
         ...
 
 

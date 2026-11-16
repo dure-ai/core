@@ -153,6 +153,7 @@ class Engine(Protocol):
 
 - **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다.
 - **가시성**: 세 검색 모두 `access.event_visible`·`knowledge_visible`로 거른 집합 안에서만 찾는다. `group()`은 호출자를 받지 않는다. 엔진은 모든 이벤트를 관찰하므로 묶음 정보가 엔진에게 새 노출이 아니고, 엔진이 내보내는 것은 결정 검증과 handoff 필터를 지난다(§3-5).
+- **묶음 멤버를 handoff에 쓰면 근거로 인용한다**: handoff 필터는 Handoff가 `sources`에 적은 이벤트만 검사한다. 엔진이 `group().members`(또는 `neighbors` 결과) 이벤트의 내용을 Handoff의 `content`에 넣으면 그 이벤트들을 모두 `sources`에 넣어야 한다. 빠뜨리면 호출자가 볼 수 없는 기록의 내용이 필터를 지나 나간다.
 - **엔진이 본 데까지만**: `similar`는 엔진이 이미 받은 이벤트까지만 읽는다. `observe` 중에는 지금 관찰하는 이벤트까지, `tick`·`handoff` 중에는 엔진의 커서까지다. 그 뒤의 이벤트는 `search`·`neighbors` 결과에도, `group().members`에도 나오지 않고, 그 뒤의 이벤트로 `group()`을 부르면 `None`이다. 그래서 처음부터 다시 전달할 때(§3-8)도 처음 전달 때와 같은 결과를 읽는다(§3-7). 지식(`knowledge`)은 지금의 지식 베이스다.
 - **recall 질의**: `search`·`knowledge`의 질의는 임베딩하되 저장하지 않는다(프로세스 메모리의 작은 LRU만).
 
@@ -222,7 +223,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 ### 3-5. handoff 필터
 
-런타임은 엔진이 건넨 항목 중 다음을 뺀다: `sources`가 비었거나, 없는 이벤트를 가리키거나, 호출자가 그 scope로 볼 수 없는 이벤트가 하나라도 있는 항목. 항목 id가 지식 항목이면 그 항목도 호출자에게 보여야 한다. 그 뒤 `k`개로 자른다.
+런타임은 엔진이 건넨 항목 중 다음을 뺀다: `sources`가 비었거나, 없는 이벤트를 가리키거나, 호출자가 그 scope로 볼 수 없는 이벤트가 하나라도 있는 항목. 항목 id가 지식 항목이면 그 항목도 호출자에게 보여야 한다. 그 뒤 `k`개로 자른다. 필터는 `sources`에 적힌 이벤트만 보므로, `content`에 쓴 이벤트(묶음 멤버 등)는 모두 `sources`에 적어야 한다(§2).
 
 누출을 막는 지점은 결정 검증(§3-4)과 이 필터 두 곳뿐이고, 둘 다 고정 부분에 있다. 엔진은 모든 이벤트를 관찰하지만, 나가는 것은 항상 검사된다.
 
@@ -302,13 +303,14 @@ class EngineStateBackend(Protocol):                           # 엔진 하나의
 class Database(Protocol):                                     # 한 연결 뒤의 저장소 전부
     events: EventStore
     knowledge: KnowledgeStore
+    vectors: VectorBackend                                    # 임베딩을 쓰지 않아도 있어야 한다
     def state(self, engine) -> EngineStateBackend: ...       # 엔진별 이름공간
     def transaction(self): ...
 ```
 
-- `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인한다. `search` 점수는 "높을수록 좋음"만 약속한다.
+- `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `VectorBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인하고, `transaction()` 안의 벡터 쓰기가 예외와 함께 되돌려지는지도 본다(되돌릴 수 없는 단일 프로세스 저장소는 `rolls_back = False`). `search` 점수는 "높을수록 좋음"만 약속한다.
 - 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **한 트랜잭션**으로 묶고 프로세스 사이에서 직렬화한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
-- 임베딩을 쓰면 `Database`에 `vectors: VectorBackend` 속성이 더해진다. `VectorBackend`는 색인 상태(모델, 묶음 문턱값, 색인한 마지막 위치), 이벤트·지식 벡터, 묶음, 임베딩 캐시를 맡는다. 모든 쓰기는 런타임의 `transaction()` 안에서 일어나고, 이벤트 하나의 색인과 전달은 같은 트랜잭션에 묶인다. 벡터는 float64로 저장해 두 저장소에서 점수와 동점 처리가 같게 한다. 기존 `Database`의 다른 부분은 그대로다. 포트 정의와 구현은 임베딩 설계(`docs/specs/2026-11-15-core-embedding-design.md` §5)를 따른다.
+- `Database`에는 `vectors: VectorBackend` 속성이 있다. `Database` 프로토콜이 요구하므로 임베딩을 쓰지 않는 배포에서도 구현해야 한다(쓰지 않으면 비어 있을 뿐이다). `VectorBackend`는 색인 상태(모델, 묶음 문턱값, 색인한 마지막 위치), 이벤트·지식 벡터, 묶음, 임베딩 캐시를 맡는다. 모든 쓰기는 런타임의 `transaction()` 안에서 일어나고 그 트랜잭션과 함께 되돌려진다. 이벤트 하나의 색인과 전달은 같은 트랜잭션에 묶이고, 임베딩 캐시는 그 앞의 짧은 트랜잭션에서 미리 채운다. 벡터는 float64로 저장해 두 저장소에서 점수와 동점 처리가 같게 한다. 기존 `Database`의 다른 부분은 그대로다. 포트 정의와 구현은 임베딩 설계(`docs/specs/2026-11-15-core-embedding-design.md` §5)를 따른다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
 - **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, append를 `transaction()` 안에서 잠금(advisory lock 등)으로 직렬화한다. PG 구현에는 동시 append 두 개를 섞는 적합성 테스트를 추가한다(지금의 `DatabaseContract`로는 잡히지 않는다).
 - **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL도 `to_tsvector('simple', words || ' ' || grams)`로 같은 토큰을 쓰면 확장 없이 옮겨진다.
