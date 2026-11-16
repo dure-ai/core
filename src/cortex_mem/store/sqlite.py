@@ -14,7 +14,6 @@ until the PostgreSQL store, which passes the same suites (cortex_mem.testing).
 """
 
 import json
-import re
 import sqlite3
 import threading
 from array import array
@@ -26,42 +25,20 @@ from typing import Any
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
+from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
 SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's write lock
 
-_WORD = re.compile(r"\w+")
-_HANGUL = re.compile(r"[가-힣]")
 _EVENT_COLUMNS = (
     "id, kind, at, user, team, session, scope, text, agent, signal, outcome, "
     "conditions, refs, repo, rev, text_redacted"
 )
 _KNOWLEDGE_COLUMNS = "id, kind, title, body, scope, owner, sources, conditions"
-_EVENT_VISIBLE = (
-    "(e.user = :user OR (:scope IN ('team', 'org') AND e.scope = 'team' AND e.team = :team)"
-    " OR (:scope = 'org' AND e.scope = 'org'))"
-)
-_KNOWLEDGE_VISIBLE = (
-    "((k.scope = 'personal' AND k.owner = :user)"
-    " OR (k.scope = 'team' AND :scope IN ('team', 'org') AND k.owner = :team)"
-    " OR (k.scope = 'org' AND :scope = 'org'))"
-)
-
-
-def _words(text: str) -> list[str]:
-    return _WORD.findall(text.lower())
-
-
-def _bigrams(text: str) -> list[str]:
-    grams = []
-    for word in _words(text):
-        if _HANGUL.search(word):
-            grams += [word[i : i + 2] for i in range(len(word) - 1)]
-    return grams
 
 
 def _match(query: str) -> str | None:
-    terms = [f'words:"{w}"' for w in _words(query)] + [f'grams:"{g}"' for g in _bigrams(query)]
+    terms = [f'words:"{w}"' for w in words(query)] + [f'grams:"{g}"' for g in bigrams(query)]
     return " OR ".join(terms) or None
 
 
@@ -187,7 +164,7 @@ class SqliteEventStore:
                 )
                 self.db.con.execute(
                     "INSERT INTO events_fts (rowid, words, grams) VALUES (?, ?, ?)",
-                    (cur.lastrowid, " ".join(_words(e.text)), " ".join(_bigrams(e.text))),
+                    (cur.lastrowid, " ".join(words(e.text)), " ".join(bigrams(e.text))),
                 )
         except sqlite3.IntegrityError:
             raise ValueError(f"duplicate event id: {e.id}") from None
@@ -226,7 +203,7 @@ class SqliteEventStore:
         sql = (
             f"SELECT {columns}, -bm25(events_fts) AS score "
             "FROM events_fts JOIN events e ON e.seq = events_fts.rowid "
-            f"WHERE events_fts MATCH :match AND {_EVENT_VISIBLE}"
+            f"WHERE events_fts MATCH :match AND {EVENT_VISIBLE_SQL}"
         )
         params: dict[str, Any] = {"match": match, "user": caller.user, "team": caller.team, "scope": scope}
         if kinds is not None:
@@ -265,7 +242,7 @@ class SqliteKnowledgeBase:
                 self.db.con.execute("DELETE FROM knowledge_fts WHERE rowid = ?", (rowid,))
             self.db.con.execute(
                 "INSERT INTO knowledge_fts (rowid, words, grams) VALUES (?, ?, ?)",
-                (rowid, " ".join(_words(text)), " ".join(_bigrams(text))),
+                (rowid, " ".join(words(text)), " ".join(bigrams(text))),
             )
 
     def remove(self, id: str) -> None:
@@ -297,7 +274,7 @@ class SqliteKnowledgeBase:
         sql = (
             f"SELECT {columns}, -bm25(knowledge_fts) AS score "
             "FROM knowledge_fts JOIN knowledge k ON k.rowid = knowledge_fts.rowid "
-            f"WHERE knowledge_fts MATCH :match AND {_KNOWLEDGE_VISIBLE} "
+            f"WHERE knowledge_fts MATCH :match AND {KNOWLEDGE_VISIBLE_SQL} "
             "ORDER BY score DESC, k.id LIMIT :k"
         )
         params = {"match": match, "user": caller.user, "team": caller.team, "scope": scope, "k": k}

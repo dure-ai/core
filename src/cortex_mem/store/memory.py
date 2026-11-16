@@ -12,7 +12,7 @@ from typing import Any
 from ..access import event_visible, knowledge_visible
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
-from .sqlite import _bigrams, _words
+from .text import bigrams, words
 
 # The harness's all_store baseline uses these, so a score gap between it and an
 # engine on this store comes from the engine rather than from the ranking formula.
@@ -21,7 +21,7 @@ _B = 0.75
 
 
 def _tokens(text: str) -> list[str]:
-    return _words(text) + _bigrams(text)
+    return words(text) + bigrams(text)
 
 
 def _bm25(query: str, texts: Sequence[str]) -> list[float]:
