@@ -13,8 +13,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+
 [dependency-groups]
-dev = ["pytest>=8", "cortex-mem-server"]
+dev = ["pytest>=8", "cortex-mem-server", "psycopg[binary]>=3.2,<4"]
 
 [build-system]
 requires = ["hatchling"]
