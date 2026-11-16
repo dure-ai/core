@@ -32,7 +32,7 @@ from .store.base import CursorConflict, EngineStateBackend, EventStore, Knowledg
 
 _ABSENT = object()
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
-RESERVED_STATE_PREFIX = "_runtime/"  # with an index, the runtime's own keys in the engine's state
+RESERVED_STATE_PREFIX = "_runtime/"  # the runtime's own keys in the engine's state, hidden from the engine
 INDEX_STATE_KEY = RESERVED_STATE_PREFIX + "index"  # the index version the engine's state was built on
 
 
@@ -139,9 +139,13 @@ class Runtime:
     Event and knowledge passages are embedded before the write transaction
     (the cache is warmed in short transactions of its own), so a slow
     embedding API never holds a durable store's write lock; the indexing
-    inside the transaction only reads the cache. Promoted items are the
-    exception: they come out of `observe`, so they are embedded inside the
-    delivery transaction, one call per promoted item.
+    inside the transaction only reads the cache. There are two exceptions,
+    both embedded inside the delivery transaction while the write lock is
+    held, each call bounded by the embedder's timeout: promoted items (they
+    come out of `observe`; one call per item), and engine queries during
+    `observe` or `tick` (`ctx.similar.search` and `ctx.similar.knowledge`
+    embed an uncached query text). Engines should prefer `group` and
+    `neighbors` in `observe`; they read only the cache and never embed.
     """
 
     def __init__(
@@ -173,8 +177,7 @@ class Runtime:
         return [v for v in self.verdicts if not v.accepted]
 
     def _staged(self, read_only: bool = False) -> _StagedState:
-        reserved = None if self.index is None else RESERVED_STATE_PREFIX
-        return _StagedState(self.state, read_only=read_only, reserved=reserved)
+        return _StagedState(self.state, read_only=read_only, reserved=RESERVED_STATE_PREFIX)
 
     def _ctx(self, state: _StagedState, upto: int) -> EngineContext:
         """upto: the last event the engine has been given (the one it observes,

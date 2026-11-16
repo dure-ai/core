@@ -220,7 +220,6 @@ BAD_KEYS = ["sk-line\r\nX-Injected: 1", "sk-bare\n", "sk-tab\tkey", "sk-한글-k
 def test_constructor_rejects_a_key_that_cannot_go_into_a_header(key, offline):
     with pytest.raises(ValueError) as info:
         UpstageEmbedder(key, "p", "q")
-    assert "UPSTAGE" not in str(info.value) or True  # message names the problem, never the value
     if key:
         assert key not in _everything(info.value)
         assert key.strip() not in str(info.value)

@@ -91,3 +91,8 @@ def test_cosine_survives_a_product_of_norms_out_of_float_range():
     # Each squared norm fits in a float64; their product does not.
     assert cosine([1e-100, 0.0], [1e-100, 1e-100]) == pytest.approx(2**-0.5)
     assert cosine([1e100, 0.0], [1e100, 1e100]) == pytest.approx(2**-0.5)
+
+
+def test_cosine_keeps_precision_when_the_norm_product_is_subnormal():
+    assert cosine([1e-160, 0], [1e-160, 1e-160]) == pytest.approx(0.70711, rel=1e-4)
+    assert cosine([1e-160, 0], [1e-160, 1e-160]) == pytest.approx(math.sqrt(0.5), rel=1e-9)

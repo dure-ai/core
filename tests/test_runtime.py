@@ -392,3 +392,24 @@ def test_event_delivered_by_another_process_is_not_applied_twice():
 
     assert [i.id for i in kb.all()] == ["k-e1"]  # only the winner's decision
     assert state.cursor() == 1 and rt.rejections == []
+
+
+def test_the_runtime_state_prefix_is_reserved_without_an_index():
+    class Peeks(Scripted):
+        def observe(self, event, ctx):
+            self.keys = [k for k, _ in ctx.state.scan()]
+            self.value = ctx.state.get("_runtime/index")
+            with pytest.raises(ValueError, match="reserved"):
+                ctx.state.put("_runtime/index", "mine")
+            with pytest.raises(ValueError, match="reserved"):
+                ctx.state.delete("_runtime/other")
+            ctx.state.put("n", 1)
+            return []
+
+    state = InMemoryStateBackend()
+    state.commit(0, 0, {"_runtime/index": "theirs"}, set())
+    engine = Peeks()
+    rt = runtime(engine, state=state)
+    rt.append(ev("e1"))
+    assert engine.keys == [] and engine.value is None
+    assert rt.state.get("_runtime/index") == "theirs" and rt.state.get("n") == 1

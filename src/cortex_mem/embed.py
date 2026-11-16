@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import math
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
@@ -43,8 +44,16 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if na2 == 0.0 or nb2 == 0.0:
         return 0.0
     norms = math.sqrt(na2 * nb2)
-    if norms == 0.0 or math.isinf(norms):  # the product left float range; each factor did not
-        norms = math.sqrt(na2) * math.sqrt(nb2)
+    if norms < sys.float_info.min or math.isinf(norms):
+        # The squares or their product left float range (overflowed or went
+        # subnormal), so scale each vector by its largest component first.
+        ma = max(abs(x) for x in a)
+        mb = max(abs(y) for y in b)
+        sa = [x / ma for x in a]
+        sb = [y / mb for y in b]
+        return math.fsum(x * y for x, y in zip(sa, sb, strict=True)) / (
+            math.sqrt(math.fsum(x * x for x in sa)) * math.sqrt(math.fsum(y * y for y in sb))
+        )
     return math.fsum(x * y for x, y in zip(a, b, strict=True)) / norms
 
 
