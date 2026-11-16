@@ -490,3 +490,14 @@ def test_upstage_key_that_cannot_be_sent_stops_the_server_without_printing_it(mo
         srv._embedder()
     assert "UPSTAGE_API_KEY" in str(exc.value)
     assert "sk-secret" not in str(exc.value) and "비밀" not in str(exc.value)
+
+
+def test_upstage_timeout_is_shorter_than_sqlites_busy_timeout(monkeypatch):
+    from cortex_mem.store.sqlite import BUSY_TIMEOUT_MS
+
+    monkeypatch.setenv("CORTEX_EMBEDDER", "upstage")
+    monkeypatch.setenv("CORTEX_EMBED_PASSAGE_MODEL", "passage-m")
+    monkeypatch.setenv("CORTEX_EMBED_QUERY_MODEL", "query-m")
+    monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
+    # A promoted item is embedded while the write lock is held (spec §7).
+    assert srv._embedder().timeout < BUSY_TIMEOUT_MS / 1000

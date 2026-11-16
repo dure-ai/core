@@ -7,7 +7,7 @@ import pytest
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
 from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, text_digest
-from cortex_mem.index import Index
+from cortex_mem.index import Index, PassageNotCached
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -560,3 +560,79 @@ def test_negative_k_returns_nothing():
     assert r.search("deploy uses tags", me, "org", k=-1) == []
     assert r.neighbors("mine", me, "org", k=-1) == []
     assert r.knowledge("deploy\ndeploy uses tags", me, "org", k=-1) == []
+
+
+# ── warming the cache outside the write lock ────────────────────────────────
+
+
+class BatchCountingEmbedder(CountingEmbedder):
+    """Also remembers each embed call's batch."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    def embed(self, texts, kind):
+        self.batches.append(list(texts))
+        return super().embed(texts, kind)
+
+
+def test_failed_rebuild_leaves_the_index_as_it_was():
+    db, _ = build([ev("e1"), ev("e2", "other words")], threshold=0.9)
+    db.knowledge.put(item("k1", body="never embedded"))
+    before = (db.vectors.meta(), list(db.vectors.vectors("event")), db.vectors.indexed())
+    fresh = Index(db.vectors, FailingEmbedder({"deploy\nnever embedded"}), 0.5)
+
+    with pytest.raises(EmbeddingError):
+        fresh.rebuild(db.knowledge)
+
+    assert fresh.stale()  # the next sync tries again
+    assert (db.vectors.meta(), list(db.vectors.vectors("event")), db.vectors.indexed()) == before
+
+
+def test_warm_embeds_missing_passages_in_batches_and_writes_only_the_cache():
+    db = InMemoryDatabase()
+    emb = BatchCountingEmbedder()
+    index = Index(db.vectors, emb, 0.9)
+    index.warm(["already cached"])
+    emb.batches.clear()
+    texts = [f"text {i}" for i in range(130)] + ["text 0", "already cached"]
+
+    index.warm(texts)
+
+    assert [len(b) for b in emb.batches] == [64, 64, 2]  # missing, distinct, in order
+    assert emb.batches[0][0] == "text 0"
+    assert all(db.vectors.cached(emb.model, text_digest(t)) is not None for t in texts)
+    assert (db.vectors.meta(), db.vectors.indexed(), list(db.vectors.vectors("event"))) == (None, 0, [])
+    index.warm(texts)
+    assert len(emb.batches) == 3  # everything was cached
+
+
+def test_catch_up_without_embedding_stops_at_a_cache_miss():
+    db = InMemoryDatabase()
+    for e in [ev("e1", "first"), ev("e2", "second")]:
+        db.events.append(e)
+    emb = CountingEmbedder()
+    index = Index(db.vectors, emb, 0.9)
+    index.warm(["first"])
+    with pytest.raises(PassageNotCached) as miss:
+        index.catch_up(db.events, 2, embed=False)
+    assert miss.value.text == "second"
+    assert db.vectors.indexed() == 1 and db.vectors.vector("event", "e2") is None
+    assert [t for t, _ in emb.calls] == ["first"]
+
+    index.warm(index.pending_passages(db.events))
+    index.catch_up(db.events, 2, embed=False)
+    assert db.vectors.indexed() == 2
+    assert [t for t, _ in emb.calls] == ["first", "second"]
+
+
+def test_pending_passages_are_the_unindexed_embeddable_texts():
+    db = InMemoryDatabase()
+    for e in [ev("e1", "one"), ev("o1", kind="outcome", refs=("e1",)), ev("e2", "two"), ev("x1", text_redacted=True),
+              ev("e3", "two"), ev("e4", "four")]:
+        db.events.append(e)
+    index = Index(db.vectors, HashEmbedder(), 0.9)
+    index.catch_up(db.events, 1)
+    assert index.pending_passages(db.events) == ["two", "four"]
+    assert index.pending_passages(db.events, upto=3) == ["two"]

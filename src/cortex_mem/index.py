@@ -7,7 +7,8 @@ give the same groups and the same search results. Ties go to append order
 for events and id order for knowledge.
 """
 
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 
 from .access import event_visible, knowledge_visible, owner_for
 from .contract import (
@@ -25,6 +26,16 @@ from .embed import Embedder, EmbeddingError, EmbedKind, cosine, text_digest
 from .store.base import EventStore, VectorBackend
 
 _QUERY_CACHE_SIZE = 256
+WARM_BATCH = 64  # texts per embed call when warming the cache
+
+
+class PassageNotCached(Exception):
+    """catch_up(embed=False) or rebuild(embed=False) needed a passage that is
+    not in the cache. The caller warms `text` outside its lock and retries."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__("a passage is not in the embedding cache")
+        self.text = text
 
 
 def _embedded(event: Event) -> bool:
@@ -54,22 +65,28 @@ class Index:
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
 
-    def rebuild(self, knowledge: KnowledgeReader) -> None:
-        """Start over: drop vectors, groups and the cursor, then embed every
-        knowledge item again (the cache makes that free for the same model)."""
+    def rebuild(self, knowledge: KnowledgeReader, embed: bool = True) -> None:
+        """Start over: drop vectors, groups and the cursor, then store every
+        knowledge item's vector again. Every vector is found first (the cache
+        makes that free for the same model), so a failure resets nothing and
+        the index stays stale. With embed=False a cache miss raises
+        PassageNotCached instead of calling the embedder."""
+        vectors = [(item.id, self._passage_vector(_passage(item), embed)) for item in knowledge.all()]
         self._backend.reset(self.want())
-        for item in knowledge.all():
-            self.put_knowledge(item)
+        for id, vector in vectors:
+            self._backend.put_vector("knowledge", id, vector)
 
-    def catch_up(self, events: EventStore, upto: int) -> None:
+    def catch_up(self, events: EventStore, upto: int, embed: bool = True) -> None:
         """Index every event after backend.indexed() up to and including upto.
-        An EmbeddingError leaves no trace of the event that failed."""
+        An EmbeddingError leaves no trace of the event that failed. With
+        embed=False the embedder is never called: a passage missing from the
+        cache raises PassageNotCached, also before that event is written."""
         for seq, event in events.since(self._backend.indexed()):
             if seq > upto:
                 break
             if _embedded(event):
                 # Embed and group first, write after: a failure writes nothing.
-                vector = self._passage_vector(event.text)
+                vector = self._passage_vector(event.text, embed)
                 scope, owner = event.scope, owner_for(event)
                 group_id = self._group_for(vector, scope, owner, event.id)
                 self._backend.put_vector("event", event.id, vector)
@@ -77,6 +94,44 @@ class Index:
             self._backend.set_indexed(seq)
             if seq >= upto:
                 break
+
+    def pending_passages(self, events: EventStore, upto: int | None = None) -> list[str]:
+        """Distinct texts of the embeddable events after backend.indexed()
+        (up to and including upto, if given), in append order."""
+        texts: dict[str, None] = {}
+        for seq, event in events.since(self._backend.indexed()):
+            if upto is not None and seq > upto:
+                break
+            if _embedded(event):
+                texts[event.text] = None
+        return list(texts)
+
+    def warm(
+        self,
+        texts: Iterable[str],
+        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> None:
+        """Embed the passages the cache lacks, at most WARM_BATCH per embed
+        call, and cache each batch in its own short transaction(). Writes
+        nothing else, so a caller runs it without holding its write lock and
+        the locked catch_up or rebuild then reads the cache. An EmbeddingError
+        keeps the batches cached before it."""
+        model = self._embedder.model
+        todo = [t for t in dict.fromkeys(texts) if self._backend.cached(model, text_digest(t)) is None]
+        for i in range(0, len(todo), WARM_BATCH):
+            chunk = todo[i : i + WARM_BATCH]
+            vectors = self._embed(chunk, "passage")
+            with transaction():
+                for text, vector in zip(chunk, vectors, strict=True):
+                    self._backend.cache(model, text_digest(text), vector)
+
+    def warm_knowledge(
+        self,
+        items: Iterable[Knowledge],
+        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> None:
+        """warm() for knowledge passages, ahead of a rebuild."""
+        self.warm([_passage(item) for item in items], transaction)
 
     def prepare_knowledge(self, item: Knowledge) -> None:
         """Embed and cache an item's passage without writing its vector, so a
@@ -94,20 +149,25 @@ class Index:
 
     # ── internals ───────────────────────────────────────────────────────────
 
-    def _passage_vector(self, text: str) -> list[float]:
+    def _passage_vector(self, text: str, embed: bool = True) -> list[float]:
         model, digest = self._embedder.model, text_digest(text)
         found = self._backend.cached(model, digest)
         if found is not None:
             return found
+        if not embed:
+            raise PassageNotCached(text)
         vector = self._embed_one(text, "passage")
         self._backend.cache(model, digest, vector)
         return vector
 
+    def _embed(self, texts: list[str], kind: EmbedKind) -> list[list[float]]:
+        out = self._embedder.embed(texts, kind)
+        if len(out) != len(texts):
+            raise EmbeddingError(f"embedder returned {len(out)} vectors for {len(texts)} texts")
+        return [[float(x) for x in vector] for vector in out]
+
     def _embed_one(self, text: str, kind: EmbedKind) -> list[float]:
-        out = self._embedder.embed([text], kind)
-        if len(out) != 1:
-            raise EmbeddingError(f"embedder returned {len(out)} vectors for 1 text")
-        return [float(x) for x in out[0]]
+        return self._embed([text], kind)[0]
 
     def _group_for(self, vector: list[float], scope: Scope, owner: str, event_id: str) -> str:
         """Single link within the cell: join the group of the closest member if

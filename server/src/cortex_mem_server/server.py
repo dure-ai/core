@@ -57,6 +57,10 @@ ENGINE_ALIASES = {
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
 log = logging.getLogger("cortex_mem_server")
+# A promoted item is embedded while SQLite's write lock is held (one call per
+# promoted item); every other passage is embedded outside it. Below the busy
+# timeout, so another session's write still gets in after a stalled call.
+UPSTAGE_TIMEOUT_S = 4.0
 
 
 def _narrow(requested: Scope | None, default: Scope) -> Scope:
@@ -287,7 +291,7 @@ def _embedder() -> Embedder | None:
         if missing:
             raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER=upstage also needs {', '.join(missing)}")
         try:
-            return UpstageEmbedder(key, passage, query)
+            return UpstageEmbedder(key, passage, query, timeout=UPSTAGE_TIMEOUT_S)
         except ValueError:
             pass  # exit after the handler, so nothing is chained; the message names no value
 

@@ -2,6 +2,9 @@
 transaction before it is delivered, engines read similarity through
 ctx.similar, and a changed index version replays the engine (spec §7)."""
 
+import sqlite3
+import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -388,3 +391,103 @@ def test_index_and_engine_cursors_move_together(store, tmp_path):
     assert db.vectors.indexed() == rt.state.cursor() == 3
     rt.append(ev("e4", "more words"))
     assert db.vectors.indexed() == rt.state.cursor() == 4
+
+
+# ── embedding outside SQLite's write lock ───────────────────────────────────
+
+
+class BatchCountingEmbedder(CountingEmbedder):
+    def __init__(self, inner=None):
+        super().__init__(inner)
+        self.batches = []
+
+    def embed(self, texts, kind):
+        self.batches.append(list(texts))
+        return super().embed(texts, kind)
+
+
+class SlowEmbedder(CountingEmbedder):
+    """Takes `delay` seconds per call and says when the first call began."""
+
+    def __init__(self, delay, model="slow"):
+        super().__init__()
+        self.model = model
+        self.delay = delay
+        self.started = threading.Event()
+
+    def embed(self, texts, kind):
+        self.started.set()
+        time.sleep(self.delay)
+        return super().embed(texts, kind)
+
+
+def test_sync_embeds_the_pending_passages_in_one_batch():
+    db = InMemoryDatabase()
+    emb = BatchCountingEmbedder()
+    engine = ProbeEngine()
+    rt = runtime(engine, db, emb)
+    rt.sync()  # builds the empty index
+    # Appended by other processes, not yet delivered here.
+    for i in range(5):
+        db.events.append(ev(f"e{i}", f"fact number {i}"))
+    db.events.append(ev("o1", "done", kind="outcome", outcome="success", refs=("e0",)))
+    db.events.append(ev("e5", "fact number 0"))  # a text seen before
+
+    assert rt.sync() == 7
+
+    assert emb.batches == [[f"fact number {i}" for i in range(5)]]
+    assert engine.groups["e5"].members == ("e0", "e5")
+
+
+@pytest.mark.parametrize("phase", ["events", "rebuild"])
+def test_another_connection_can_append_while_core_embeds(phase, tmp_path):
+    path = tmp_path / "core.db"
+    db = SqliteDatabase(path)
+    emb = SlowEmbedder(delay=0.5)
+    engine = ProbeEngine()
+    if phase == "events":
+        rt = runtime(engine, db, emb)
+        rt.sync()  # index built, nothing to embed yet
+        db.events.append(ev("e1", "slow words"))
+    else:
+        db.knowledge.put(item("k1", ("e0",), body="slow knowledge"))  # the new model must embed it
+        rt = runtime(engine, db, emb)
+    other = SqliteDatabase(path)
+    other.con.execute("PRAGMA busy_timeout = 50")  # far shorter than one embedding
+    errors = []
+
+    def deliver():
+        try:
+            rt.sync()
+        except (sqlite3.Error, EmbeddingError) as exc:  # reported below; anything else fails loudly
+            errors.append(exc)
+
+    worker = threading.Thread(target=deliver)
+    worker.start()
+    assert emb.started.wait(5)
+    try:
+        other.events.append(ev("x1", "appended meanwhile", user="u2"))  # raised "database is locked" before
+    finally:
+        worker.join(10)
+    assert errors == []
+    assert [e.id for _, e in other.events.since(0)][-1] == "x1"
+    rt.sync()
+    assert "x1" in engine.seen
+
+
+def test_a_failing_text_in_a_warm_batch_stops_only_its_own_event():
+    db = InMemoryDatabase()
+    emb = FailingEmbedder({"boom"})  # fails any batch that contains it
+    engine = ProbeEngine()
+    rt = runtime(engine, db, emb)
+    rt.sync()
+    for e in [ev("e1", "fine"), ev("e2", "boom"), ev("e3", "fine too")]:
+        db.events.append(e)
+
+    with pytest.raises(EmbeddingError):
+        rt.sync()
+
+    assert engine.seen == ["e1"]  # delivered although its batch failed
+    assert (rt.state.cursor(), db.vectors.indexed(), rt.skipped) == (1, 1, [])
+    emb.fail_on.clear()
+    assert rt.sync() == 2

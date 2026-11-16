@@ -28,6 +28,7 @@ from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
 
 SCHEMA_VERSION = 4
+BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's write lock
 
 _WORD = re.compile(r"\w+")
 _HANGUL = re.compile(r"[가-힣]")
@@ -88,7 +89,7 @@ class SqliteDatabase:
         self.con = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._lock = threading.RLock()
         self._depth = 0
-        self.con.execute("PRAGMA busy_timeout = 5000")
+        self.con.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         self._create()
         self.events = SqliteEventStore(self)
         self.knowledge = SqliteKnowledgeBase(self)
