@@ -37,6 +37,8 @@ class TestInMemoryVectorBackend(VectorBackendContract):
 
 
 class TestInMemoryDatabase(DatabaseContract):
+    rolls_back = False  # one process, transaction() is nullcontext
+
     def make(self, tmp_path):
         db = InMemoryDatabase()
         return lambda: db

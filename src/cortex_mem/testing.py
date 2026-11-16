@@ -393,7 +393,14 @@ class _Counting:
 
 class DatabaseContract:
     """make(tmp_path) returns a zero-argument opener. Each call to it is one
-    more process (connection) on the same storage."""
+    more process (connection) on the same storage.
+
+    `rolls_back`: whether transaction() undoes the writes made inside it when
+    it raises. A durable store must; a single-process store whose
+    transaction() is nullcontext sets it False (delivery then stays all or
+    nothing because the runtime writes only after everything that can fail)."""
+
+    rolls_back = True
 
     def make(self, tmp_path) -> Any:
         raise NotImplementedError
@@ -498,3 +505,35 @@ class DatabaseContract:
         later = []
         self.runtime(open_db, _Counting(later, state_version="2")).sync()
         assert later == []
+
+    def test_vector_writes_roll_back_with_the_transaction(self, open_db):
+        if not self.rolls_back:
+            pytest.skip("this store's transaction() does not roll back")
+        db = open_db()
+        vb = db.vectors  # every Database has one, embeddings in use or not
+        vb.reset({"model": "m1", "group_threshold": 0.9})
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        vb.put_group("e1", "e1", "team", "t1", 1)
+        vb.put_vector("knowledge", "k1", [0.0, 1.0])
+        vb.cache("m1", "d1", [0.5, 0.5])
+        vb.set_indexed(1)
+
+        def snapshot(v):
+            return (
+                v.meta(), v.indexed(), list(v.vectors("event")), list(v.vectors("knowledge")),
+                v.members("e1"), v.group_of("e2"), v.cached("m1", "d1"), v.cached("m1", "d2"),
+            )
+
+        before = snapshot(vb)
+        with pytest.raises(RuntimeError, match="boom"), db.transaction():
+            vb.put_vector("event", "e2", [0.0, 1.0])
+            vb.put_group("e2", "e1", "team", "t1", 2)
+            vb.put_vector("knowledge", "k1", [9.0, 9.0])
+            vb.delete_vectors("event", ["e1"])
+            vb.cache("m1", "d2", [0.1, 0.2])
+            vb.set_indexed(2)
+            vb.reset({"model": "m2", "group_threshold": 0.5})
+            raise RuntimeError("boom")
+
+        assert snapshot(vb) == before
+        assert snapshot(open_db().vectors) == before  # another connection sees the same
