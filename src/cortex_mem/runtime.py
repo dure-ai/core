@@ -287,9 +287,10 @@ class Runtime:
         none), rebuild it; and when this engine's state was built on another
         version than the current one, or the index was just rebuilt (it starts
         again at position 0, behind this engine's cursor), reset the state and
-        deliver from the start, as a changed state_version does. The state keeps its version:
-        the engine's, else the stored one. Knowledge passages are embedded
-        before the transaction; the rebuild inside it only reads the cache."""
+        deliver from the start, as a changed state_version does. The state
+        keeps its version: the engine's, else the stored one. Knowledge
+        passages are embedded before the transaction; the rebuild inside it
+        only reads the cache."""
         if self.index is None:
             return
         while True:
