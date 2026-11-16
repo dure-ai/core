@@ -31,12 +31,21 @@ class Embedder(Protocol):
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    """Cosine similarity of two vectors; 0.0 if either is a zero vector."""
-    na = math.sqrt(math.fsum(x * x for x in a))
-    nb = math.sqrt(math.fsum(x * x for x in b))
-    if na == 0.0 or nb == 0.0:
+    """Cosine similarity of two vectors; 0.0 if either is a zero vector.
+    Raises ValueError when the lengths differ (vectors of two models).
+
+    One square root of the product of the squared norms: for identical
+    vectors that is the squared norm itself, so the result is exactly 1.0."""
+    if len(a) != len(b):
+        raise ValueError(f"cosine of vectors with different lengths: {len(a)} and {len(b)}")
+    na2 = math.fsum(x * x for x in a)
+    nb2 = math.fsum(x * x for x in b)
+    if na2 == 0.0 or nb2 == 0.0:
         return 0.0
-    return math.fsum(x * y for x, y in zip(a, b)) / (na * nb)
+    norms = math.sqrt(na2 * nb2)
+    if norms == 0.0 or math.isinf(norms):  # the product left float range; each factor did not
+        norms = math.sqrt(na2) * math.sqrt(nb2)
+    return math.fsum(x * y for x, y in zip(a, b, strict=True)) / norms
 
 
 def text_digest(text: str) -> str:

@@ -67,3 +67,27 @@ def test_embed_keeps_input_order():
     both = emb.embed(["a b", "c d"], "passage")
     assert both[0] == emb.embed(["a b"], "passage")[0]
     assert both[1] == emb.embed(["c d"], "passage")[0]
+
+
+def test_cosine_of_identical_vectors_is_exactly_one():
+    import random
+
+    rng = random.Random(20261115)
+    for _ in range(300):
+        v = [rng.gauss(0, 1) for _ in range(1024)]
+        assert cosine(v, list(v)) == 1.0
+        scaled = [x * 3.0 for x in v]
+        assert cosine(scaled, scaled) == 1.0
+
+
+def test_cosine_rejects_vectors_of_different_lengths():
+    with pytest.raises(ValueError, match="length"):
+        cosine([1.0, 0.0, 0.0], [1.0, 0.0])
+    with pytest.raises(ValueError, match="length"):
+        cosine([0.0], [0.0, 0.0])  # even when either is a zero vector
+
+
+def test_cosine_survives_a_product_of_norms_out_of_float_range():
+    # Each squared norm fits in a float64; their product does not.
+    assert cosine([1e-100, 0.0], [1e-100, 1e-100]) == pytest.approx(2**-0.5)
+    assert cosine([1e100, 0.0], [1e100, 1e100]) == pytest.approx(2**-0.5)
