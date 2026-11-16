@@ -57,9 +57,11 @@ ENGINE_ALIASES = {
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
 log = logging.getLogger("cortex_mem_server")
-# A promoted item is embedded while SQLite's write lock is held (one call per
-# promoted item); every other passage is embedded outside it. Below the busy
-# timeout, so another session's write still gets in after a stalled call.
+# Two things are embedded while SQLite's write lock is held: a promoted item
+# (one call per item) and an engine's query text in ctx.similar.search or
+# .knowledge during observe/tick (engines should prefer group/neighbors there).
+# Every other passage is embedded outside it. Below the busy timeout, so
+# another session's write still gets in after a stalled call.
 UPSTAGE_TIMEOUT_S = 4.0
 
 
