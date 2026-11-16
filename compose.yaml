@@ -5,7 +5,7 @@ services:
   pg:
     image: pgvector/pgvector:pg17
     ports:
-      - "54329:5432"
+      - "127.0.0.1:54329:5432"
     environment:
       # Local tests only. Never reuse this value anywhere real.
       POSTGRES_PASSWORD: cortex
