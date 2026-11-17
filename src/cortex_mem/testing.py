@@ -441,12 +441,13 @@ class VectorBackendContract(_Contract):
         assert vb.vector("event", "e3") == [1.0]
 
     def test_put_vector_replaces_the_same_id(self, vb):
-        vb.put_vector("event", "e1", [1.0])
-        vb.put_vector("event", "e2", [2.0])
+        # One dimension throughout: PostgreSQL refuses mixed dimensions in an index version.
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        vb.put_vector("event", "e2", [2.0, 0.0])
         vb.put_vector("event", "e1", [9.0, 8.0])
 
         assert vb.vector("event", "e1") == [9.0, 8.0]
-        assert list(vb.vectors("event")) == [("e1", [9.0, 8.0]), ("e2", [2.0])]
+        assert list(vb.vectors("event")) == [("e1", [9.0, 8.0]), ("e2", [2.0, 0.0])]
 
     def test_delete_vectors_removes_only_the_named_ids(self, vb):
         for id in ("e1", "e2", "e3"):

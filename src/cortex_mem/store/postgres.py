@@ -13,9 +13,9 @@ Tables are created in the connection's current schema (the first one on ``search
 never a hard-coded one.
 
 ``PgEventStore`` (``db.events``) is the append-only event log and ``PgKnowledgeStore``
-(``db.knowledge``) the knowledge base, both with BM25 text search. The state and vector
-stores land on top of this in later steps; until then
-``vectors`` and ``state()`` raise ``NotImplementedError``.
+(``db.knowledge``) the knowledge base, both with BM25 text search. ``PgStateBackend``
+(``db.state(name)``) keeps engine state, and ``PgVectorBackend`` (``db.vectors``) keeps
+pgvector vectors and scores cosine similarity in SQL (spec §6).
 
 Shared SQL fragments are written with ``:name`` parameters and turned into psycopg's
 ``%(name)s`` by ``pg_params``. That rewrite does not parse string literals, so it would
@@ -25,16 +25,19 @@ must be written ``%%``. The shared fragments contain neither.
 
 import hashlib
 import json
+import logging
 import re
 import threading
+from array import array
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
+from ..embed import float32
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, pg_params, words
 
@@ -158,6 +161,7 @@ class PostgresDatabase:
         self._depth = 0
         self._events = PgEventStore(self)
         self._knowledge = PgKnowledgeStore(self)
+        self._vectors = PgVectorBackend(self)
         try:
             require_vector_type(self.con)
             self._create()
@@ -194,8 +198,8 @@ class PostgresDatabase:
         return self._knowledge
 
     @property
-    def vectors(self) -> Any:
-        raise NotImplementedError("the PostgreSQL vector store is not implemented yet")
+    def vectors(self) -> "PgVectorBackend":
+        return self._vectors
 
     def state(self, engine: str) -> "PgStateBackend":
         return PgStateBackend(self, engine)
@@ -570,3 +574,338 @@ class PgStateBackend:
                 "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version",
                 (self.engine, version),
             )
+
+
+log = logging.getLogger(__name__)
+
+HNSW_MAX_DIM = 4000  # halfvec's HNSW limit; larger vectors are searched exactly
+_HNSW_TABLES = ("event_vectors", "knowledge_vectors")
+_KINDS = {"event": "event_vectors", "knowledge": "knowledge_vectors"}
+
+
+def _literal(vector: list[float]) -> str:
+    """pgvector's text form. repr() of a float32-rounded value parses back to that same
+    float32 (pgvector reads components with strtof)."""
+    return "[" + ",".join(repr(x) for x in vector) + "]"
+
+
+def _as_float32(values: list[float]) -> list[float]:
+    """emb::real[] as Python floats of exactly the stored float32 values, whatever text
+    form the driver parsed them from."""
+    return array("f", values).tolist()
+
+
+def _hnsw_name(table: str, dim: int) -> str:
+    return f"{table}_hnsw_d{dim}"
+
+
+# Cosine distance to the query, with pgvector's NaN for a zero vector read as distance 1
+# (score 0), which is what cortex_mem.embed.cosine gives. PostgreSQL sorts NaN above every
+# number and NaN > 0 is true there, so it must not reach ORDER BY or the score filter.
+_DIST = "coalesce(nullif(v.emb <=> %(q)s::vector, 'NaN'), 1)"
+_EVENT_FROM = (
+    "FROM vector_groups g JOIN event_vectors v ON v.event_id = g.event_id "
+    "JOIN events e ON e.id = g.event_id"
+)
+_KNOWLEDGE_FROM = "FROM knowledge_vectors v JOIN knowledge k ON k.id = v.id"
+
+
+class PgVectorBackend:
+    """Vectors as pgvector ``vector`` (float32), cosine computed in SQL: score =
+    1 - (emb <=> q). The searches join events and knowledge under the shared visibility
+    SQL, so one statement picks, scores and ranks. Exact by default; with
+    ``vector_index="hnsw"`` the searches (never nearest_member) take candidates from an
+    HNSW index on emb::halfvec(D) and rank them by the exact score.
+
+    Every vector of one index version has one dimension D, kept in vector_meta as 'dim'
+    from the first put after reset(); a vector or query of another dimension raises
+    ValueError before anything is written. The embedding cache holds any dimension.
+    """
+
+    kind = "postgres"
+
+    def __init__(self, db: PostgresDatabase) -> None:
+        self.db = db
+
+    # Index state
+
+    def _get_meta(self, key: str) -> str | None:
+        rows = self.db.query("SELECT value FROM vector_meta WHERE key = %s", (key,))
+        return rows[0][0] if rows else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self.db.con.execute(
+            "INSERT INTO vector_meta (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, value),
+        )
+
+    def meta(self) -> dict | None:
+        value = self._get_meta("meta")
+        return json.loads(value) if value is not None else None
+
+    def reset(self, meta: dict) -> None:
+        encoded = json.dumps(meta)
+        with self.db.transaction():
+            con = self.db.con
+            for name in self._hnsw_indexes():
+                con.execute(f'DROP INDEX IF EXISTS "{name}"')
+            for table in ("event_vectors", "knowledge_vectors", "vector_groups"):
+                con.execute(f"DELETE FROM {table}")
+            con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
+            self._set_meta("meta", encoded)
+
+    def indexed(self) -> int:
+        value = self._get_meta("indexed")
+        return int(value) if value is not None else 0
+
+    def set_indexed(self, seq: int) -> None:
+        with self.db.transaction():
+            self._set_meta("indexed", str(seq))
+
+    # Dimension and the HNSW index
+
+    def _dim(self) -> int | None:
+        """D of this index version: recorded, or else taken from a stored vector."""
+        value = self._get_meta("dim")
+        if value is not None:
+            return int(value)
+        rows = self.db.query(
+            "SELECT vector_dims(emb) FROM event_vectors UNION ALL "
+            "SELECT vector_dims(emb) FROM knowledge_vectors LIMIT 1"
+        )
+        return rows[0][0] if rows else None
+
+    def _check_dim(self, vector: list[float], dim: int | None) -> None:
+        if not vector:
+            raise ValueError("a vector must have at least one dimension")
+        if dim is not None and len(vector) != dim:
+            raise ValueError(
+                f"vector dimension {len(vector)} differs from this index version's dimension {dim}; "
+                "reset the index to change models"
+            )
+
+    def _hnsw_dim(self, dim: int | None) -> int | None:
+        """D when the searches go through the HNSW index, else None."""
+        if self.db.vector_index != "hnsw" or dim is None or dim > HNSW_MAX_DIM:
+            return None
+        return dim
+
+    def _hnsw_indexes(self) -> list[str]:
+        rows = self.db.query(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+            "AND tablename = ANY(%s) AND indexname ~ '_hnsw_d[0-9]+$'",
+            (list(_HNSW_TABLES),),
+        )
+        return [r[0] for r in rows]
+
+    def _record_dim(self, dim: int) -> None:
+        """Record D for this index version and build its HNSW indexes when they are on."""
+        self._set_meta("dim", str(dim))
+        if self.db.vector_index != "hnsw":
+            return
+        if dim > HNSW_MAX_DIM:
+            log.warning(
+                "vectors have %d dimensions, more than HNSW's %d for halfvec; searching exactly",
+                dim, HNSW_MAX_DIM,
+            )  # fmt: skip
+            return
+        for table in _HNSW_TABLES:
+            self.db.con.execute(
+                f"CREATE INDEX IF NOT EXISTS {_hnsw_name(table, dim)} ON {table} "
+                f"USING hnsw ((emb::halfvec({dim})) halfvec_cosine_ops)"
+            )
+
+    # Vectors
+
+    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+        table = _KINDS[kind]
+        values = float32(vector)
+        with self.db.transaction():
+            dim = self._dim()
+            self._check_dim(values, dim)  # before any write, so the transaction stays usable
+            if self._get_meta("dim") is None:
+                self._record_dim(len(values))
+            if kind == "event":
+                # ord is assigned on first insert; replacing keeps it (and the position).
+                self.db.con.execute(
+                    "INSERT INTO event_vectors (event_id, ord, emb) VALUES "
+                    "(%s, (SELECT coalesce(max(ord), 0) + 1 FROM event_vectors), %s::vector) "
+                    "ON CONFLICT (event_id) DO UPDATE SET emb = EXCLUDED.emb",
+                    (id, _literal(values)),
+                )
+            else:
+                self.db.con.execute(
+                    f"INSERT INTO {table} (id, emb) VALUES (%s, %s::vector) "
+                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb",
+                    (id, _literal(values)),
+                )
+
+    def vector(self, kind: str, id: str) -> list[float] | None:
+        key = "event_id" if kind == "event" else "id"
+        rows = self.db.query(f"SELECT emb::real[] FROM {_KINDS[kind]} WHERE {key} = %s", (id,))
+        return _as_float32(rows[0][0]) if rows else None
+
+    def vectors(self, kind: str, upto: int | None = None) -> Iterator[tuple[str, list[float]]]:
+        if kind == "knowledge":
+            if upto is not None:
+                raise ValueError("upto bounds event vectors only")
+            rows = self.db.query('SELECT id, emb::real[] FROM knowledge_vectors ORDER BY id COLLATE "C"')
+        elif upto is None:
+            rows = self.db.query("SELECT event_id, emb::real[] FROM event_vectors ORDER BY ord")
+        else:
+            rows = self.db.query(
+                "SELECT v.event_id, v.emb::real[] FROM event_vectors v "
+                "JOIN vector_groups g ON g.event_id = v.event_id WHERE g.seq <= %s ORDER BY v.ord",
+                (upto,),
+            )
+        for id, values in rows:
+            yield id, _as_float32(values)
+
+    def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
+        key = "event_id" if kind == "event" else "id"
+        with self.db.transaction():
+            self.db.con.execute(f"DELETE FROM {_KINDS[kind]} WHERE {key} = ANY(%s)", (list(ids),))
+
+    # Groups
+
+    def put_group(self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO vector_groups (event_id, group_id, scope, owner, seq) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (event_id) DO UPDATE SET group_id = EXCLUDED.group_id, scope = EXCLUDED.scope, "
+                "owner = EXCLUDED.owner, seq = EXCLUDED.seq",
+                (event_id, group_id, scope, owner, seq),
+            )
+
+    def group_of(self, event_id: str) -> str | None:
+        rows = self.db.query("SELECT group_id FROM vector_groups WHERE event_id = %s", (event_id,))
+        return rows[0][0] if rows else None
+
+    def members(self, group_id: str, upto: int | None = None) -> list[str]:
+        sql = "SELECT event_id FROM vector_groups WHERE group_id = %(group)s"
+        if upto is not None:
+            sql += " AND seq <= %(upto)s"
+        rows = self.db.query(sql + ' ORDER BY seq, event_id COLLATE "C"', {"group": group_id, "upto": upto})
+        return [r[0] for r in rows]
+
+    def partition(self, scope: Scope, owner: str) -> list[str]:
+        rows = self.db.query(
+            "SELECT event_id FROM vector_groups WHERE scope = %s AND owner = %s "
+            'ORDER BY seq, event_id COLLATE "C"',
+            (scope, owner),
+        )
+        return [r[0] for r in rows]
+
+    # Embedding cache: any dimension, since models differ.
+
+    def cached(self, model: str, digest: str) -> list[float] | None:
+        rows = self.db.query(
+            "SELECT emb::real[] FROM embed_cache WHERE model = %s AND digest = %s", (model, digest)
+        )
+        return _as_float32(rows[0][0]) if rows else None
+
+    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None:
+        values = float32(vector)
+        if not values:
+            raise ValueError("a vector must have at least one dimension")
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO embed_cache (model, digest, emb) VALUES (%s, %s, %s::vector) "
+                "ON CONFLICT (model, digest) DO UPDATE SET emb = EXCLUDED.emb",
+                (model, digest, _literal(values)),
+            )
+
+    # Similarity
+
+    def _query(self, vector: Sequence[float]) -> tuple[str, int | None]:
+        """The query as a pgvector literal, and D; ValueError on a bad query."""
+        values = float32(vector)
+        dim = self._dim()
+        self._check_dim(values, dim)
+        return _literal(values), dim
+
+    def nearest_member(
+        self, scope: Scope, owner: str, vector: Sequence[float], upto: int
+    ) -> tuple[str, float] | None:
+        q, _ = self._query(vector)
+        rows = self.db.query(
+            f"SELECT g.event_id, 1 - {_DIST} AS score "
+            "FROM vector_groups g JOIN event_vectors v ON v.event_id = g.event_id "
+            "WHERE g.scope = %(scope)s AND g.owner = %(owner)s AND g.seq <= %(upto)s "
+            f'ORDER BY {_DIST}, g.seq, g.event_id COLLATE "C" LIMIT 1',
+            {"q": q, "scope": scope, "owner": owner, "upto": upto},
+        )
+        return (rows[0][0], rows[0][1]) if rows else None
+
+    def _ranked(self, candidates: str, ties: str, params: dict[str, Any], k: int, dim: int | None) -> list:
+        """(id, score) of the best k rows of ``candidates``, a SELECT of ``id``, its tie
+        columns and ``dist`` (already limited to dist < 1, i.e. score > 0) whose FROM has
+        ``v`` as the vector table. Exact unless the HNSW index is on: then the index picks
+        candidates by halfvec distance and they are ranked here by the exact one."""
+        params = {**params, "k": k}
+        rank = f"ORDER BY dist, {ties} LIMIT %(k)s"
+        hnsw = self._hnsw_dim(dim)
+        if hnsw is None:
+            return self.db.query(f"SELECT id, 1 - dist FROM ({candidates}) c {rank}", params)
+        params["n"] = max(4 * k, 40)
+        sql = (
+            f"SELECT id, 1 - dist FROM ({candidates} "
+            f"ORDER BY (v.emb::halfvec({hnsw})) <=> %(q)s::halfvec({hnsw}) LIMIT %(n)s) c {rank}"
+        )
+        with self.db._lock:
+            if self.db._depth > 0:  # inside a write transaction: SET LOCAL lasts until it ends
+                self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+                return self.db.con.execute(sql, params).fetchall()
+            # A read-only transaction of its own, so SET LOCAL has one to live in; it takes
+            # no advisory lock, so a search never waits for writers.
+            self.db.con.execute("BEGIN READ ONLY")
+            try:
+                self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+                rows = self.db.con.execute(sql, params).fetchall()
+            finally:
+                self.db._rollback()
+            return rows
+
+    def search_events(
+        self,
+        vector: Sequence[float],
+        caller: Caller,
+        scope: Scope,
+        k: int,
+        kinds: Collection[Kind] | None = None,
+        upto: int | None = None,
+        exclude: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if k <= 0 or (kinds is not None and not kinds):
+            return []
+        q, dim = self._query(vector)
+        sql = (
+            f"SELECT g.event_id AS id, g.seq AS seq, {_DIST} AS dist {_EVENT_FROM} "
+            f"WHERE {pg_params(EVENT_VISIBLE_SQL)} AND {_DIST} < 1"
+        )
+        params: dict[str, Any] = {"q": q, "user": caller.user, "team": caller.team, "scope": scope}
+        if upto is not None:
+            sql += " AND g.seq <= %(upto)s"
+            params["upto"] = upto
+        if kinds is not None:
+            sql += " AND e.kind = ANY(%(kinds)s)"
+            params["kinds"] = list(kinds)
+        if exclude is not None:
+            sql += " AND g.event_id <> %(exclude)s"
+            params["exclude"] = exclude
+        return self._ranked(sql, 'seq, id COLLATE "C"', params, k, dim)
+
+    def search_knowledge(
+        self, vector: Sequence[float], caller: Caller, scope: Scope, k: int
+    ) -> list[tuple[str, float]]:
+        if k <= 0:
+            return []
+        q, dim = self._query(vector)
+        sql = (
+            f"SELECT v.id AS id, {_DIST} AS dist {_KNOWLEDGE_FROM} "
+            f"WHERE {pg_params(KNOWLEDGE_VISIBLE_SQL)} AND {_DIST} < 1"
+        )
+        params = {"q": q, "user": caller.user, "team": caller.team, "scope": scope}
+        return self._ranked(sql, 'id COLLATE "C"', params, k, dim)

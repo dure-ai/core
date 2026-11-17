@@ -3,6 +3,8 @@
 Every test uses the ``pg_schema`` fixture, so all of them skip without ``CORTEX_TEST_PG_URL``.
 """
 
+import math
+import random
 import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -19,6 +21,7 @@ from cortex_mem.testing import (
     EngineStateBackendContract,
     EventStoreContract,
     KnowledgeStoreContract,
+    VectorBackendContract,
     caller,
     ev,
     item,
@@ -485,3 +488,159 @@ class TestPgState(EngineStateBackendContract):
         b.reset("9")
         assert (a.get("k"), a.cursor(), a.version()) == ("from a", 2, None)
         assert list(a.scan()) == [("k", "from a"), ("only-a", 1)]
+
+
+def _hnsw_indexes(db: PostgresDatabase) -> set[str]:
+    rows = db.query(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+        "AND tablename IN ('event_vectors', 'knowledge_vectors') AND indexdef LIKE '%%hnsw%%'"
+    )
+    return {r[0] for r in rows}
+
+
+class TestPgVectors(VectorBackendContract):
+    """The shared vector contract on PostgreSQL (pgvector), plus dimensions and HNSW."""
+
+    @pytest.fixture(autouse=True)
+    def _databases(self, pg_schema):
+        self.url = pg_schema
+        self.dbs: list[PostgresDatabase] = []
+        yield
+        for db in self.dbs:
+            db.close()
+
+    def open(self, vector_index: str = "none") -> PostgresDatabase:
+        db = PostgresDatabase(self.url, vector_index=vector_index)
+        self.dbs.append(db)
+        return db
+
+    def make(self):
+        return self.open()
+
+    def test_vectors_is_one_backend_per_database(self, db):
+        assert db.vectors is db.vectors
+        assert db.vectors.kind == "postgres"
+
+    def test_mixed_dimensions_in_one_index_version_are_refused(self, db, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        with pytest.raises(ValueError, match="dimension"):
+            vb.put_vector("event", "e2", [1.0, 0.0, 0.0])
+        with pytest.raises(ValueError, match="dimension"):
+            vb.put_vector("knowledge", "k1", [1.0])
+        with pytest.raises(ValueError, match="dimension"):
+            vb.put_vector("event", "e1", [1.0])  # replacing does not change it either
+        with pytest.raises(ValueError):
+            vb.put_vector("event", "e3", [])
+        # Refused before anything is written, so a surrounding transaction still commits.
+        with db.transaction():
+            with pytest.raises(ValueError):
+                vb.put_vector("event", "e4", [1.0, 0.0, 0.0])
+            vb.put_vector("event", "e5", [0.0, 1.0])
+        assert [i for i, _ in vb.vectors("event")] == ["e1", "e5"]
+        assert list(vb.vectors("knowledge")) == []
+        # The cache is not an index: other models may have other dimensions.
+        vb.cache("m2", "d1", [1.0, 2.0, 3.0])
+        assert vb.cached("m2", "d1") == [1.0, 2.0, 3.0]
+        # A query of another dimension is refused too, rather than failing in pgvector.
+        with pytest.raises(ValueError, match="dimension"):
+            vb.search_events([1.0], caller(), "org", 5)
+        # A new index version may have a new dimension.
+        vb.reset({"model": "m2", "group_threshold": 0.8})
+        vb.put_vector("event", "e1", [1.0, 0.0, 0.0])
+        assert vb.vector("event", "e1") == [1.0, 0.0, 0.0]
+
+    def test_non_finite_vectors_are_refused(self, db, vb):
+        for bad in ([math.nan, 0.0], [math.inf, 0.0], [1e39, 0.0]):
+            with pytest.raises(ValueError):
+                vb.put_vector("event", "e1", bad)
+            with pytest.raises(ValueError):
+                vb.put_vector("knowledge", "k1", bad)
+            with pytest.raises(ValueError):
+                vb.cache("m1", "d1", bad)
+            with pytest.raises(ValueError):
+                vb.search_events(bad, caller(), "org", 5)
+            with pytest.raises(ValueError):
+                vb.search_knowledge(bad, caller(), "org", 5)
+            with pytest.raises(ValueError):
+                vb.nearest_member("team", "t1", bad, 10)
+        assert list(vb.vectors("event")) == list(vb.vectors("knowledge")) == []
+        assert vb.cached("m1", "d1") is None
+
+    def test_zero_vectors_score_zero_as_in_python(self, db, vb):
+        # pgvector gives NaN for the cosine of a zero vector; the other stores give 0.0.
+        rows = [("a", [0.0, 0.0]), ("b", [0.0, 1.0]), ("c", [1.0, 0.0])]
+        for seq, (id, vector) in enumerate(rows, start=1):
+            self.index_event(db, ev(id, scope="team"), vector, seq)
+        assert vb.nearest_member("team", "t1", [0.0, 0.0], 10) == ("a", 0.0)
+        assert vb.nearest_member("team", "t1", [-1.0, 0.0], 10) == ("a", 0.0)
+        assert [i for i, _ in vb.search_events([1.0, 0.0], caller(), "team", 5)] == ["c"]
+        assert vb.search_events([0.0, 0.0], caller(), "team", 5) == []
+
+    def test_reset_drops_vectors_and_the_hnsw_index_but_keeps_the_cache(self):
+        db = self.open("hnsw")
+        vb = db.vectors
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.cache("m1", "d1", [0.5, 0.5])
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        vb.put_vector("knowledge", "k1", [1.0, 0.0])
+        vb.put_group("e1", "g1", "team", "t1", 1)
+        vb.set_indexed(3)
+        assert _hnsw_indexes(db) == {"event_vectors_hnsw_d2", "knowledge_vectors_hnsw_d2"}
+
+        vb.reset({"model": "m2", "group_threshold": 0.9})
+
+        assert _hnsw_indexes(db) == set()
+        assert list(vb.vectors("event")) == list(vb.vectors("knowledge")) == []
+        assert vb.group_of("e1") is None
+        assert vb.indexed() == 0
+        assert vb.cached("m1", "d1") == [0.5, 0.5]
+        # The next index version builds its own index for its own dimension.
+        vb.put_vector("event", "e1", [1.0, 0.0, 0.0])
+        assert _hnsw_indexes(db) == {"event_vectors_hnsw_d3", "knowledge_vectors_hnsw_d3"}
+        # A database without HNSW still drops an index another process left behind.
+        self.open("none").vectors.reset({"model": "m3", "group_threshold": 0.9})
+        assert _hnsw_indexes(db) == set()
+
+    def test_no_hnsw_index_without_the_setting(self, db, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        assert _hnsw_indexes(db) == set()
+
+    def test_hnsw_search_finds_the_exact_top_k_on_a_small_set(self):
+        exact, hnsw = self.open("none"), self.open("hnsw")
+        hnsw.vectors.reset({"model": "m1", "group_threshold": 0.8})
+        rng = random.Random(7)
+        dim = 8
+        owners = {"personal": "u1", "team": "t1", "org": "*"}
+        for seq in range(1, 51):
+            scope = ("personal", "team", "org")[seq % 3]
+            kind = "recall" if seq % 5 == 0 else "record"
+            vector = [rng.uniform(-1, 1) for _ in range(dim)]
+            self.index_event(hnsw, ev(f"e{seq:02d}", user=("u1", "u2")[seq % 2], scope=scope, kind=kind), vector, seq)
+            hnsw.knowledge.put(item(f"k{seq:02d}", scope=scope, owner=owners[scope]))
+            hnsw.vectors.put_vector("knowledge", f"k{seq:02d}", vector)
+        assert _hnsw_indexes(hnsw) == {f"event_vectors_hnsw_d{dim}", f"knowledge_vectors_hnsw_d{dim}"}
+
+        found = 0
+        for _ in range(10):
+            q = [rng.uniform(-1, 1) for _ in range(dim)]
+            for who, scope, k in ((("u1", "t1"), "org", 5), (("u2", "t1"), "team", 3), (("u1", "t1"), "personal", 10)):
+                me = caller(*who)
+                for kw in ({}, {"kinds": {"record"}, "upto": 40, "exclude": "e03"}):
+                    want = exact.vectors.search_events(q, me, scope, k, **kw)
+                    assert hnsw.vectors.search_events(q, me, scope, k, **kw) == want
+                    found += len(want)
+                want = exact.vectors.search_knowledge(q, me, scope, k)
+                assert hnsw.vectors.search_knowledge(q, me, scope, k) == want
+                found += len(want)
+        assert found > 100  # the comparison is not between empty lists
+
+    def test_too_many_dimensions_for_hnsw_warn_and_search_exactly(self, caplog):
+        db = self.open("hnsw")
+        vb = db.vectors
+        vb.reset({"model": "big", "group_threshold": 0.8})
+        self.index_event(db, ev("e1"), [1.0] * 4001, 1)
+        assert _hnsw_indexes(db) == set()
+        assert "4001" in caplog.text
+        assert vb.search_events([1.0] * 4001, caller(), "personal", 5) == [("e1", pytest.approx(1.0))]
