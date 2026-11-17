@@ -1,5 +1,6 @@
 """scripts/sqlite_to_pg.py: move a SQLite store into PostgreSQL (spec §9)."""
 
+import hashlib
 import importlib.util
 import sqlite3
 import subprocess
@@ -215,3 +216,115 @@ def test_the_password_never_appears_in_the_output(tmp_path, pg_schema):
     password = urlsplit(pg_schema).password
     result = run(str(path), pg_schema)
     assert password and password not in result.stdout + result.stderr
+
+
+# Fix round 1: the source is read from a snapshot and never changed.
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def pg_count(url, table):
+    pg = PostgresDatabase(url)
+    try:
+        return pg.query(f"SELECT count(*) FROM {table}")[0][0]
+    finally:
+        pg.close()
+
+
+def test_the_source_file_is_unchanged(tmp_path, pg_schema):
+    path = tmp_path / "core.db"
+    build_source(path)
+    before = sha(path)
+    assert run(str(path), pg_schema).returncode == 0
+    assert sha(path) == before
+
+
+def test_a_zero_byte_file_exits_2_and_stays_empty(tmp_path):
+    path = tmp_path / "empty.db"
+    path.write_bytes(b"")
+    result = run(str(path), "postgresql://u:hunter2pw@127.0.0.1:1/db")
+    assert result.returncode == 2
+    assert path.stat().st_size == 0
+
+
+def test_an_unrelated_sqlite_file_exits_2_and_is_not_touched(tmp_path):
+    path = tmp_path / "other.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE notes (a)")
+    con.commit()
+    con.close()
+    before = sha(path)
+    result = run(str(path), "postgresql://u:hunter2pw@127.0.0.1:1/db")
+    assert result.returncode == 2
+    assert "events" in result.stderr
+    assert sha(path) == before
+
+
+def test_a_read_only_source_migrates(tmp_path, pg_schema):
+    path = tmp_path / "core.db"
+    build_source(path)
+    path.chmod(0o444)
+    try:
+        result = run(str(path), pg_schema)
+    finally:
+        path.chmod(0o644)
+    assert result.returncode == 0, result.stderr
+    assert pg_count(pg_schema, "events") == 5
+
+
+def test_a_schema_4_source_warns_and_migrates_without_a_cache(tmp_path, pg_schema):
+    path = tmp_path / "core.db"
+    build_source(path)
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA user_version = 4")
+    con.commit()
+    con.close()
+    before = sha(path)
+    result = run(str(path), pg_schema)
+    assert result.returncode == 0, result.stderr
+    assert "re-embed" in result.stderr
+    assert pg_count(pg_schema, "events") == 5
+    assert pg_count(pg_schema, "embed_cache") == 0
+    assert sha(path) == before  # its cache is still there
+
+
+def test_a_non_finite_cache_vector_exits_2_naming_the_digest(tmp_path, pg_schema):
+    path = tmp_path / "core.db"
+    build_source(path)
+    con = sqlite3.connect(path)
+    digest = con.execute("SELECT digest FROM embed_cache LIMIT 1").fetchone()[0]
+    con.execute(
+        "UPDATE embed_cache SET vec = ? WHERE digest = ?",
+        (array("f", [float("nan"), 1.0]).tobytes(), digest),
+    )
+    con.commit()
+    con.close()
+    result = run(str(path), pg_schema)
+    assert result.returncode == 2
+    assert digest[:12] in result.stderr
+    assert "Traceback" not in result.stderr
+    for table in ("events", "knowledge", "engine_state", "engine_cursor", "embed_cache"):
+        assert pg_count(pg_schema, table) == 0
+
+
+def test_engine_rows_without_state_keys_copy_and_the_cache_count_matches(tmp_path, pg_schema):
+    path = tmp_path / "core.db"
+    build_source(path)
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO engine_cursor (engine, cursor, version) VALUES ('bare', 3, NULL)")
+    con.execute("INSERT INTO engine_cursor (engine, cursor, version) VALUES ('fresh', 0, 'v9')")
+    cached = con.execute("SELECT count(*) FROM embed_cache").fetchone()[0]
+    con.commit()
+    con.close()
+    result = run(str(path), pg_schema)
+    assert result.returncode == 0, result.stderr
+    pg = PostgresDatabase(pg_schema)
+    try:
+        assert (pg.state("bare").cursor(), pg.state("bare").version()) == (3, None)
+        assert (pg.state("fresh").cursor(), pg.state("fresh").version()) == (0, "v9")
+        assert list(pg.state("bare").scan()) == []
+        assert pg.query("SELECT count(*) FROM embed_cache")[0][0] == cached > 0
+    finally:
+        pg.close()

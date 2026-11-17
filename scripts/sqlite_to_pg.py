@@ -67,7 +67,10 @@ def _copy_cache(src, pg) -> None:
             raise MigrationError(f"embedding cache row {digest[:12]} is not a float32 vector")
         values = array("f")
         values.frombytes(blob)
-        pg.vectors.cache(model, digest, values.tolist())
+        try:
+            pg.vectors.cache(model, digest, values.tolist())
+        except ValueError as exc:
+            raise MigrationError(f"embedding cache row {digest[:12]} cannot be stored: {exc}") from None
 
 
 def migrate(src, pg) -> list[tuple[str, int, int]]:
@@ -88,9 +91,44 @@ def migrate(src, pg) -> list[tuple[str, int, int]]:
     return rows
 
 
+def _snapshot(path: Path, into: Path) -> Path:
+    """Copy the source with SQLite's backup API, read-only, and return the copy's path.
+
+    Raises MigrationError when the file is not a SQLite store with an events table."""
+    import sqlite3
+
+    try:
+        ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise MigrationError(f"cannot read {path}: {exc}") from None
+    try:
+        try:
+            has_events = ro.execute("SELECT 1 FROM sqlite_master WHERE name = 'events'").fetchone()
+            version = ro.execute("PRAGMA user_version").fetchone()[0]
+            if not has_events:
+                raise MigrationError(f"{path} has no events table; it is not a cortex store")
+            copy = into / "source.db"
+            dest = sqlite3.connect(copy)
+            try:
+                ro.backup(dest)
+            finally:
+                dest.close()
+        except sqlite3.Error as exc:
+            raise MigrationError(f"cannot read {path}: {exc}") from None
+    finally:
+        ro.close()
+    if version == 4:
+        print(
+            "warning: the source is schema 4, whose embedding cache is not usable; "
+            "nothing is cached and the first sync will re-embed",
+            file=sys.stderr,
+        )
+    return copy
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("sqlite_path", type=Path, help="the SQLite store to read")
+    parser.add_argument("sqlite_path", type=Path, help="the SQLite store to read (never changed)")
     parser.add_argument("pg_url", help="PostgreSQL URL of an empty target (never printed)")
     args = parser.parse_args(argv)
 
@@ -98,37 +136,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {args.sqlite_path} is not a readable SQLite file", file=sys.stderr)
         return 2
     try:
-        import sqlite3
-
-        from cortex_mem.store.postgres import PostgresDatabase
-        from cortex_mem.store.sqlite import SqliteDatabase
-
-        try:
-            src = SqliteDatabase(args.sqlite_path)
-        except (sqlite3.Error, RuntimeError) as exc:
-            print(f"error: cannot read {args.sqlite_path}: {exc}", file=sys.stderr)
-            return 2
-        try:
-            try:
-                pg = PostgresDatabase(args.pg_url)
-            except (ConnectionError, ImportError, RuntimeError, ValueError) as exc:
-                # PostgresDatabase words its errors without the password.
-                print(f"error: {exc}", file=sys.stderr)
-                return 2
-            try:
-                rows = migrate(src, pg)
-            except MigrationError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 2
-            except (sqlite3.Error, ValueError) as exc:
-                print(f"error: the source could not be moved ({type(exc).__name__}): {exc}", file=sys.stderr)
-                return 2
-            finally:
-                pg.close()
-        finally:
-            src.con.close()
-    except ImportError as exc:
+        rows = _run(args.sqlite_path, args.pg_url)
+    except MigrationError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001  one line, no traceback, and never the URL
+        message = " ".join(str(exc).replace(args.pg_url, "<url>").split())
+        print(f"error: {type(exc).__name__}: {message}", file=sys.stderr)
         return 2
 
     print(f"{'table':<16}{'source':>8}{'target':>8}")
@@ -136,6 +150,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{table:<16}{a:>8}{b:>8}")
     print("moved; the first sync on PostgreSQL rebuilds the index from the embedding cache")
     return 0
+
+
+def _run(path: Path, url: str) -> list[tuple[str, int, int]]:
+    import tempfile
+
+    from cortex_mem.store.postgres import PostgresDatabase
+    from cortex_mem.store.sqlite import SqliteDatabase
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = SqliteDatabase(_snapshot(path, Path(tmp)))
+        try:
+            try:
+                pg = PostgresDatabase(url)
+            except ConnectionError as exc:
+                raise MigrationError(str(exc)) from None  # worded without the password
+            try:
+                return migrate(src, pg)
+            finally:
+                pg.close()
+        finally:
+            src.con.close()
 
 
 if __name__ == "__main__":
