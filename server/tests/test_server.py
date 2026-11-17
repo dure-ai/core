@@ -393,7 +393,8 @@ def test_server_refuses_to_start_with_bad_settings(tmp_path, settings, message):
 # ── embeddings config ───────────────────────────────────────────────────────
 
 _EMBED_VARS = ("CORTEX_EMBEDDER", "CORTEX_EMBED_PASSAGE_MODEL", "CORTEX_EMBED_QUERY_MODEL", "UPSTAGE_API_KEY",
-               "CORTEX_GROUP_THRESHOLD", "CORTEX_TEAM", "CORTEX_USER")
+               "CORTEX_GROUP_THRESHOLD", "CORTEX_TEAM", "CORTEX_USER",
+               "CORTEX_DB_URL", "CORTEX_DB_LOCK_TIMEOUT", "CORTEX_VECTOR_INDEX")
 
 
 def _service_from_env(monkeypatch, tmp_path, **env):
@@ -501,3 +502,89 @@ def test_upstage_timeout_is_shorter_than_sqlites_busy_timeout(monkeypatch):
     monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
     # A promoted item is embedded while the write lock is held (spec §7).
     assert srv._embedder().timeout < BUSY_TIMEOUT_MS / 1000
+
+
+# ── PostgreSQL config ───────────────────────────────────────────────────────
+
+_DB_VARS = ("CORTEX_DB_URL", "CORTEX_DB_LOCK_TIMEOUT", "CORTEX_VECTOR_INDEX")
+
+
+def test_sqlite_is_the_default_and_the_url_is_unset(monkeypatch, tmp_path):
+    for name in _DB_VARS:
+        monkeypatch.delenv(name, raising=False)
+    svc = _service_from_env(monkeypatch, tmp_path)
+
+    assert srv._db_url() is None
+    assert srv._lock_timeout() == "30s" and srv._vector_index() == "none"
+    assert (tmp_path / "cortex.db").exists()
+    assert svc.runtime.events is not None
+
+
+def test_blank_url_counts_as_unset(monkeypatch):
+    monkeypatch.setenv("CORTEX_DB_URL", "   ")
+    assert srv._db_url() is None
+
+
+@pytest.mark.parametrize(
+    "name, value, check",
+    [("CORTEX_DB_LOCK_TIMEOUT", "soon", "_lock_timeout"), ("CORTEX_DB_LOCK_TIMEOUT", "", "_lock_timeout"),
+     ("CORTEX_VECTOR_INDEX", "ivfflat", "_vector_index")],
+)
+def test_bad_lock_timeout_and_vector_index_stop_the_server(monkeypatch, name, value, check):
+    for var in _DB_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit, match=name):
+        getattr(srv, check)()
+
+
+def test_lock_timeout_and_vector_index_accept_good_values(monkeypatch):
+    monkeypatch.setenv("CORTEX_DB_LOCK_TIMEOUT", " 500ms ")
+    monkeypatch.setenv("CORTEX_VECTOR_INDEX", " HNSW ")
+    assert srv._lock_timeout() == "500ms" and srv._vector_index() == "hnsw"
+
+
+def test_connection_refused_exits_without_the_password(monkeypatch, tmp_path, caplog):
+    url = "postgresql://postgres:wrong-secret@127.0.0.1:1/postgres"
+    with pytest.raises(SystemExit) as exc:
+        _service_from_env(monkeypatch, tmp_path, CORTEX_DB_URL=url)
+    assert "could not open the PostgreSQL store" in str(exc.value)
+    assert "wrong-secret" not in str(exc.value) and "wrong-secret" not in caplog.text
+
+
+def test_wrong_password_exits_without_the_password(monkeypatch, tmp_path, caplog):
+    import pg
+
+    base = pg.pg_url()
+    if base is None:
+        pytest.skip("CORTEX_TEST_PG_URL is not set")
+    url = "postgresql://postgres:wrong-secret@localhost:54329/postgres"
+    with pytest.raises(SystemExit) as exc:
+        _service_from_env(monkeypatch, tmp_path, CORTEX_DB_URL=url)
+    assert "could not open the PostgreSQL store" in str(exc.value)
+    assert "wrong-secret" not in str(exc.value) and "wrong-secret" not in caplog.text
+
+
+def test_url_wins_over_the_sqlite_path_with_a_warning(monkeypatch, tmp_path, pg_schema, caplog):
+    caplog.set_level("WARNING", logger="cortex_mem_server")
+    svc = _service_from_env(monkeypatch, tmp_path, CORTEX_DB_URL=pg_schema)
+    try:
+        assert svc.db.kind == "postgres"
+        svc.record("deploy uses release tags")
+        assert not (tmp_path / "cortex.db").exists()
+        assert "CORTEX_DB_PATH" in caplog.text and pg_schema not in caplog.text
+    finally:
+        svc.db.close()
+
+
+def test_postgres_service_records_events_and_groups(monkeypatch, tmp_path, pg_schema):
+    svc = _service_from_env(
+        monkeypatch, tmp_path, CORTEX_DB_URL=pg_schema, CORTEX_EMBEDDER="hash", CORTEX_VECTOR_INDEX="none"
+    )
+    try:
+        first = svc.record("deploy uses release tags")["id"]
+        svc.record("deploy uses release tags")
+        group = svc.runtime.index.reader(svc.runtime.events, svc.runtime.knowledge).group(first)
+        assert group is not None and len(group.members) == 2
+    finally:
+        svc.db.close()

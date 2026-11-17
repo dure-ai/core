@@ -5,7 +5,11 @@ checks live in the runtime and the stores; the engine is picked by config.
 Environment variables (only CORTEX_TEAM is required):
     CORTEX_TEAM          the user's team; the server refuses to start without it, since
                          records filed under the wrong team cannot be moved later
-    CORTEX_DB_PATH       SQLite file                    (default: ~/.cortex-mem/cortex.db)
+    CORTEX_DB_URL        postgresql://... : use PostgreSQL; its password is never printed
+                         (default: unset, SQLite)
+    CORTEX_DB_PATH       SQLite file, only without CORTEX_DB_URL (default: ~/.cortex-mem/cortex.db)
+    CORTEX_DB_LOCK_TIMEOUT  how long PostgreSQL waits for the write lock, e.g. 30s, 500ms (default: 30s)
+    CORTEX_VECTOR_INDEX  none | hnsw: PostgreSQL vector search, exact or approximate (default: none)
     CORTEX_USER          who is recording               (default: OS user, with a notice)
     CORTEX_AGENT         client name, e.g. claude-code  (default: unset)
     CORTEX_REPO          repository this project works in, e.g. acme/api (default: unset);
@@ -24,7 +28,7 @@ Environment variables (only CORTEX_TEAM is required):
     CORTEX_GROUP_THRESHOLD  similarity from 0 to 1 at which records are grouped (default: 0.9)
 
 One server process is one session: Claude Code starts a process per session.
-Processes share the SQLite file; the runtime delivers each event once.
+Processes share the SQLite file or the PostgreSQL database; the runtime delivers each event once.
 """
 
 import getpass
@@ -38,6 +42,7 @@ from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import get_args
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
@@ -49,6 +54,7 @@ from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
+from cortex_mem.store.postgres import _DURATION, PostgresDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
 ENGINE_ALIASES = {
@@ -136,6 +142,7 @@ class Service:
         index: Index | None = None,
     ) -> None:
         name, built = load_engine(engine)
+        self.db = db
         self.runtime = Runtime(
             built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures,
             index=index,
@@ -312,13 +319,51 @@ def _group_threshold() -> float:
     return value
 
 
+def _db_url() -> str | None:
+    return os.environ.get("CORTEX_DB_URL", "").strip() or None
+
+
+def _lock_timeout() -> str:
+    raw = os.environ.get("CORTEX_DB_LOCK_TIMEOUT", "30s").strip()
+    if not _DURATION.fullmatch(raw):
+        raise SystemExit(
+            f"cortex-mem: CORTEX_DB_LOCK_TIMEOUT must be a PostgreSQL duration such as 30s, 500ms or 2min, got {raw!r}"
+        )
+    return raw
+
+
+def _vector_index() -> str:
+    name = os.environ.get("CORTEX_VECTOR_INDEX", "none").strip().lower()
+    if name not in ("none", "hnsw"):
+        raise SystemExit(f"cortex-mem: CORTEX_VECTOR_INDEX must be none or hnsw, got {name!r}")
+    return name
+
+
+def _open_database() -> Database:
+    url = _db_url()
+    if url is None:
+        path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return SqliteDatabase(path)
+    if os.environ.get("CORTEX_DB_PATH"):
+        log.warning("CORTEX_DB_URL and CORTEX_DB_PATH are both set; using PostgreSQL and ignoring the SQLite path")
+    try:
+        return PostgresDatabase(url, _lock_timeout(), _vector_index())
+    except ConnectionError as exc:
+        # The error carries host, port and database, and the password is redacted already;
+        # do it again here in case the driver quoted the URL.
+        password = urlsplit(url).password
+        reason = str(exc).replace(url, "<url>")
+        if password:
+            reason = reason.replace(password, "***")
+        raise SystemExit(f"cortex-mem: could not open the PostgreSQL store: {reason} ({type(exc).__name__})") from None
+
+
 def get_service() -> Service:
     global _service
     if _service is None:
         user, team = _identity()
-        path = Path(os.environ.get("CORTEX_DB_PATH", "~/.cortex-mem/cortex.db")).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        db = SqliteDatabase(path)
+        db = _open_database()
         embedder, threshold = _embedder(), _group_threshold()
         _service = Service(
             db,
@@ -405,6 +450,8 @@ def main() -> None:
     _max_failures()
     _embedder()
     _group_threshold()
+    _lock_timeout()
+    _vector_index()
     mcp.run()
 
 
