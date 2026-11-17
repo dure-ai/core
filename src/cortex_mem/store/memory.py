@@ -10,7 +10,16 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from ..access import event_visible, knowledge_visible
-from ..contract import Caller, Event, Kind, Knowledge, Scope
+from ..contract import (
+    Caller,
+    Event,
+    EventReader,
+    Kind,
+    Knowledge,
+    KnowledgeReader,
+    Scope,
+)
+from ..embed import cosine, float32, top_by_cosine
 from .base import CursorConflict
 from .text import bigrams, words
 
@@ -158,7 +167,14 @@ class InMemoryStateBackend:
 
 
 class InMemoryVectorBackend:
-    def __init__(self) -> None:
+    """Vectors in dicts; the searches score in Python and judge visibility
+    with cortex_mem.access over the events and knowledge given here."""
+
+    kind = "memory"
+
+    def __init__(self, events: EventReader, knowledge: KnowledgeReader) -> None:
+        self._events = events
+        self._knowledge = knowledge
         self._vectors: dict[str, dict[str, list[float]]] = {
             "event": {},
             "knowledge": {},
@@ -186,7 +202,7 @@ class InMemoryVectorBackend:
 
     def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
         # Assigning to an existing dict key keeps its original position.
-        self._vectors[kind][id] = [float(x) for x in vector]
+        self._vectors[kind][id] = float32(vector)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         found = self._vectors[kind].get(id)
@@ -236,7 +252,66 @@ class InMemoryVectorBackend:
         return None if found is None else list(found)
 
     def cache(self, model: str, digest: str, vector: Sequence[float]) -> None:
-        self._cache[(model, digest)] = [float(x) for x in vector]
+        self._cache[(model, digest)] = float32(vector)
+
+    def _grouped(self, upto: int | None) -> list[str]:
+        """Grouped event ids that have a vector, seq <= upto, by (seq, id)."""
+        rows = sorted(
+            (g[3], e)
+            for e, g in self._groups.items()
+            if e in self._vectors["event"] and (upto is None or g[3] <= upto)
+        )
+        return [e for _, e in rows]
+
+    def nearest_member(
+        self, scope: Scope, owner: str, vector: Sequence[float], upto: int
+    ) -> tuple[str, float] | None:
+        query = float32(vector)
+        table = self._vectors["event"]
+        best: tuple[str, float] | None = None
+        for id in self._grouped(upto):
+            if self._groups[id][1] == scope and self._groups[id][2] == owner:
+                score = cosine(query, table[id])
+                if best is None or score > best[1]:  # strictly: a tie keeps the earlier
+                    best = (id, score)
+        return best
+
+    def search_events(
+        self,
+        vector: Sequence[float],
+        caller: Caller,
+        scope: Scope,
+        k: int,
+        kinds: Collection[Kind] | None = None,
+        upto: int | None = None,
+        exclude: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if k <= 0 or (kinds is not None and not kinds):
+            return []
+        ids = [id for id in self._grouped(upto) if id != exclude]
+        events = {e.id: e for e in self._events.get(ids)}
+        table = self._vectors["event"]
+        candidates = [
+            (id, table[id])
+            for id in ids
+            if id in events
+            and (kinds is None or events[id].kind in kinds)
+            and event_visible(events[id], caller, scope)
+        ]
+        return top_by_cosine(float32(vector), candidates, k)
+
+    def search_knowledge(
+        self, vector: Sequence[float], caller: Caller, scope: Scope, k: int
+    ) -> list[tuple[str, float]]:
+        if k <= 0:
+            return []
+        table = self._vectors["knowledge"]
+        ids = sorted(table)
+        items = {item.id: item for item in self._knowledge.get(ids)}
+        candidates = [
+            (id, table[id]) for id in ids if id in items and knowledge_visible(items[id], caller, scope)
+        ]
+        return top_by_cosine(float32(vector), candidates, k)
 
 
 class InMemoryDatabase:
@@ -245,7 +320,7 @@ class InMemoryDatabase:
     def __init__(self) -> None:
         self.events = InMemoryEventStore()
         self.knowledge = InMemoryKnowledgeBase()
-        self.vectors = InMemoryVectorBackend()
+        self.vectors = InMemoryVectorBackend(self.events, self.knowledge)
         self._states: dict[str, InMemoryStateBackend] = {}
 
     def state(self, engine: str) -> InMemoryStateBackend:

@@ -9,7 +9,15 @@ from collections.abc import Collection, Iterator, Mapping, Sequence, Set
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
-from ..contract import Event, EventReader, Knowledge, KnowledgeReader, Scope
+from ..contract import (
+    Caller,
+    Event,
+    EventReader,
+    Kind,
+    Knowledge,
+    KnowledgeReader,
+    Scope,
+)
 
 
 class CursorConflict(Exception):
@@ -69,9 +77,21 @@ class EngineStateBackend(Protocol):
 
 
 class VectorBackend(Protocol):
-    """Embedding vectors, similarity groups and the embedding cache. Vectors are
-    float64 (list[float]); callers get copies. All writes happen inside the
-    runtime's transaction()."""
+    """Embedding vectors, similarity groups and the embedding cache, and the
+    similarity searches over them. Vectors are float32: every write (vectors
+    and cache) rounds to float32, and reads give those values back as Python
+    floats (list[float]); callers get copies. All writes happen inside the
+    runtime's transaction().
+
+    The searches judge visibility from the events and knowledge of the same
+    Database (cortex_mem.access rules), so a backend is built next to them.
+    An event's position here is the seq given to put_group: only grouped
+    event vectors are search candidates, upto bounds that seq, and ties go
+    to the smaller seq (then the smaller id)."""
+
+    kind: str
+    """The store this backend lives in: "memory", "sqlite" or "postgres".
+    Part of the index version, so moving to another store rebuilds the index."""
 
     # Index state
     def meta(self) -> dict | None:
@@ -126,6 +146,38 @@ class VectorBackend(Protocol):
     def cached(self, model: str, digest: str) -> list[float] | None: ...
 
     def cache(self, model: str, digest: str, vector: Sequence[float]) -> None: ...
+
+    # Similarity: cosine of the float32 query against the stored vectors.
+    def nearest_member(
+        self, scope: Scope, owner: str, vector: Sequence[float], upto: int
+    ) -> tuple[str, float] | None:
+        """The grouped event of the (scope, owner) cell with seq <= upto whose
+        vector is closest to `vector`, with its score, whatever the score;
+        ties go to the smaller seq. None when the cell has no such event.
+        Always exact (never an approximate index): groups must not vary."""
+        ...
+
+    def search_events(
+        self,
+        vector: Sequence[float],
+        caller: Caller,
+        scope: Scope,
+        k: int,
+        kinds: Collection[Kind] | None = None,
+        upto: int | None = None,
+        exclude: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """Up to k (event id, score) of the grouped events the caller may see
+        in scope, with score > 0, best first, ties by seq. kinds limits the
+        event kinds, upto the seq (None = no bound), exclude drops one id."""
+        ...
+
+    def search_knowledge(
+        self, vector: Sequence[float], caller: Caller, scope: Scope, k: int
+    ) -> list[tuple[str, float]]:
+        """Up to k (knowledge id, score) of the items the caller may see in
+        scope, with score > 0, best first, ties by id."""
+        ...
 
 
 class Database(Protocol):

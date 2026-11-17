@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
-from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, text_digest
+from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, float32, text_digest
 from cortex_mem.index import Index, PassageNotCached
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -113,7 +113,7 @@ def test_record_below_the_threshold_starts_a_new_group():
 
 def test_score_equal_to_the_threshold_joins():
     emb = TableEmbedder({"a": [1, 0, 0], "b": [0.6, 0.8, 0]})
-    threshold = cosine(emb.table["b"], emb.table["a"])
+    threshold = cosine(float32(emb.table["b"]), float32(emb.table["a"]))  # the score the store computes
     db, index = build([ev("e1", "a"), ev("e2", "b")], emb, threshold=threshold)
     assert reader(db, index).group("e2").members == ("e1", "e2")
 
@@ -245,9 +245,9 @@ def test_knowledge_vectors_follow_put_and_remove():
     index = Index(db.vectors, HashEmbedder(), 0.9)
     emb = HashEmbedder()
     index.put_knowledge(item("k1", title="deploy", body="uses tags"))
-    assert db.vectors.vector("knowledge", "k1") == emb.embed(["deploy\nuses tags"], "passage")[0]
+    assert db.vectors.vector("knowledge", "k1") == float32(emb.embed(["deploy\nuses tags"], "passage")[0])
     index.put_knowledge(item("k1", title="deploy", body="uses branches"))
-    assert db.vectors.vector("knowledge", "k1") == emb.embed(["deploy\nuses branches"], "passage")[0]
+    assert db.vectors.vector("knowledge", "k1") == float32(emb.embed(["deploy\nuses branches"], "passage")[0])
     index.remove_knowledge("k1")
     assert db.vectors.vector("knowledge", "k1") is None
     index.remove_knowledge("never-there")
@@ -280,7 +280,7 @@ def test_rebuild_resets_and_reembeds_knowledge():
     db.vectors.put_vector("knowledge", "gone", [1.0, 0.0])  # not in the knowledge base
     calls = len(emb.calls)
     index.rebuild(db.knowledge)
-    assert db.vectors.meta() == index.want() == {"model": emb.model, "group_threshold": 0.9}
+    assert db.vectors.meta() == index.want() == {"model": emb.model, "group_threshold": 0.9, "store": "memory"}
     assert list(db.vectors.vectors("event")) == []
     assert db.vectors.group_of("e1") is None
     assert db.vectors.indexed() == 0
@@ -672,3 +672,45 @@ def test_a_bounded_reader_still_searches_all_current_knowledge():
     assert ids(index.reader(db.events, db.knowledge, upto=0).knowledge("deploy\ndeploy uses tags", caller(), "team")) == [
         "k1"
     ]
+
+
+# ── the store computes similarity ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("make", [InMemoryDatabase, SqliteDatabase], ids=["memory", "sqlite"])
+def test_the_index_version_names_the_store(make):
+    db = make()
+    index = Index(db.vectors, HashEmbedder(), 0.9)
+    assert index.want() == {"model": "hash-256", "group_threshold": 0.9, "store": db.vectors.kind}
+    assert index.want()["store"] == ("memory" if make is InMemoryDatabase else "sqlite")
+
+
+class NoScanBackend:
+    """A VectorBackend that refuses the full scans, so an Index that still
+    compares every vector in Python fails here."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        if name in ("vectors", "partition"):
+            raise AssertionError(f"the index scanned with {name}()")
+        return getattr(self._inner, name)
+
+
+def test_the_index_asks_the_store_for_similarity_instead_of_scanning():
+    db = InMemoryDatabase()
+    events = [ev("e1"), ev("e2"), ev("e3", "payments need vendor v2"), ev("x1", user="u9", team="t9")]
+    for e in events:
+        db.events.append(e)
+    index = Index(NoScanBackend(db.vectors), HashEmbedder(), 0.9)
+    index.catch_up(db.events, len(events))
+    k = item("k1")
+    db.knowledge.put(k)
+    index.put_knowledge(k)
+    r = reader(db, index)
+
+    assert r.group("e2") == Group("e1", "personal", "u1", ("e1", "e2"))
+    assert ids(r.search("deploy uses tags", caller(), "org")) == ["e1", "e2"]
+    assert ids(r.neighbors("e1", caller(), "org")) == ["e2"]
+    assert ids(r.knowledge("deploy\ndeploy uses tags", caller(), "team")) == ["k1"]

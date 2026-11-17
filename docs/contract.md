@@ -1,4 +1,4 @@
-# 엔진 포트 계약 v0.2.0
+# 엔진 포트 계약 v0.3.0
 
 > 상태: 초안 (PR #1 리뷰 2차 반영, D1~D7 합의). 코드 정본은 `src/cortex_mem/contract.py`(포트), `src/cortex_mem/access.py`(scope 규칙), `src/cortex_mem/runtime.py`(런타임).
 > 이 문서의 규칙 중 타입으로 표현되지 않는 것(호출 순서, id·scope 의미, 런타임 동작)도 계약의 일부다.
@@ -151,8 +151,8 @@ class Engine(Protocol):
     def handoff(self, query, caller, scope, ctx, k=6) -> list[Handoff]: ...
 ```
 
-- **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다.
-- **가시성**: 세 검색 모두 `access.event_visible`·`knowledge_visible`로 거른 집합 안에서만 찾는다. `group()`은 호출자를 받지 않는다. 엔진은 모든 이벤트를 관찰하므로 묶음 정보가 엔진에게 새 노출이 아니고, 엔진이 내보내는 것은 결정 검증과 handoff 필터를 지난다(§3-5).
+- **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다. 벡터는 float32로 저장되므로 같은 데이터라도 저장소(인메모리·SQLite·PostgreSQL)에 따라 점수가 마지막 자리(1e-6 안)에서 다를 수 있다. 같은 저장소에서는 실행마다 같다.
+- **가시성**: 세 검색 모두 `access.event_visible`·`knowledge_visible`로 거른 집합 안에서만 찾는다(SQL 저장소는 같은 규칙의 SQL 조건으로 거른다, §5). `group()`은 호출자를 받지 않는다. 엔진은 모든 이벤트를 관찰하므로 묶음 정보가 엔진에게 새 노출이 아니고, 엔진이 내보내는 것은 결정 검증과 handoff 필터를 지난다(§3-5).
 - **묶음 멤버를 handoff에 쓰면 근거로 인용한다**: handoff 필터는 Handoff가 `sources`에 적은 이벤트만 검사한다. 엔진이 `group().members`(또는 `neighbors` 결과) 이벤트의 내용을 Handoff의 `content`에 넣으면 그 이벤트들을 모두 `sources`에 넣어야 한다. 빠뜨리면 호출자가 볼 수 없는 기록의 내용이 필터를 지나 나간다.
 - **엔진이 본 데까지만**: `similar`는 엔진이 이미 받은 이벤트까지만 읽는다. `observe` 중에는 지금 관찰하는 이벤트까지, `tick`·`handoff` 중에는 엔진의 커서까지다. 그 뒤의 이벤트는 `search`·`neighbors` 결과에도, `group().members`에도 나오지 않고, 그 뒤의 이벤트로 `group()`을 부르면 `None`이다. 그래서 처음부터 다시 전달할 때(§3-8)도 처음 전달 때와 같은 결과를 읽는다(§3-7). 지식(`knowledge`)은 지금의 지식 베이스다.
 - **recall 질의**: `search`·`knowledge`의 질의는 임베딩하되 저장하지 않는다(프로세스 메모리의 작은 LRU만).
@@ -306,14 +306,35 @@ class Database(Protocol):                                     # 한 연결 뒤�
     vectors: VectorBackend                                    # 임베딩을 쓰지 않아도 있어야 한다
     def state(self, engine) -> EngineStateBackend: ...       # 엔진별 이름공간
     def transaction(self): ...
+
+class VectorBackend(Protocol):                                # 색인 상태·벡터·묶음·캐시 + 유사도 계산
+    kind: str                                                 # "memory" | "sqlite" | "postgres"
+    ...                                                       # meta/reset/indexed, put_vector/vector/vectors, put_group/members/partition, cached/cache
+    def nearest_member(self, scope, owner, vector, upto) -> tuple[str, float] | None: ...
+    def search_events(self, vector, caller, scope, k, kinds=None, upto=None, exclude=None) -> list[tuple[str, float]]: ...
+    def search_knowledge(self, vector, caller, scope, k) -> list[tuple[str, float]]: ...
 ```
 
 - `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `VectorBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인하고, `transaction()` 안의 벡터 쓰기가 예외와 함께 되돌려지는지도 본다(되돌릴 수 없는 단일 프로세스 저장소는 `rolls_back = False`). `search` 점수는 "높을수록 좋음"만 약속한다.
 - 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **한 트랜잭션**으로 묶고 프로세스 사이에서 직렬화한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
-- `Database`에는 `vectors: VectorBackend` 속성이 있다. `Database` 프로토콜이 요구하므로 임베딩을 쓰지 않는 배포에서도 구현해야 한다(쓰지 않으면 비어 있을 뿐이다). `VectorBackend`는 색인 상태(모델, 묶음 문턱값, 색인한 마지막 위치), 이벤트·지식 벡터, 묶음, 임베딩 캐시를 맡는다. 모든 쓰기는 런타임의 `transaction()` 안에서 일어나고 그 트랜잭션과 함께 되돌려진다. 이벤트 하나의 색인과 전달은 같은 트랜잭션에 묶이고, 임베딩 캐시는 그 앞의 짧은 트랜잭션에서 미리 채운다. 벡터는 float64로 저장해 두 저장소에서 점수와 동점 처리가 같게 한다. 기존 `Database`의 다른 부분은 그대로다. 포트 정의와 구현은 임베딩 설계(`docs/specs/2026-11-15-core-embedding-design.md` §5)를 따른다.
+- `Database`에는 `vectors: VectorBackend` 속성이 있다. `Database` 프로토콜이 요구하므로 임베딩을 쓰지 않는 배포에서도 구현해야 한다(쓰지 않으면 비어 있을 뿐이다). `VectorBackend`는 색인 상태(모델, 묶음 문턱값, 색인한 마지막 위치), 이벤트·지식 벡터, 묶음, 임베딩 캐시를 맡는다. 모든 쓰기는 런타임의 `transaction()` 안에서 일어나고 그 트랜잭션과 함께 되돌려진다. 이벤트 하나의 색인과 전달은 같은 트랜잭션에 묶이고, 임베딩 캐시는 그 앞의 짧은 트랜잭션에서 미리 채운다. 벡터는 **float32**다: 쓰기(벡터와 임베딩 캐시)는 모두 float32로 반올림해 저장하고, 읽기는 그 값을 파이썬 float로 돌려준다. 기존 `Database`의 다른 부분은 그대로다. 포트 정의와 구현은 임베딩 설계(`docs/specs/2026-11-15-core-embedding-design.md` §5)를 따른다.
+- **유사도 계산은 저장소가 한다** (0.3.0). `Index`는 임베딩·캐시·묶음 배정·커서를 맡고, 코사인 점수는 `VectorBackend`의 세 메서드가 낸다. 질의 벡터도 float32로 반올림해 계산한다.
+  - `nearest_member(scope, owner, vector, upto)`: 그 (scope, owner) 칸의 묶인 이벤트 중 위치 ≤ `upto`이고 가장 가까운 것과 그 점수. 점수와 상관없이 가장 가까운 것을 돌려주고(문턱값은 `Index`가 본다), 동점은 위치가 작은 것, 칸이 비었으면 `None`. 언제나 정확 검색이다(근사 색인을 쓰지 않는다).
+  - `search_events(vector, caller, scope, k, kinds, upto, exclude)`: 호출자가 그 범위에서 볼 수 있는 묶인 이벤트 중 점수 > 0인 것 k개, 점수 내림차순, 동점은 위치 순. `kinds`는 이벤트 종류, `upto`는 위치 상한(`None` = 상한 없음), `exclude`는 뺄 id 하나.
+  - `search_knowledge(vector, caller, scope, k)`: 볼 수 있는 지식 중 점수 > 0인 것 k개, 동점은 id 순.
+  - **위치**는 `put_group`에 준 seq(= 이벤트 로그 위치)다. 묶음이 없는 이벤트 벡터는 검색 후보가 아니고, 이벤트·지식 저장소에 없는 id도 후보가 아니다.
+  - 가시성은 같은 `Database`의 이벤트·지식으로 판단한다. 그래서 백엔드는 그 옆에서 만든다(인메모리는 `InMemoryVectorBackend(events, knowledge)`, SQL 저장소는 `events`·`knowledge` 표와 잇는다). 파이썬 구현은 `access.event_visible`·`knowledge_visible`, SQL 구현은 텍스트 검색과 같은 조건(`store/text.py`의 `EVENT_VISIBLE_SQL`·`KNOWLEDGE_VISIBLE_SQL`)을 쓴다. `VectorBackendContract`의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려주고, 범위 × 호출자 조합의 기대 id 표로 두 구현이 같은지 고정한다.
+  - 인메모리와 SQLite는 같은 파이썬 코드로 계산하므로 점수가 비트까지 같다. PostgreSQL(pgvector)은 DB 안에서 계산하므로 점수가 1e-6 안에서 같다고 본다. 색인 버전(`Index.want()`)에 `store: backend.kind`가 들어 있어 저장소를 옮기면 색인을 다시 만들고 엔진에 처음부터 다시 전달한다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
 - **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, append를 `transaction()` 안에서 잠금(advisory lock 등)으로 직렬화한다. PG 구현에는 동시 append 두 개를 섞는 적합성 테스트를 추가한다(지금의 `DatabaseContract`로는 잡히지 않는다).
 - **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL도 `to_tsvector('simple', words || ' ' || grams)`로 같은 토큰을 쓰면 확장 없이 옮겨진다.
+
+### 계약 변경 이력
+
+| 버전 | 바뀐 것 | 엔진 영향 |
+| --- | --- | --- |
+| 0.2.0 | 코어 임베딩 색인과 읽기 전용 `ctx.similar`(`SimilarityReader`: search·neighbors·knowledge·group), `Database.vectors`, `VectorBackend` | 엔진이 `ctx.similar`를 쓸 수 있다(없으면 `None`) |
+| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(1e-6 안) 달라질 수 있다 |
 
 ## 6. v0.2 이후로 미룬 것
 

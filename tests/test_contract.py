@@ -175,7 +175,7 @@ def test_group_is_frozen_and_keeps_member_order():
         group.owner = "t2"  # type: ignore[misc]
 
 
-def test_contract_version_is_0_2_0():
+def test_contract_version_is_0_3_0():
     from cortex_mem.contract import CONTRACT_VERSION
 
-    assert CONTRACT_VERSION == "0.2.0"
+    assert CONTRACT_VERSION == "0.3.0"

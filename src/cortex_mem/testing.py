@@ -11,11 +11,13 @@ DatabaseContract runs the runtime over a whole Database, so delivery
 Needs pytest; import it from tests only.
 """
 
+from array import array
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
+from .access import owner_for
 from .contract import Caller, Event, Knowledge, Promote
 from .runtime import Runtime
 from .store.base import CursorConflict
@@ -232,10 +234,169 @@ class EngineStateBackendContract(_Contract):
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
 
 
+def f32(values):
+    """The values as a store keeps them: rounded to float32."""
+    return array("f", values).tolist()
+
+
+SCORE_TOLERANCE = 1e-6  # stores may differ in the last float32 digits (PG computes in SQL)
+
+
 class VectorBackendContract(_Contract):
+    """make() returns a Database-like object with .events, .knowledge and
+    .vectors on one storage: the similarity methods judge visibility from the
+    events and knowledge they sit next to."""
+
     @pytest.fixture
-    def vb(self):
+    def db(self):
         return self.make()
+
+    @pytest.fixture
+    def vb(self, db):
+        return db.vectors
+
+    @staticmethod
+    def index_event(db, event, vector, seq):
+        """Append event, store its vector and group it on its own at position seq."""
+        db.events.append(event)
+        db.vectors.put_vector("event", event.id, vector)
+        db.vectors.put_group(event.id, event.id, event.scope, owner_for(event), seq)
+
+    @staticmethod
+    def scores_match(got, want):
+        assert [id for id, _ in got] == [id for id, _ in want]
+        for (_, a), (_, b) in zip(got, want, strict=True):
+            assert a == pytest.approx(b, abs=SCORE_TOLERANCE)
+
+    def test_kind_names_the_store(self, vb):
+        assert vb.kind in ("memory", "sqlite", "postgres")
+
+    def test_nearest_member_is_the_closest_in_the_cell_and_ties_go_to_the_earlier(self, vb):
+        # Inserted out of seq order: ties follow the seq given to put_group.
+        rows = [("late", [1.0, 0.0], 4), ("early", [1.0, 0.0], 2), ("up", [0.0, 1.0], 1),
+                ("diag", [0.6, 0.8], 3), ("away", [-1.0, 0.0], 5)]  # fmt: skip
+        for id, vector, seq in rows:
+            vb.put_vector("event", id, vector)
+            vb.put_group(id, id, "team", "t1", seq)
+        vb.put_group("novector", "novector", "team", "t1", 6)  # grouped but no vector: skipped
+
+        got = vb.nearest_member("team", "t1", [1.0, 0.0], 10)
+        assert got[0] == "early" and got[1] == pytest.approx(1.0, abs=SCORE_TOLERANCE)
+        got = vb.nearest_member("team", "t1", [0.0, 1.0], 10)
+        assert got[0] == "up" and got[1] == pytest.approx(1.0, abs=SCORE_TOLERANCE)
+        got = vb.nearest_member("team", "t1", [0.6, 0.8], 10)
+        assert got[0] == "diag" and got[1] == pytest.approx(1.0, abs=SCORE_TOLERANCE)
+        got = vb.nearest_member("team", "t1", [-1.0, 0.0], 3)  # "away" is past upto
+        assert got[0] == "up" and got[1] == pytest.approx(0.0, abs=SCORE_TOLERANCE)
+        # The closest even when it is not close: the caller applies its threshold.
+        vb.put_vector("event", "only", [-1.0, 0.0])
+        vb.put_group("only", "only", "personal", "u1", 7)
+        got = vb.nearest_member("personal", "u1", [1.0, 0.0], 10)
+        assert got[0] == "only" and got[1] == pytest.approx(-1.0, abs=SCORE_TOLERANCE)
+        assert vb.nearest_member("personal", "u2", [1.0, 0.0], 10) is None
+
+    def test_nearest_member_ignores_other_cells_and_members_after_upto(self, vb):
+        rows = [("a", [0.0, 1.0], "team", "t1", 1), ("c", [1.0, 0.0], "team", "t2", 2),
+                ("d", [1.0, 0.0], "personal", "t1", 3), ("e", [1.0, 0.0], "org", "*", 4),
+                ("b", [1.0, 0.0], "team", "t1", 5)]  # fmt: skip
+        for id, vector, scope, owner, seq in rows:
+            vb.put_vector("event", id, vector)
+            vb.put_group(id, id, scope, owner, seq)
+
+        assert vb.nearest_member("team", "t1", [1.0, 0.0], 0) is None
+        assert vb.nearest_member("team", "t1", [1.0, 0.0], 4)[0] == "a"
+        assert vb.nearest_member("team", "t1", [1.0, 0.0], 5)[0] == "b"
+        assert vb.nearest_member("org", "*", [1.0, 0.0], 3) is None
+        assert vb.nearest_member("org", "*", [1.0, 0.0], 4)[0] == "e"
+
+    def test_search_events_visibility_matrix(self, db, vb):
+        rows = [
+            ev("p-u1", user="u1", team="t1", scope="personal"),
+            ev("p-u2", user="u2", team="t1", scope="personal"),
+            ev("t-t1", user="u2", team="t1", scope="team"),
+            ev("t-t2", user="u3", team="t2", scope="team"),
+            ev("o-u9", user="u9", team="t9", scope="org"),
+            ev("o-u3", user="u3", team="t2", scope="org"),
+        ]
+        for seq, e in enumerate(rows, start=1):
+            self.index_event(db, e, [1.0, 0.0], seq)
+        expected = {
+            (("u1", "t1"), "personal"): ["p-u1"],
+            (("u1", "t1"), "team"): ["p-u1", "t-t1"],
+            (("u1", "t1"), "org"): ["p-u1", "t-t1", "o-u9", "o-u3"],
+            (("u2", "t1"), "personal"): ["p-u2", "t-t1"],
+            (("u2", "t1"), "team"): ["p-u2", "t-t1"],
+            (("u2", "t1"), "org"): ["p-u2", "t-t1", "o-u9", "o-u3"],
+            (("u3", "t2"), "personal"): ["t-t2", "o-u3"],
+            (("u3", "t2"), "team"): ["t-t2", "o-u3"],
+            (("u3", "t2"), "org"): ["t-t2", "o-u9", "o-u3"],
+        }
+        got = {
+            (who, scope): [id for id, _ in vb.search_events([1.0, 0.0], caller(*who), scope, 50)]
+            for who, scope in expected
+        }
+        assert got == expected
+
+    def test_search_events_respects_kinds_upto_exclude_k_and_drops_nonpositive(self, db, vb):
+        rows = [("a", "record", [1.0, 0.0]), ("b", "recall", [0.8, 0.6]), ("c", "record", [0.0, 1.0]),
+                ("d", "record", [-1.0, 0.0]), ("e", "record", [0.8, 0.6]), ("f", "record", [1.0, 0.0])]  # fmt: skip
+        for seq, (id, kind, vector) in enumerate(rows, start=1):
+            self.index_event(db, ev(id, kind=kind), vector, seq)
+        db.events.append(ev("loose"))
+        vb.put_vector("event", "loose", [1.0, 0.0])  # no group: not a candidate
+        vb.put_vector("event", "ghost", [1.0, 0.0])
+        vb.put_group("ghost", "ghost", "personal", "u1", 8)  # no event: not a candidate
+        q, me = [1.0, 0.0], caller()
+
+        def search(**kw):
+            return [id for id, _ in vb.search_events(q, me, "personal", kw.pop("k", 20), **kw)]
+
+        self.scores_match(
+            vb.search_events(q, me, "personal", 20), [("a", 1.0), ("f", 1.0), ("b", 0.8), ("e", 0.8)]
+        )
+        assert search(kinds=None, upto=None) == ["a", "f", "b", "e"]
+        assert search(kinds={"record"}) == ["a", "f", "e"]
+        assert search(kinds=["recall"]) == ["b"]
+        assert search(kinds=()) == []
+        assert search(upto=5) == ["a", "b", "e"]
+        assert search(upto=0) == []
+        assert search(exclude="a") == ["f", "b", "e"]
+        assert search(exclude="a", upto=5, kinds={"record"}) == ["e"]
+        assert search(k=2) == ["a", "f"]
+        assert search(k=0) == []
+        assert search(k=-1) == []
+
+    def test_search_knowledge_visibility_and_id_ties(self, db, vb):
+        rows = [("k1", "personal", "u1", [1.0, 0.0]), ("k2", "personal", "u2", [1.0, 0.0]),
+                ("k3", "team", "t1", [1.0, 0.0]), ("k4", "team", "t2", [1.0, 0.0]),
+                ("k5", "org", "*", [1.0, 0.0]), ("k6", "org", "*", [0.6, 0.8]),
+                ("k7", "org", "*", [0.0, 1.0])]  # fmt: skip
+        for id, scope, owner, vector in reversed(rows):  # stored out of id order
+            db.knowledge.put(item(id, scope=scope, owner=owner))
+            vb.put_vector("knowledge", id, vector)
+        vb.put_vector("knowledge", "ghost", [1.0, 0.0])  # not in the knowledge base
+        expected = {
+            (("u1", "t1"), "personal"): ["k1"],
+            (("u1", "t1"), "team"): ["k1", "k3"],
+            (("u1", "t1"), "org"): ["k1", "k3", "k5", "k6"],
+            (("u2", "t1"), "personal"): ["k2"],
+            (("u2", "t1"), "team"): ["k2", "k3"],
+            (("u2", "t1"), "org"): ["k2", "k3", "k5", "k6"],
+            (("u3", "t2"), "personal"): [],
+            (("u3", "t2"), "team"): ["k4"],
+            (("u3", "t2"), "org"): ["k4", "k5", "k6"],
+        }
+        got = {
+            (who, scope): [id for id, _ in vb.search_knowledge([1.0, 0.0], caller(*who), scope, 50)]
+            for who, scope in expected
+        }
+        assert got == expected
+        self.scores_match(
+            vb.search_knowledge([1.0, 0.0], caller(), "org", 3), [("k1", 1.0), ("k3", 1.0), ("k5", 1.0)]
+        )
+        self.scores_match(vb.search_knowledge([0.6, 0.8], caller("u3", "t2"), "org", 50),
+                          [("k6", 1.0), ("k7", 0.8), ("k4", 0.6), ("k5", 0.6)])  # fmt: skip
+        assert vb.search_knowledge([1.0, 0.0], caller(), "org", 0) == []
 
     def test_meta_starts_empty_and_reset_records_it(self, vb):
         assert vb.meta() is None
@@ -248,16 +409,22 @@ class VectorBackendContract(_Contract):
         vb.meta()["model"] = "changed"
         assert vb.meta() == meta
 
-    def test_vectors_round_trip_as_float64(self, vb):
-        vb.put_vector("event", "e1", [0.1, 1 / 3, -2.5])
+    def test_vectors_round_trip_at_float32_precision(self, vb):
+        values = [0.1, 1 / 3, -2.5]
+        want = f32(values)
+        assert want != values  # the rounding is visible
+        vb.put_vector("event", "e1", values)
+        vb.put_vector("knowledge", "k1", values)
 
         got = vb.vector("event", "e1")
-        assert got == [0.1, 1 / 3, -2.5]
+        assert got == want
+        assert vb.vector("knowledge", "k1") == want
+        assert list(vb.vectors("event")) == [("e1", want)]
         assert all(type(x) is float for x in got)
         assert vb.vector("event", "missing") is None
         assert vb.vector("knowledge", "e1") is None
         got.append(9.0)
-        assert vb.vector("event", "e1") == [0.1, 1 / 3, -2.5]
+        assert vb.vector("event", "e1") == want
 
     def test_event_vectors_keep_insertion_order_and_knowledge_vectors_sort_by_id(
         self, vb
@@ -337,11 +504,11 @@ class VectorBackendContract(_Contract):
         assert vb.cached("m1", "d1") is None
         vb.cache("m1", "d1", [0.1, 0.2])
 
-        assert vb.cached("m1", "d1") == [0.1, 0.2]
+        assert vb.cached("m1", "d1") == f32([0.1, 0.2])  # the cache is float32 too
         assert vb.cached("m2", "d1") is None
         assert vb.cached("m1", "d2") is None
         vb.cached("m1", "d1").append(1.0)
-        assert vb.cached("m1", "d1") == [0.1, 0.2]
+        assert vb.cached("m1", "d1") == f32([0.1, 0.2])
 
     def test_members_and_event_vectors_up_to_a_position(self, vb):
         for seq, id in enumerate(["e1", "e2", "e3"], start=1):

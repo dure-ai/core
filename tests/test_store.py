@@ -5,7 +5,6 @@ from cortex_mem.store.memory import (
     InMemoryEventStore,
     InMemoryKnowledgeBase,
     InMemoryStateBackend,
-    InMemoryVectorBackend,
 )
 from cortex_mem.testing import (
     DatabaseContract,
@@ -33,7 +32,7 @@ class TestInMemoryStateBackend(EngineStateBackendContract):
 
 class TestInMemoryVectorBackend(VectorBackendContract):
     def make(self):
-        return InMemoryVectorBackend()
+        return InMemoryDatabase()
 
 
 class TestInMemoryDatabase(DatabaseContract):

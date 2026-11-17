@@ -10,6 +10,7 @@ from cortex_mem.testing import (
     EventStoreContract,
     KnowledgeStoreContract,
     VectorBackendContract,
+    f32,
 )
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
@@ -32,7 +33,7 @@ class TestSqliteStateBackend(EngineStateBackendContract):
 
 class TestSqliteVectorBackend(VectorBackendContract):
     def make(self):
-        return SqliteDatabase().vectors
+        return SqliteDatabase()
 
 
 class TestSqliteDatabase(DatabaseContract):
@@ -167,12 +168,12 @@ def test_vectors_groups_and_cursor_survive_reopening(tmp_path):
     v = SqliteDatabase(path).vectors
 
     assert v.meta() == {"model": "m", "group_threshold": 0.5}
-    assert v.vector("event", "e1") == [0.1, 0.2]
-    assert v.vector("knowledge", "k1") == [0.3]
+    assert v.vector("event", "e1") == f32([0.1, 0.2])
+    assert v.vector("knowledge", "k1") == f32([0.3])
     assert v.group_of("e1") == "g1"
     assert v.partition("personal", "u1") == ["e1"]
     assert v.indexed() == 7
-    assert v.cached("m", "d") == [0.5, 1 / 3]
+    assert v.cached("m", "d") == f32([0.5, 1 / 3])
 
 
 def test_writes_roll_back_with_the_transaction():

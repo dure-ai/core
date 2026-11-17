@@ -9,7 +9,8 @@ import math
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from array import array
+from collections.abc import Iterable, Sequence
 from typing import Literal, Protocol
 
 from cortex_mem.store.text import bigrams, words
@@ -55,6 +56,24 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
             math.sqrt(math.fsum(x * x for x in sa)) * math.sqrt(math.fsum(y * y for y in sb))
         )
     return math.fsum(x * y for x, y in zip(a, b, strict=True)) / norms
+
+
+def float32(vector: Iterable[float]) -> list[float]:
+    """The vector rounded to float32, as every store keeps vectors (contract
+    §5), back as Python floats."""
+    return array("f", vector).tolist()
+
+
+def top_by_cosine[T](
+    query: Sequence[float], candidates: Iterable[tuple[T, Sequence[float]]], k: int
+) -> list[tuple[T, float]]:
+    """The k candidates closest to query with a score > 0, best first. The sort
+    is stable, so ties keep the order the candidates came in. The stores that
+    score in Python share this, so they rank the same."""
+    scored = [(key, cosine(query, vector)) for key, vector in candidates]
+    kept = [pair for pair in scored if pair[1] > 0]
+    kept.sort(key=lambda pair: -pair[1])
+    return kept[: max(k, 0)]
 
 
 def text_digest(text: str) -> str:

@@ -1,4 +1,4 @@
-"""Engine port contract v0.2.
+"""Engine port contract v0.3.
 
 Everything the MCP server, the evaluation harness, and every engine share.
 The engine is the only swappable part. It reads the fixed stores through
@@ -14,7 +14,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
-CONTRACT_VERSION = "0.2.0"
+CONTRACT_VERSION = "0.3.0"
 
 Kind = Literal["record", "recall", "outcome", "human_confirm", "commit"]
 Signal = Literal["self", "test", "review", "human", "doc"]

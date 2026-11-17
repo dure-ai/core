@@ -4,13 +4,15 @@ hands engines a read-only SimilarityReader (design: core embedding §6).
 
 Determinism: the same event order, the same vectors and the same threshold
 give the same groups and the same search results. Ties go to append order
-for events and id order for knowledge.
+for events and id order for knowledge. The scores themselves are computed
+by the VectorBackend (contract §5); this module embeds, caches, picks the
+group and keeps the cursor.
 """
 
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable
 from contextlib import AbstractContextManager, nullcontext
 
-from .access import event_visible, knowledge_visible, owner_for
+from .access import event_visible, owner_for
 from .contract import (
     Caller,
     Event,
@@ -22,7 +24,7 @@ from .contract import (
     Scope,
     SimilarityReader,
 )
-from .embed import Embedder, EmbeddingError, EmbedKind, cosine, text_digest
+from .embed import Embedder, EmbeddingError, EmbedKind, text_digest
 from .store.base import EventStore, VectorBackend
 
 _QUERY_CACHE_SIZE = 256
@@ -59,8 +61,14 @@ class Index:
         self._queries: dict[str, list[float]] = {}
 
     def want(self) -> dict:
-        """The index version this Index builds."""
-        return {"model": self._embedder.model, "group_threshold": self._threshold}
+        """The index version this Index builds. It names the store, because
+        stores may score in the last float32 digits differently: moving to
+        another store rebuilds the index."""
+        return {
+            "model": self._embedder.model,
+            "group_threshold": self._threshold,
+            "store": self._backend.kind,
+        }
 
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
@@ -88,7 +96,7 @@ class Index:
                 # Embed and group first, write after: a failure writes nothing.
                 vector = self._passage_vector(event.text, embed)
                 scope, owner = event.scope, owner_for(event)
-                group_id = self._group_for(vector, scope, owner, event.id)
+                group_id = self._group_for(vector, scope, owner, event.id, seq)
                 self._backend.put_vector("event", event.id, vector)
                 self._backend.put_group(event.id, group_id, scope, owner, seq)
             self._backend.set_indexed(seq)
@@ -175,22 +183,14 @@ class Index:
     def _embed_one(self, text: str, kind: EmbedKind) -> list[float]:
         return self._embed([text], kind)[0]
 
-    def _group_for(self, vector: list[float], scope: Scope, owner: str, event_id: str) -> str:
-        """Single link within the cell: join the group of the closest member if
-        it reaches the threshold, else start a group named after this event.
-        Members come in seq order and only a strictly higher score replaces the
-        best, so a tie goes to the earlier member. Conditions are ignored."""
-        best: str | None = None
-        best_score = 0.0
-        for member in self._backend.partition(scope, owner):
-            other = self._backend.vector("event", member)
-            if other is None:
-                continue
-            score = cosine(vector, other)
-            if best is None or score > best_score:
-                best, best_score = member, score
-        if best is not None and best_score >= self._threshold:
-            group_id = self._backend.group_of(best)
+    def _group_for(self, vector: list[float], scope: Scope, owner: str, event_id: str, seq: int) -> str:
+        """Single link within the cell: join the group of the closest earlier
+        member if it reaches the threshold, else start a group named after this
+        event. The backend breaks a tie toward the earlier member. Conditions
+        are ignored."""
+        found = self._backend.nearest_member(scope, owner, vector, seq - 1)
+        if found is not None and found[1] >= self._threshold:
+            group_id = self._backend.group_of(found[0])
             if group_id is not None:
                 return group_id
         return event_id
@@ -205,12 +205,6 @@ class Index:
             del self._queries[next(iter(self._queries))]
         return found
 
-    def _event_vectors(self, upto: int | None) -> Iterator[tuple[str, list[float]]]:
-        return self._backend.vectors("event", upto)
-
-    def _knowledge_vectors(self) -> Iterator[tuple[str, list[float]]]:
-        return self._backend.vectors("knowledge")
-
     def _group(self, event_id: str, upto: int | None) -> tuple[str, list[str]] | None:
         group_id = self._backend.group_of(event_id)
         if group_id is None:
@@ -219,14 +213,6 @@ class Index:
         if event_id not in members:
             return None  # the event itself is past upto
         return group_id, members
-
-
-def _rank[T](scored: list[tuple[T, float]], k: int) -> list[tuple[T, float]]:
-    """Drop scores <= 0, best first; the sort is stable, so ties keep the
-    order the candidates came in."""
-    kept = [pair for pair in scored if pair[1] > 0]
-    kept.sort(key=lambda pair: -pair[1])
-    return kept[: max(k, 0)]
 
 
 class _Reader:
@@ -252,8 +238,8 @@ class _Reader:
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
-        stored = list(self._index._event_vectors(self._upto))
-        return self._rank_events(stored, target, caller, scope, k, kinds, exclude=None)
+        hits = self._index._backend.search_events(target, caller, scope, k, kinds, self._upto)
+        return self._with_events(hits)
 
     def neighbors(
         self, event_id: str, caller: Caller, scope: Scope, k: int = 20
@@ -265,11 +251,13 @@ class _Reader:
             return []
         if self._index._group(event_id, self._upto) is None:
             return []  # not embedded, or past upto: every embedded event has a group
-        stored = list(self._index._event_vectors(self._upto))
-        target = next((vector for id, vector in stored if id == event_id), None)
+        target = self._index._backend.vector("event", event_id)
         if target is None:
             return []
-        return self._rank_events(stored, target, caller, scope, k, None, exclude=event_id)
+        hits = self._index._backend.search_events(
+            target, caller, scope, k, None, self._upto, exclude=event_id
+        )
+        return self._with_events(hits)
 
     def knowledge(
         self, query: str, caller: Caller, scope: Scope, k: int = 20
@@ -277,14 +265,9 @@ class _Reader:
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
-        stored = list(self._index._knowledge_vectors())  # id order
-        items = {item.id: item for item in self._knowledge.get([id for id, _ in stored])}
-        scored = [
-            (items[id], cosine(target, vector))
-            for id, vector in stored
-            if id in items and knowledge_visible(items[id], caller, scope)
-        ]
-        return _rank(scored, k)
+        hits = self._index._backend.search_knowledge(target, caller, scope, k)
+        items = {item.id: item for item in self._knowledge.get([id for id, _ in hits])}
+        return [(items[id], score) for id, score in hits if id in items]
 
     def group(self, event_id: str) -> Group | None:
         found = self._index._group(event_id, self._upto)
@@ -296,23 +279,6 @@ class _Reader:
             return None
         return Group(group_id, first[0].scope, owner_for(first[0]), tuple(members))
 
-    def _rank_events(
-        self,
-        vectors: list[tuple[str, list[float]]],
-        target: list[float],
-        caller: Caller,
-        scope: Scope,
-        k: int,
-        kinds: Collection[Kind] | None,
-        exclude: str | None,
-    ) -> list[tuple[Event, float]]:
-        stored = [(id, v) for id, v in vectors if id != exclude]  # append order
-        events = {e.id: e for e in self._events.get([id for id, _ in stored])}
-        scored = [
-            (events[id], cosine(target, vector))
-            for id, vector in stored
-            if id in events
-            and (kinds is None or events[id].kind in kinds)
-            and event_visible(events[id], caller, scope)
-        ]
-        return _rank(scored, k)
+    def _with_events(self, hits: list[tuple[str, float]]) -> list[tuple[Event, float]]:
+        events = {e.id: e for e in self._events.get([id for id, _ in hits])}
+        return [(events[id], score) for id, score in hits if id in events]

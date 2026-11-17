@@ -327,7 +327,7 @@ def test_changed_threshold_rebuilds_groups_and_replays_the_engine(tmp_path):
     assert second.seen == ["e1", "e2", "e3"]  # the engine got the whole log again
     assert second.groups["e2"] == Group("e1", "personal", "u1", ("e1", "e2"))
     assert second.groups["e3"].id == "e3"
-    assert db.vectors.meta() == {"model": "table", "group_threshold": 0.5}
+    assert db.vectors.meta() == {"model": "table", "group_threshold": 0.5, "store": "sqlite"}
     assert rt.state.get("n") == 3  # state was reset, not added to
     assert rt.state.version() == ""  # no state_version on the engine, none stored
     assert [i.id for i in db.knowledge.all()] == ["k1"]  # knowledge is kept
@@ -548,7 +548,7 @@ def test_the_index_is_checked_on_every_sync_not_once_per_process():
     rt.sync()
 
     assert engine.seen == ["e1", "e2"]  # rebuilt back to 0.9 and replayed
-    assert db.vectors.meta() == {"model": "table", "group_threshold": 0.9}
+    assert db.vectors.meta() == {"model": "table", "group_threshold": 0.9, "store": db.vectors.kind}
     assert engine.groups["e2"].members == ("e2",)
 
 
@@ -568,7 +568,7 @@ def test_the_index_marker_is_hidden_from_the_engine():
     rt.append(ev("e1"))
     rt.append(ev("e2"))
     assert engine.keys == ["n"] and engine.marker is None
-    assert rt.state.get(INDEX_STATE_KEY) == {"model": "hash-256", "group_threshold": 0.9}
+    assert rt.state.get(INDEX_STATE_KEY) == {"model": "hash-256", "group_threshold": 0.9, "store": "memory"}
 
 
 # ── replay sees what live delivery saw ──────────────────────────────────────

@@ -130,7 +130,8 @@ def test_stores_agree_on_groups_and_search(tmp_path):
     assert any(hits for hits in memory[2].values())
     assert any(g and len(g.members) > 1 for g in memory[0].values())
     assert memory[0] == sqlite[0]
-    assert memory[1] == sqlite[1]  # scores compared exactly: both stores keep float64
+    # Scores compared exactly: both stores keep float32 and score with the same Python code.
+    assert memory[1] == sqlite[1]
     assert memory[2] == sqlite[2]
 
 

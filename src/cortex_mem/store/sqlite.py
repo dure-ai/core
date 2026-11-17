@@ -24,6 +24,7 @@ from os import PathLike
 from typing import Any
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
+from ..embed import cosine, float32, top_by_cosine
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
@@ -339,16 +340,25 @@ class SqliteStateBackend:
 
 
 def _pack(vector: Sequence[float]) -> bytes:
-    return array("d", vector).tobytes()
+    """float32 BLOB: the store keeps vectors at float32 (contract §5). Blobs
+    written as float64 before contract 0.3.0 are not read back correctly; the
+    index version names the store, so such an index is rebuilt anyway."""
+    return array("f", vector).tobytes()
 
 
 def _unpack(blob: bytes) -> list[float]:
-    values = array("d")
+    values = array("f")
     values.frombytes(blob)
     return values.tolist()
 
 
 class SqliteVectorBackend:
+    """Vectors as float32 BLOBs. The searches pick their candidates in SQL,
+    joined with the events and knowledge tables under the same visibility SQL
+    as text search, and score them in Python (SQLite has no vector type)."""
+
+    kind = "sqlite"
+
     def __init__(self, db: SqliteDatabase) -> None:
         self.db = db
 
@@ -455,3 +465,64 @@ class SqliteVectorBackend:
                 "ON CONFLICT (model, digest) DO UPDATE SET vec = excluded.vec",
                 (model, digest, _pack(vector)),
             )
+
+    def nearest_member(
+        self, scope: Scope, owner: str, vector: Sequence[float], upto: int
+    ) -> tuple[str, float] | None:
+        rows = self.db.query(
+            "SELECT g.event_id, v.vec FROM vector_groups g "
+            "JOIN vectors v ON v.kind = 'event' AND v.id = g.event_id "
+            "WHERE g.scope = ? AND g.owner = ? AND g.seq <= ? ORDER BY g.seq, g.event_id",
+            (scope, owner, upto),
+        )
+        query = float32(vector)
+        best: tuple[str, float] | None = None
+        for id, blob in rows:
+            score = cosine(query, _unpack(blob))
+            if best is None or score > best[1]:  # strictly: a tie keeps the earlier
+                best = (id, score)
+        return best
+
+    def search_events(
+        self,
+        vector: Sequence[float],
+        caller: Caller,
+        scope: Scope,
+        k: int,
+        kinds: Collection[Kind] | None = None,
+        upto: int | None = None,
+        exclude: str | None = None,
+    ) -> list[tuple[str, float]]:
+        if k <= 0 or (kinds is not None and not kinds):
+            return []
+        sql = (
+            "SELECT g.event_id, v.vec FROM vector_groups g "
+            "JOIN vectors v ON v.kind = 'event' AND v.id = g.event_id "
+            f"JOIN events e ON e.id = g.event_id WHERE {EVENT_VISIBLE_SQL}"
+        )
+        params: dict[str, Any] = {"user": caller.user, "team": caller.team, "scope": scope}
+        if upto is not None:
+            sql += " AND g.seq <= :upto"
+            params["upto"] = upto
+        if exclude is not None:
+            sql += " AND g.event_id != :exclude"
+            params["exclude"] = exclude
+        if kinds is not None:
+            names = [f"kind{i}" for i in range(len(kinds))]
+            sql += f" AND e.kind IN ({', '.join(':' + n for n in names)})"
+            params.update(zip(names, kinds))
+        sql += " ORDER BY g.seq, g.event_id"
+        rows = self.db.query(sql, params)
+        return top_by_cosine(float32(vector), ((id, _unpack(blob)) for id, blob in rows), k)
+
+    def search_knowledge(
+        self, vector: Sequence[float], caller: Caller, scope: Scope, k: int
+    ) -> list[tuple[str, float]]:
+        if k <= 0:
+            return []
+        rows = self.db.query(
+            "SELECT v.id, v.vec FROM vectors v JOIN knowledge k ON k.id = v.id "
+            f"WHERE v.kind = 'knowledge' AND {KNOWLEDGE_VISIBLE_SQL} ORDER BY v.id",
+            {"user": caller.user, "team": caller.team, "scope": scope},
+        )
+        return top_by_cosine(float32(vector), ((id, _unpack(blob)) for id, blob in rows), k)
