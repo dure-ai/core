@@ -2,17 +2,18 @@ import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 import anyio
 import pytest
+from cortex_mem_server import server as srv
+from cortex_mem_server.server import ScopePolicy, Service, load_engine
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from cortex_mem.contract import Demote
 from cortex_mem.embed import UpstageEmbedder
 from cortex_mem.index import Index
-from cortex_mem_server import server as srv
-from cortex_mem_server.server import ScopePolicy, Service, load_engine
 from cortex_mem.store.sqlite import SqliteDatabase
 
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
@@ -558,7 +559,8 @@ def test_wrong_password_exits_without_the_password(monkeypatch, tmp_path, caplog
     base = pg.pg_url()
     if base is None:
         pytest.skip("CORTEX_TEST_PG_URL is not set")
-    url = "postgresql://postgres:wrong-secret@localhost:54329/postgres"
+    parts = urlsplit(base)
+    url = urlunsplit(parts._replace(netloc=f"{parts.username or 'postgres'}:wrong-secret@{parts.hostname}:{parts.port}", query=""))
     with pytest.raises(SystemExit) as exc:
         _service_from_env(monkeypatch, tmp_path, CORTEX_DB_URL=url)
     assert "could not open the PostgreSQL store" in str(exc.value)

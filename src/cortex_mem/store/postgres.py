@@ -125,6 +125,13 @@ def _bad_lock_timeout(value: str) -> ValueError:
     )
 
 
+def check_lock_timeout(raw: str) -> str:
+    """Return ``raw`` if it is a PostgreSQL duration, else raise ValueError naming the setting."""
+    if not _DURATION.fullmatch(raw):
+        raise _bad_lock_timeout(raw)
+    return raw
+
+
 def _redact(text: str, *secrets: str) -> str:
     for secret in secrets:
         if secret:
@@ -138,8 +145,7 @@ class PostgresDatabase:
     def __init__(self, url: str, lock_timeout: str = "30s", vector_index: str = "none") -> None:
         if vector_index not in VECTOR_INDEXES:
             raise ValueError(f"vector_index must be one of {VECTOR_INDEXES}, not {vector_index!r}")
-        if not _DURATION.fullmatch(lock_timeout):
-            raise _bad_lock_timeout(lock_timeout)
+        check_lock_timeout(lock_timeout)
         import psycopg  # fails early with a clear error if the extra is missing
 
         self._where, password = _describe(url)

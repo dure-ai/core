@@ -54,7 +54,7 @@ from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
-from cortex_mem.store.postgres import _DURATION, PostgresDatabase
+from cortex_mem.store.postgres import PostgresDatabase, check_lock_timeout
 from cortex_mem.store.sqlite import SqliteDatabase
 
 ENGINE_ALIASES = {
@@ -142,7 +142,7 @@ class Service:
         index: Index | None = None,
     ) -> None:
         name, built = load_engine(engine)
-        self.db = db
+        self.db = db  # exposed so callers and tests can close the store
         self.runtime = Runtime(
             built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures,
             index=index,
@@ -325,11 +325,10 @@ def _db_url() -> str | None:
 
 def _lock_timeout() -> str:
     raw = os.environ.get("CORTEX_DB_LOCK_TIMEOUT", "30s").strip()
-    if not _DURATION.fullmatch(raw):
-        raise SystemExit(
-            f"cortex-mem: CORTEX_DB_LOCK_TIMEOUT must be a PostgreSQL duration such as 30s, 500ms or 2min, got {raw!r}"
-        )
-    return raw
+    try:
+        return check_lock_timeout(raw)
+    except ValueError as exc:
+        raise SystemExit(f"cortex-mem: {exc}") from None
 
 
 def _vector_index() -> str:

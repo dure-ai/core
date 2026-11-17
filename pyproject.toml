@@ -34,6 +34,7 @@ cortex-mem-server = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "server/tests"]
+pythonpath = ["tests"]
 
 # Check against the lowest supported Python so newer-only syntax is caught.
 [tool.ruff]
