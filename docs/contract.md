@@ -275,7 +275,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 - 엔진마다 시나리오별로 새 `InMemoryDatabase`와 `Runtime`을 만들어 같은 이벤트를 흘려 넣는다. 하니스는 엔진을 직접 부르지 않고 런타임만 부른다(서버와 같은 진입점).
 - 주 채점은 에이전트에게 건넨 결과(handoff)로 한다. 지식 베이스 상태(`knowledge.all()`)는 신뢰도 채점(Brier, v0.2) 같은 선택 기능에만 쓴다.
-- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다. **비교는 인메모리 저장소 기준**이다. 저장소 구현마다 검색 점수 함수가 달라(인메모리 BM25, SQLite FTS5 `bm25`, PostgreSQL `ts_rank`) 같은 데이터에서도 순위가 달라질 수 있으므로, 하니스 비교는 저장소 구현 하나로 고정한다. 인메모리 BM25는 하니스 `all_store`와 같은 공식·상수(`k1=1.5`, `b=0.75`)를 써서, 기준선과의 점수 차이가 검색 공식이 아니라 엔진 판단에서 나오게 한다.
+- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다. **비교는 인메모리 저장소 기준**이다. 저장소 구현마다 검색 점수 함수가 달라(인메모리 BM25, SQLite FTS5 `bm25`, PostgreSQL 역색인 BM25) 같은 데이터에서도 순위가 달라질 수 있으므로, 하니스 비교는 저장소 구현 하나로 고정한다. 인메모리 BM25는 하니스 `all_store`와 같은 공식·상수(`k1=1.5`, `b=0.75`)를 써서, 기준선과의 점수 차이가 검색 공식이 아니라 엔진 판단에서 나오게 한다.
 - 런타임은 `max_failures=None`(기본값)으로 만든다(§3-1).
 - 관찰 지표: 결정 기록(`verdicts`: 승인·거부, 사유, 근거 id), `why`별 강등 수, handoff 필터에 걸린 수.
 
@@ -326,15 +326,16 @@ class VectorBackend(Protocol):                                # 색인 상태·�
   - 가시성은 같은 `Database`의 이벤트·지식으로 판단한다. 그래서 백엔드는 그 옆에서 만든다(인메모리는 `InMemoryVectorBackend(events, knowledge)`, SQL 저장소는 `events`·`knowledge` 표와 잇는다). 파이썬 구현은 `access.event_visible`·`knowledge_visible`, SQL 구현은 텍스트 검색과 같은 조건(`store/text.py`의 `EVENT_VISIBLE_SQL`·`KNOWLEDGE_VISIBLE_SQL`)을 쓴다. `VectorBackendContract`의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려주고, 범위 × 호출자 조합의 기대 id 표로 두 구현이 같은지 고정한다.
   - 인메모리와 SQLite는 같은 파이썬 코드로 계산하므로 점수가 비트까지 같다. PostgreSQL(pgvector)은 DB 안에서 계산하므로 점수가 1e-6 안에서 같다고 본다. 색인 버전(`Index.want()`)에 `store: backend.kind`가 들어 있어 저장소를 옮기면 색인을 다시 만들고 엔진에 처음부터 다시 전달한다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
-- **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, append를 `transaction()` 안에서 잠금(advisory lock 등)으로 직렬화한다. PG 구현에는 동시 append 두 개를 섞는 적합성 테스트를 추가한다(지금의 `DatabaseContract`로는 잡히지 않는다).
-- **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL도 `to_tsvector('simple', words || ' ' || grams)`로 같은 토큰을 쓰면 확장 없이 옮겨진다.
+- **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, PG 구현(`PostgresDatabase`)은 `transaction()`을 바깥에서만 `BEGIN` + `pg_advisory_xact_lock`(DB 전체 잠금 하나)으로 열고, 위치를 잠금 안에서 `max(seq)+1`로 정한다. 롤백된 append는 번호를 남기지 않는다. 잠금 대기는 `lock_timeout`(서버 `CORTEX_DB_LOCK_TIMEOUT`, 기본 `30s`)으로 끊고 분명한 오류를 낸다. 트랜잭션 안에서 DB 오류를 잡아 넘기면 안 된다(중단된 트랜잭션은 커밋되지 않는다). 동시 append·전달을 섞는 시험은 `tests/test_postgres.py`와 `tests/test_similarity_behaviour.py`에 있다(`DatabaseContract`만으로는 잡히지 않는다).
+- **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL은 같은 토큰(`store/text.py`)을 역색인 표(`event_terms`, `knowledge_terms`, 문서 길이 표)에 쓰고 BM25(k1=1.2, b=0.75)를 SQL 집계로 계산한다. 기본 전문 검색(`tsvector`)은 한국어를 나누지 못하고 IDF가 없어 쓰지 않으며, 확장도 필요 없다. df·문서 수·평균 길이는 호출자가 볼 수 있는 기록만으로 계산한다(숨은 기록이 점수를 바꾸지 않는다). 점수 값은 저장소마다 다르고 순서의 성질만 같다.
+- **PostgreSQL 저장 형식**: JSON(`conditions`, `refs`, 엔진 상태 값 등)과 시각은 `text`로 저장해 키 순서와 시간대·마이크로초가 그대로 돌아온다(`jsonb`·`timestamptz`를 쓰지 않는다). id로 정렬하거나 동점을 가를 때는 `COLLATE "C"`로 파이썬·SQLite와 같은 바이트 순서를 쓴다. 벡터는 pgvector `vector`(float32)이고 점수는 `1 - (emb <=> q)`다. 정확 검색이 기본이고, 근사 색인(HNSW, `CORTEX_VECTOR_INDEX=hnsw`)은 `search_events`·`search_knowledge`에만 쓰며 기본은 꺼져 있다. 근사 색인은 진짜 최근접을 놓치거나 가시성 필터 때문에 k개보다 적게 낼 수 있다. 차원이 4000을 넘으면 색인 없이 정확 검색만 된다. 한 색인 버전 안에서 벡터 차원이 다르면 쓰기에서 `ValueError`를 낸다.
 
 ### 계약 변경 이력
 
 | 버전 | 바뀐 것 | 엔진 영향 |
 | --- | --- | --- |
 | 0.2.0 | 코어 임베딩 색인과 읽기 전용 `ctx.similar`(`SimilarityReader`: search·neighbors·knowledge·group), `Database.vectors`, `VectorBackend` | 엔진이 `ctx.similar`를 쓸 수 있다(없으면 `None`) |
-| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(1e-6 안) 달라질 수 있다 |
+| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(1e-6 안) 달라질 수 있다. PostgreSQL + pgvector 구현(`PostgresDatabase`)이 같은 적합성 시험을 통과하는 기준 저장소로 추가된다 |
 
 ## 6. v0.2 이후로 미룬 것
 
@@ -381,6 +382,8 @@ class VectorBackend(Protocol):                                # 색인 상태·�
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
 - [ ] 공용 DB 위치: team scope는 공용 DB가 있어야 사람 간 독립 출처를 셀 수 있다.
+- **운영 요구**: PostgreSQL 14 이상, pgvector 0.7 이상(근사 색인의 반복 탐색 `hnsw.iterative_scan`은 0.8 이상). DB마다 `CREATE EXTENSION vector`가 필요하다(없으면 시작할 때 빠진 것을 알리고 멈춘다). 드라이버는 선택 의존성 `cortex-mem[postgres]`(psycopg 3).
+- [ ] 전역 잠금(DB 하나에 잠금 하나)을 유지할지는 지연을 잰 뒤 정한다. 근사 색인 기본값도 측정 뒤 정한다.
 
 **모두**
 - [ ] 독립 출처의 기본 단위를 `user`로 볼지, `(user, session)`으로 볼지. 계약은 둘 다 담을 수 있고, 판정은 엔진 몫이다.
