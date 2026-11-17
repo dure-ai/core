@@ -12,7 +12,7 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Literal, Protocol
 
-from cortex_mem.store.sqlite import _bigrams, _words
+from cortex_mem.store.text import bigrams, words
 
 EmbedKind = Literal["passage", "query"]
 """Whether a text is stored (passage) or searched with (query)."""
@@ -75,7 +75,7 @@ class HashEmbedder:
 
     def _one(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
-        for token in _words(text) + _bigrams(text):
+        for token in words(text) + bigrams(text):
             n = int.from_bytes(hashlib.sha256(token.encode("utf-8")).digest()[:8], "big")
             vec[n % self.dim] += 1.0 if (n // self.dim) % 2 == 0 else -1.0
         norm = math.sqrt(math.fsum(x * x for x in vec))
