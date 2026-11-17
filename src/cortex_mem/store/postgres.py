@@ -28,12 +28,14 @@ import json
 import re
 import threading
 from collections import Counter
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
+from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, pg_params, words
 
 SCHEMA_VERSION = 1
@@ -195,8 +197,8 @@ class PostgresDatabase:
     def vectors(self) -> Any:
         raise NotImplementedError("the PostgreSQL vector store is not implemented yet")
 
-    def state(self, engine: str) -> Any:
-        raise NotImplementedError("the PostgreSQL state store is not implemented yet")
+    def state(self, engine: str) -> "PgStateBackend":
+        return PgStateBackend(self, engine)
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -497,3 +499,74 @@ class PgKnowledgeStore:
             "terms": terms, "user": caller.user, "team": caller.team, "scope": scope, "k": k,
         }  # fmt: skip
         return [(_row_to_knowledge(row[:-1]), row[-1]) for row in self.db.query(_KNOWLEDGE_SEARCH_SQL, params)]
+
+
+class PgStateBackend:
+    """One engine's key/value state and delivery cursor, as SQLite's backend does it.
+
+    Values are stored as JSON text (not jsonb) so key order survives a round trip.
+    """
+
+    def __init__(self, db: PostgresDatabase, engine: str) -> None:
+        self.db = db
+        self.engine = engine
+
+    def get(self, key: str) -> Any | None:
+        rows = self.db.query(
+            "SELECT value FROM engine_state WHERE engine = %s AND key = %s", (self.engine, key)
+        )
+        return json.loads(rows[0][0]) if rows else None
+
+    def scan(self, prefix: str = "") -> Iterator[tuple[str, Any]]:
+        # left() takes the prefix as data, so no LIKE escaping is needed.
+        rows = self.db.query(
+            'SELECT key, value FROM engine_state WHERE engine = %s AND left(key, length(%s)) = %s '
+            'ORDER BY key COLLATE "C"',
+            (self.engine, prefix, prefix),
+        )
+        for key, value in rows:
+            yield key, json.loads(value)
+
+    def cursor(self) -> int:
+        rows = self.db.query("SELECT cursor FROM engine_cursor WHERE engine = %s", (self.engine,))
+        return rows[0][0] if rows else 0
+
+    def commit(
+        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
+    ) -> None:
+        # Serialize before any write, so a value that is not JSON leaves nothing half-written.
+        encoded = [(self.engine, key, json.dumps(value)) for key, value in writes.items()]
+        with self.db.transaction():
+            current = self.cursor()
+            if current != expected:
+                raise CursorConflict(f"cursor is {current}, expected {expected}")
+            con = self.db.con
+            with con.cursor() as cur:
+                cur.executemany(
+                    "DELETE FROM engine_state WHERE engine = %s AND key = %s",
+                    [(self.engine, key) for key in deletes],
+                )
+                cur.executemany(
+                    "INSERT INTO engine_state (engine, key, value) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (engine, key) DO UPDATE SET value = EXCLUDED.value",
+                    encoded,
+                )
+            con.execute(
+                "INSERT INTO engine_cursor (engine, cursor) VALUES (%s, %s) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = EXCLUDED.cursor",
+                (self.engine, cursor),
+            )
+
+    def version(self) -> str | None:
+        rows = self.db.query("SELECT version FROM engine_cursor WHERE engine = %s", (self.engine,))
+        return rows[0][0] if rows else None
+
+    def reset(self, version: str) -> None:
+        with self.db.transaction():
+            con = self.db.con
+            con.execute("DELETE FROM engine_state WHERE engine = %s", (self.engine,))
+            con.execute(
+                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (%s, 0, %s) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version",
+                (self.engine, version),
+            )

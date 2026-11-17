@@ -16,6 +16,7 @@ from cortex_mem.store.postgres import (
     require_vector_type,
 )
 from cortex_mem.testing import (
+    EngineStateBackendContract,
     EventStoreContract,
     KnowledgeStoreContract,
     caller,
@@ -443,3 +444,44 @@ class TestPgKnowledge(KnowledgeStoreContract):
         kb.put(item("hidden2", "canary " * 40, scope="personal", owner="u2"))
 
         assert kb.search("canary", caller(), "team") == before
+
+
+class TestPgState(EngineStateBackendContract):
+    """The shared engine-state contract on PostgreSQL, plus key order and engine isolation."""
+
+    @pytest.fixture(autouse=True)
+    def _databases(self, pg_schema):
+        self.url = pg_schema
+        self.dbs: list[PostgresDatabase] = []
+        yield
+        for db in self.dbs:
+            db.close()
+
+    def open(self) -> PostgresDatabase:
+        db = PostgresDatabase(self.url)
+        self.dbs.append(db)
+        return db
+
+    def make(self):
+        return self.open().state("engine")
+
+    def test_values_keep_key_order(self):
+        state = self.make()
+        state.commit(0, 1, {"k": {"b": 1, "a": 2}}, set())
+
+        assert list(state.get("k")) == ["b", "a"]
+        (_, value), = state.scan()
+        assert list(value) == ["b", "a"]
+
+    def test_two_engines_do_not_share_state(self):
+        db = self.open()
+        a, b = db.state("a"), db.state("b")
+        a.commit(0, 2, {"k": "from a", "only-a": 1}, set())
+        b.commit(0, 5, {"k": "from b"}, set())
+
+        assert (a.get("k"), a.cursor()) == ("from a", 2)
+        assert (b.get("k"), b.cursor()) == ("from b", 5)
+        assert list(b.scan()) == [("k", "from b")]
+        b.reset("9")
+        assert (a.get("k"), a.cursor(), a.version()) == ("from a", 2, None)
+        assert list(a.scan()) == [("k", "from a"), ("only-a", 1)]
