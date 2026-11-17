@@ -629,10 +629,10 @@ class TestPgVectors(VectorBackendContract):
                 me = caller(*who)
                 for kw in ({}, {"kinds": {"record"}, "upto": 40, "exclude": "e03"}):
                     want = exact.vectors.search_events(q, me, scope, k, **kw)
-                    assert hnsw.vectors.search_events(q, me, scope, k, **kw) == want
+                    self.scores_match(hnsw.vectors.search_events(q, me, scope, k, **kw), want)
                     found += len(want)
                 want = exact.vectors.search_knowledge(q, me, scope, k)
-                assert hnsw.vectors.search_knowledge(q, me, scope, k) == want
+                self.scores_match(hnsw.vectors.search_knowledge(q, me, scope, k), want)
                 found += len(want)
         assert found > 100  # the comparison is not between empty lists
 
@@ -644,3 +644,59 @@ class TestPgVectors(VectorBackendContract):
         assert _hnsw_indexes(db) == set()
         assert "4001" in caplog.text
         assert vb.search_events([1.0] * 4001, caller(), "personal", 5) == [("e1", pytest.approx(1.0))]
+
+    def test_hnsw_turned_on_for_an_existing_index_version_builds_its_index(self):
+        before = self.open("none")
+        before.vectors.reset({"model": "m1", "group_threshold": 0.8})
+        rng = random.Random(3)
+        for seq in range(1, 31):
+            vector = [rng.uniform(-1, 1) for _ in range(4)]
+            self.index_event(before, ev(f"e{seq:02d}", scope="org"), vector, seq)
+            before.knowledge.put(item(f"k{seq:02d}", scope="org", owner="*"))
+            before.vectors.put_vector("knowledge", f"k{seq:02d}", vector)
+        assert _hnsw_indexes(before) == set()
+
+        hnsw = self.open("hnsw")  # opening learns D from the index version and builds the index
+        assert _hnsw_indexes(hnsw) == {"event_vectors_hnsw_d4", "knowledge_vectors_hnsw_d4"}
+        q, me = [0.3, -0.2, 0.9, 0.1], caller()
+        self.scores_match(
+            hnsw.vectors.search_events(q, me, "org", 7), before.vectors.search_events(q, me, "org", 7)
+        )
+        self.scores_match(
+            hnsw.vectors.search_knowledge(q, me, "org", 7), before.vectors.search_knowledge(q, me, "org", 7)
+        )
+        # Without its index a search is exact rather than a halfvec scan.
+        hnsw.query("DROP INDEX event_vectors_hnsw_d4")
+        assert hnsw.vectors.search_events(q, me, "org", 30) == before.vectors.search_events(q, me, "org", 30)
+
+    def test_halfvec_overflow_is_refused_with_hnsw_on(self, caplog):
+        db = self.open("hnsw")
+        vb = db.vectors
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        for big in ([70000.0, 0.0], [0.0, -65505.0]):
+            with pytest.raises(ValueError, match="halfvec"):
+                vb.put_vector("event", "e2", big)
+            with pytest.raises(ValueError, match="halfvec"):
+                vb.put_vector("knowledge", "k1", big)
+            with pytest.raises(ValueError, match="halfvec"):
+                vb.search_events(big, caller(), "org", 5)
+            with pytest.raises(ValueError, match="halfvec"):
+                vb.search_knowledge(big, caller(), "org", 5)
+        # Refused before anything is written, so a surrounding transaction still commits.
+        with db.transaction():
+            with pytest.raises(ValueError):
+                vb.put_vector("event", "e3", [70000.0, 0.0])
+            vb.put_vector("event", "e4", [65504.0, -65504.0])  # the largest halfvec
+        assert [i for i, _ in vb.vectors("event")] == ["e1", "e4"]
+
+        # Without HNSW such vectors are fine; turning HNSW on then skips that table's index
+        # (building it would fail) and searches it exactly.
+        plain = self.open("none")
+        plain.vectors.reset({"model": "m2", "group_threshold": 0.8})
+        self.index_event(plain, ev("big"), [70000.0, 1.0], 1)
+        reopened = self.open("hnsw")
+        assert _hnsw_indexes(reopened) == {"knowledge_vectors_hnsw_d2"}
+        assert "halfvec" in caplog.text
+        got = reopened.vectors.search_events([1.0, 0.0], caller(), "personal", 5)
+        self.scores_match(got, [("big", 1.0)])

@@ -165,6 +165,7 @@ class PostgresDatabase:
         try:
             require_vector_type(self.con)
             self._create()
+            self._vectors.load()
         except BaseException:
             self.con.close()
             raise
@@ -579,6 +580,7 @@ class PgStateBackend:
 log = logging.getLogger(__name__)
 
 HNSW_MAX_DIM = 4000  # halfvec's HNSW limit; larger vectors are searched exactly
+HALFVEC_MAX = 65504.0  # largest finite half-precision value; beyond it the halfvec cast fails
 _HNSW_TABLES = ("event_vectors", "knowledge_vectors")
 _KINDS = {"event": "event_vectors", "knowledge": "knowledge_vectors"}
 
@@ -613,19 +615,42 @@ _KNOWLEDGE_FROM = "FROM knowledge_vectors v JOIN knowledge k ON k.id = v.id"
 class PgVectorBackend:
     """Vectors as pgvector ``vector`` (float32), cosine computed in SQL: score =
     1 - (emb <=> q). The searches join events and knowledge under the shared visibility
-    SQL, so one statement picks, scores and ranks. Exact by default; with
-    ``vector_index="hnsw"`` the searches (never nearest_member) take candidates from an
-    HNSW index on emb::halfvec(D) and rank them by the exact score.
+    SQL, so one statement picks, scores and ranks.
 
     Every vector of one index version has one dimension D, kept in vector_meta as 'dim'
     from the first put after reset(); a vector or query of another dimension raises
     ValueError before anything is written. The embedding cache holds any dimension.
+
+    Exact search is the default and the reference: measure with it. With
+    ``vector_index="hnsw"`` the backend builds an HNSW index on emb::halfvec(D) for each
+    vector table once it learns D (on the first put of an index version, or on opening a
+    database that already has one; D <= 4000), and search_events / search_knowledge
+    (never nearest_member) take candidates from it and rank them by the exact score.
+    Those results are approximate: halfvec precision can put a slightly farther vector
+    among the candidates instead of the nearest one, and under a selective visibility
+    filter the iterative scan can stop at ``hnsw.max_scan_tuples`` and return fewer than
+    k matches although more exist. A table without its index (D > 4000, or vectors
+    written beyond halfvec range before HNSW was turned on) is searched exactly. With
+    HNSW on, a vector or query component beyond halfvec range (|x| > 65504) raises
+    ValueError before anything is written, so a caller's transaction is never aborted
+    by the cast.
     """
 
     kind = "postgres"
 
     def __init__(self, db: PostgresDatabase) -> None:
         self.db = db
+        self._hnsw_for: int | None = None  # the D this backend last built (or checked) indexes for
+
+    def load(self) -> None:
+        """On opening the database: with HNSW on, build the indexes of an index version
+        that already has a dimension (vectors written while HNSW was off)."""
+        if self.db.vector_index != "hnsw":
+            return
+        with self.db.transaction():
+            dim = self._dim()
+            if dim is not None:
+                self._ensure_hnsw(dim)
 
     # Index state
 
@@ -654,6 +679,7 @@ class PgVectorBackend:
                 con.execute(f"DELETE FROM {table}")
             con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
             self._set_meta("meta", encoded)
+            self._hnsw_for = None
 
     def indexed(self) -> int:
         value = self._get_meta("indexed")
@@ -685,11 +711,20 @@ class PgVectorBackend:
                 "reset the index to change models"
             )
 
-    def _hnsw_dim(self, dim: int | None) -> int | None:
-        """D when the searches go through the HNSW index, else None."""
+    def _check_halfvec(self, vector: list[float]) -> None:
+        """With HNSW on, refuse what the emb::halfvec(D) cast would fail on."""
+        if self.db.vector_index == "hnsw" and any(abs(x) > HALFVEC_MAX for x in vector):
+            raise ValueError(
+                f"with the HNSW index on, vector components must be within halfvec range "
+                f"(|x| <= {HALFVEC_MAX:g})"
+            )
+
+    def _hnsw_dim(self, table: str, dim: int | None) -> int | None:
+        """D when searches of ``table`` go through its HNSW index (it exists), else None."""
         if self.db.vector_index != "hnsw" or dim is None or dim > HNSW_MAX_DIM:
             return None
-        return dim
+        rows = self.db.query("SELECT to_regclass(%s) IS NOT NULL", (_hnsw_name(table, dim),))
+        return dim if rows[0][0] else None
 
     def _hnsw_indexes(self) -> list[str]:
         rows = self.db.query(
@@ -699,20 +734,35 @@ class PgVectorBackend:
         )
         return [r[0] for r in rows]
 
-    def _record_dim(self, dim: int) -> None:
-        """Record D for this index version and build its HNSW indexes when they are on."""
-        self._set_meta("dim", str(dim))
-        if self.db.vector_index != "hnsw":
-            return
+    def _ensure_hnsw(self, dim: int) -> None:
+        """Inside a write transaction, with HNSW on: build the missing indexes for D, once
+        per D per backend. A table holding a component beyond halfvec range (written while
+        HNSW was off) gets no index, since building it would fail; it is searched exactly."""
+        self._hnsw_for = dim
         if dim > HNSW_MAX_DIM:
             log.warning(
                 "vectors have %d dimensions, more than HNSW's %d for halfvec; searching exactly",
                 dim, HNSW_MAX_DIM,
             )  # fmt: skip
             return
+        have = set(self._hnsw_indexes())
         for table in _HNSW_TABLES:
+            name = _hnsw_name(table, dim)
+            if name in have:
+                continue
+            overflow = self.db.con.execute(
+                f"SELECT EXISTS (SELECT 1 FROM {table} v, unnest(v.emb::real[]) x WHERE abs(x) > %s)",
+                (HALFVEC_MAX,),
+            ).fetchone()[0]
+            if overflow:
+                log.warning(
+                    "%s holds components beyond halfvec range (|x| > %g); no HNSW index, "
+                    "searching it exactly until the index is reset",
+                    table, HALFVEC_MAX,
+                )  # fmt: skip
+                continue
             self.db.con.execute(
-                f"CREATE INDEX IF NOT EXISTS {_hnsw_name(table, dim)} ON {table} "
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table} "
                 f"USING hnsw ((emb::halfvec({dim})) halfvec_cosine_ops)"
             )
 
@@ -721,11 +771,14 @@ class PgVectorBackend:
     def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
         table = _KINDS[kind]
         values = float32(vector)
+        self._check_halfvec(values)  # before any write, so the transaction stays usable
         with self.db.transaction():
             dim = self._dim()
-            self._check_dim(values, dim)  # before any write, so the transaction stays usable
+            self._check_dim(values, dim)  # likewise
             if self._get_meta("dim") is None:
-                self._record_dim(len(values))
+                self._set_meta("dim", str(len(values)))
+            if self.db.vector_index == "hnsw" and self._hnsw_for != len(values):
+                self._ensure_hnsw(len(values))
             if kind == "event":
                 # ord is assigned on first insert; replacing keeps it (and the position).
                 self.db.con.execute(
@@ -819,9 +872,12 @@ class PgVectorBackend:
 
     # Similarity
 
-    def _query(self, vector: Sequence[float]) -> tuple[str, int | None]:
-        """The query as a pgvector literal, and D; ValueError on a bad query."""
+    def _query(self, vector: Sequence[float], halfvec: bool = False) -> tuple[str, int | None]:
+        """The query as a pgvector literal, and D; ValueError on a bad query. halfvec: the
+        query may be cast to halfvec (the searches, with HNSW on)."""
         values = float32(vector)
+        if halfvec:
+            self._check_halfvec(values)
         dim = self._dim()
         self._check_dim(values, dim)
         return _literal(values), dim
@@ -839,14 +895,17 @@ class PgVectorBackend:
         )
         return (rows[0][0], rows[0][1]) if rows else None
 
-    def _ranked(self, candidates: str, ties: str, params: dict[str, Any], k: int, dim: int | None) -> list:
+    def _ranked(
+        self, table: str, candidates: str, ties: str, params: dict[str, Any], k: int, dim: int | None
+    ) -> list:
         """(id, score) of the best k rows of ``candidates``, a SELECT of ``id``, its tie
         columns and ``dist`` (already limited to dist < 1, i.e. score > 0) whose FROM has
-        ``v`` as the vector table. Exact unless the HNSW index is on: then the index picks
-        candidates by halfvec distance and they are ranked here by the exact one."""
+        ``table`` as ``v``. Exact unless ``table`` has its HNSW index: then the index picks
+        candidates by halfvec distance and they are ranked here by the exact one, which is
+        approximate (see the class docstring)."""
         params = {**params, "k": k}
         rank = f"ORDER BY dist, {ties} LIMIT %(k)s"
-        hnsw = self._hnsw_dim(dim)
+        hnsw = self._hnsw_dim(table, dim)
         if hnsw is None:
             return self.db.query(f"SELECT id, 1 - dist FROM ({candidates}) c {rank}", params)
         params["n"] = max(4 * k, 40)
@@ -878,9 +937,10 @@ class PgVectorBackend:
         upto: int | None = None,
         exclude: str | None = None,
     ) -> list[tuple[str, float]]:
+        """Exact, or approximate with HNSW on: then possibly fewer than k (class docstring)."""
         if k <= 0 or (kinds is not None and not kinds):
             return []
-        q, dim = self._query(vector)
+        q, dim = self._query(vector, halfvec=True)
         sql = (
             f"SELECT g.event_id AS id, g.seq AS seq, {_DIST} AS dist {_EVENT_FROM} "
             f"WHERE {pg_params(EVENT_VISIBLE_SQL)} AND {_DIST} < 1"
@@ -895,17 +955,18 @@ class PgVectorBackend:
         if exclude is not None:
             sql += " AND g.event_id <> %(exclude)s"
             params["exclude"] = exclude
-        return self._ranked(sql, 'seq, id COLLATE "C"', params, k, dim)
+        return self._ranked("event_vectors", sql, 'seq, id COLLATE "C"', params, k, dim)
 
     def search_knowledge(
         self, vector: Sequence[float], caller: Caller, scope: Scope, k: int
     ) -> list[tuple[str, float]]:
+        """Exact, or approximate with HNSW on: then possibly fewer than k (class docstring)."""
         if k <= 0:
             return []
-        q, dim = self._query(vector)
+        q, dim = self._query(vector, halfvec=True)
         sql = (
             f"SELECT v.id AS id, {_DIST} AS dist {_KNOWLEDGE_FROM} "
             f"WHERE {pg_params(KNOWLEDGE_VISIBLE_SQL)} AND {_DIST} < 1"
         )
         params = {"q": q, "user": caller.user, "team": caller.team, "scope": scope}
-        return self._ranked(sql, 'id COLLATE "C"', params, k, dim)
+        return self._ranked("knowledge_vectors", sql, 'id COLLATE "C"', params, k, dim)
