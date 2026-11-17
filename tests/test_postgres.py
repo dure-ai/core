@@ -5,14 +5,17 @@ Every test uses the ``pg_schema`` fixture, so all of them skip without ``CORTEX_
 
 import threading
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from cortex_mem.contract import Event
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
     require_vector_type,
 )
+from cortex_mem.testing import EventStoreContract, caller, ev
 
 TABLES = {
     "cortex_meta", "events", "event_terms", "event_stats", "knowledge", "knowledge_terms",
@@ -264,3 +267,92 @@ def test_lock_timeout_is_validated_at_construction(pg_schema):
     for good in ("30s", "500ms", "2min", "0", "1.5s"):
         with closing(PostgresDatabase(pg_schema, lock_timeout=good)) as db, db.transaction():
             pass
+
+
+class TestPgEvents(EventStoreContract):
+    """The shared event-store contract on PostgreSQL, plus what only PostgreSQL has to prove."""
+
+    @pytest.fixture(autouse=True)
+    def _databases(self, pg_schema):
+        self.url = pg_schema
+        self.dbs: list[PostgresDatabase] = []
+        yield
+        for db in self.dbs:
+            db.close()
+
+    def open(self) -> PostgresDatabase:
+        db = PostgresDatabase(self.url)
+        self.dbs.append(db)
+        return db
+
+    def make(self):
+        return self.open().events
+
+    def test_append_positions_follow_commit_order(self):
+        first, second = self.open(), self.open()
+        for i in range(6):
+            (first if i % 2 == 0 else second).events.append(ev(f"e{i}", "x"))
+
+        rows = list(first.events.since(0))
+        assert [seq for seq, _ in rows] == [1, 2, 3, 4, 5, 6]
+        assert [e.id for _, e in rows] == [f"e{i}" for i in range(6)]
+
+    def test_rolled_back_append_leaves_no_gap(self):
+        db = self.open()
+        with pytest.raises(RuntimeError, match="boom"), db.transaction():
+            db.events.append(ev("lost", "x"))
+            raise RuntimeError("boom")
+
+        db.events.append(ev("kept", "x"))
+
+        assert [(seq, e.id) for seq, e in db.events.since(0)] == [(1, "kept")]
+
+    def test_duplicate_id_leaves_the_transaction_usable(self):
+        db = self.open()
+        db.events.append(ev("e1", "a"))
+        with db.transaction():
+            with pytest.raises(ValueError, match="duplicate event id: e1"):
+                db.events.append(ev("e1", "b"))
+            db.events.append(ev("e2", "c"))
+
+        assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
+
+    def test_round_trip_keeps_timezone_microseconds_and_json_key_order(self):
+        at = datetime(2026, 11, 16, 9, 30, 15, 123456, tzinfo=timezone(timedelta(hours=9)))
+        original = Event(
+            id="e1", kind="record", at=at, user="u1", team="t1", session="s1", scope="team",
+            text="x", conditions={"zeta": 1, "alpha": {"y": 2, "b": 3}, "mid": [3, 1]}, refs=("h2", "h1"),
+        )  # fmt: skip
+        store = self.make()
+        store.append(original)
+
+        (got,) = store.get(["e1"])
+        assert got == original
+        assert got.at.utcoffset() == timedelta(hours=9) and got.at.microsecond == 123456
+        assert list(got.conditions) == ["zeta", "alpha", "mid"]
+        assert list(got.conditions["alpha"]) == ["y", "b"]
+        assert got.refs == ("h2", "h1")
+
+    def test_search_uses_corpus_statistics_not_the_visible_subset(self):
+        store = self.make()
+        # The word is common in the corpus (hidden events count) so it scores low in every case.
+        store.append(ev("a", "release", user="u2"))
+        store.append(ev("b", "release", user="u2"))
+        store.append(ev("mine", "release notes", user="u1"))
+        store.append(ev("other", "canary notes", user="u1"))
+
+        assert [e.id for e, _ in store.search("release canary", caller(), "personal")] == ["other", "mine"]
+
+    def test_search_ignores_empty_query_and_non_positive_k(self):
+        store = self.make()
+        store.append(ev("e1", "deploy"))
+
+        assert store.search("  ", caller(), "personal") == []
+        assert store.search("deploy", caller(), "personal", k=0) == []
+
+    def test_empty_text_is_stored_but_matches_nothing(self):
+        store = self.make()
+        store.append(ev("e1", ""))
+
+        assert [e.id for _, e in store.since(0)] == ["e1"]
+        assert store.search("deploy", caller(), "personal") == []

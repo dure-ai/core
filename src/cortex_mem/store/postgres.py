@@ -12,16 +12,28 @@ silently: see transaction().
 Tables are created in the connection's current schema (the first one on ``search_path``),
 never a hard-coded one.
 
-The event, knowledge, state and vector stores land on top of this in later steps; until
-then ``events``, ``knowledge``, ``vectors`` and ``state()`` raise ``NotImplementedError``.
+``PgEventStore`` (``db.events``) is the append-only event log with BM25 text search. The
+knowledge, state and vector stores land on top of this in later steps; until then
+``knowledge``, ``vectors`` and ``state()`` raise ``NotImplementedError``.
+
+Shared SQL fragments are written with ``:name`` parameters and turned into psycopg's
+``%(name)s`` by ``pg_params``. That rewrite does not parse string literals, so it would
+change a ``:name`` inside one, and a literal ``%`` in any statement sent through psycopg
+must be written ``%%``. The shared fragments contain neither.
 """
 
 import hashlib
+import json
 import re
 import threading
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
+
+from ..contract import Caller, Event, Kind, Scope
+from .text import EVENT_VISIBLE_SQL, bigrams, pg_params, words
 
 SCHEMA_VERSION = 1
 VECTOR_INDEXES = ("none", "hnsw")
@@ -141,6 +153,7 @@ class PostgresDatabase:
         # MCP servers may call tools from worker threads; one lock serializes them.
         self._lock = threading.RLock()
         self._depth = 0
+        self._events = PgEventStore(self)
         try:
             require_vector_type(self.con)
             self._create()
@@ -169,8 +182,8 @@ class PostgresDatabase:
                 )
 
     @property
-    def events(self) -> Any:
-        raise NotImplementedError("the PostgreSQL event store is not implemented yet")
+    def events(self) -> "PgEventStore":
+        return self._events
 
     @property
     def knowledge(self) -> Any:
@@ -275,3 +288,111 @@ class PostgresDatabase:
 
     def close(self) -> None:
         self.con.close()
+
+
+_EVENT_COLUMNS = (
+    'id, kind, at, "user", team, session, scope, text, agent, signal, outcome, '
+    "conditions, refs, repo, rev, text_redacted"
+)
+BM25_K1 = 1.2
+BM25_B = 0.75
+
+# BM25 over event_terms. Corpus statistics (N, average length, df) count every event, not
+# only the ones the caller may see, as SQLite FTS5 does. Placeholders are psycopg's.
+_SEARCH_SQL = f"""
+WITH df AS (
+    SELECT term, count(*)::float8 AS df FROM event_terms WHERE term = ANY(%(terms)s) GROUP BY term
+), corpus AS (
+    SELECT (SELECT count(*) FROM events)::float8 AS n, (SELECT avg(len) FROM event_stats)::float8 AS avgdl
+)
+SELECT {", ".join("e." + c for c in _EVENT_COLUMNS.split(", "))},
+       sum(ln((corpus.n - df.df + 0.5) / (df.df + 0.5) + 1)
+           * t.tf * ({BM25_K1} + 1) / (t.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * s.len / corpus.avgdl))) AS score
+FROM event_terms t
+JOIN df ON df.term = t.term
+JOIN events e ON e.seq = t.seq
+JOIN event_stats s ON s.seq = t.seq
+CROSS JOIN corpus
+WHERE t.term = ANY(%(terms)s) AND {pg_params(EVENT_VISIBLE_SQL)}
+"""
+
+
+def _row_to_event(row: tuple) -> Event:
+    id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
+    return Event(
+        id=id, kind=kind, at=datetime.fromisoformat(at), user=user, team=team, session=session,
+        scope=scope, text=text, agent=agent, signal=signal, outcome=outcome,
+        conditions=json.loads(conditions), refs=tuple(json.loads(refs)), repo=repo, rev=rev,
+        text_redacted=bool(redacted),
+    )  # fmt: skip
+
+
+class PgEventStore:
+    def __init__(self, db: PostgresDatabase) -> None:
+        self.db = db
+
+    def append(self, event: Event) -> str:
+        e = event
+        tokens = Counter(words(e.text) + bigrams(e.text))
+        with self.db.transaction():
+            # Checked, not caught: a failed INSERT would abort the whole transaction.
+            if self.db.con.execute("SELECT 1 FROM events WHERE id = %s", (e.id,)).fetchone():
+                raise ValueError(f"duplicate event id: {e.id}")
+            # Writers hold the database-wide lock, so max+1 is gap-free and in commit order.
+            seq = self.db.con.execute("SELECT coalesce(max(seq), 0) + 1 FROM events").fetchone()[0]
+            self.db.con.execute(
+                f"INSERT INTO events (seq, {_EVENT_COLUMNS}) VALUES ({', '.join(['%s'] * 17)})",
+                (
+                    seq, e.id, e.kind, e.at.isoformat(), e.user, e.team, e.session, e.scope, e.text,
+                    e.agent, e.signal, e.outcome, json.dumps(dict(e.conditions)),
+                    json.dumps(list(e.refs)), e.repo, e.rev, e.text_redacted,
+                ),
+            )  # fmt: skip
+            if tokens:
+                with self.db.con.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO event_terms (seq, term, tf) VALUES (%s, %s, %s)",
+                        [(seq, term, tf) for term, tf in tokens.items()],
+                    )
+            self.db.con.execute(
+                "INSERT INTO event_stats (seq, len) VALUES (%s, %s)", (seq, sum(tokens.values()))
+            )
+        return e.id
+
+    def since(self, seq: int, page: int = 256) -> Iterator[tuple[int, Event]]:
+        while True:
+            rows = self.db.query(
+                f"SELECT seq, {_EVENT_COLUMNS} FROM events WHERE seq > %s ORDER BY seq LIMIT %s", (seq, page)
+            )
+            for row in rows:
+                seq = row[0]
+                yield seq, _row_to_event(row[1:])
+            if len(rows) < page:
+                return
+
+    def get(self, ids: Collection[str]) -> list[Event]:
+        ids = list(ids)
+        rows = self.db.query(f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ANY(%s)", (ids,))
+        found = {row[0]: _row_to_event(row) for row in rows}
+        return [found[i] for i in ids if i in found]
+
+    def search(
+        self,
+        query: str,
+        caller: Caller,
+        scope: Scope,
+        k: int = 20,
+        kinds: Collection[Kind] | None = None,
+    ) -> list[tuple[Event, float]]:
+        terms = list(dict.fromkeys(words(query) + bigrams(query)))
+        if not terms or k <= 0:
+            return []
+        sql = _SEARCH_SQL
+        params: dict[str, Any] = {
+            "terms": terms, "user": caller.user, "team": caller.team, "scope": scope, "k": k,
+        }  # fmt: skip
+        if kinds is not None:
+            sql += " AND e.kind = ANY(%(kinds)s)"
+            params["kinds"] = list(kinds)
+        sql += " GROUP BY e.seq ORDER BY score DESC, e.seq LIMIT %(k)s"
+        return [(_row_to_event(row[:-1]), row[-1]) for row in self.db.query(sql, params)]
