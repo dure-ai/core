@@ -6,7 +6,8 @@ imports without the driver. Install it with the ``postgres`` extra.
 transaction() is SQLite's ``BEGIN IMMEDIATE`` rebuilt on PostgreSQL: the outermost call
 begins a transaction and takes one database-wide advisory lock (``TRANSACTION_LOCK``), so
 writes from every process serialize and event positions commit in order (spec §4). Reads
-take no lock and see committed rows.
+take no lock and see committed rows. A transaction PostgreSQL aborted is never committed
+silently: see transaction().
 
 Tables are created in the connection's current schema (the first one on ``search_path``),
 never a hard-coded one.
@@ -16,6 +17,7 @@ then ``events``, ``knowledge``, ``vectors`` and ``state()`` raise ``NotImplement
 """
 
 import hashlib
+import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,6 +26,9 @@ from typing import Any
 SCHEMA_VERSION = 1
 VECTOR_INDEXES = ("none", "hnsw")
 LOCK_TIMEOUT_SETTING = "CORTEX_DB_LOCK_TIMEOUT"
+# A PostgreSQL duration as lock_timeout takes it: a number with an optional unit (no unit
+# means milliseconds). PostgreSQL still checks the range when transaction() applies it.
+_DURATION = re.compile(r"\d+(\.\d+)?(us|ms|s|min|h|d)?")
 
 # The one key every cortex process locks in transaction(): the first 8 bytes of
 # sha256("cortex-mem/store/transaction") as a signed 64-bit integer, which is what
@@ -91,6 +96,17 @@ def _describe(url: str) -> tuple[str, str | None]:
     return where, str(params.get("password") or "")
 
 
+class TransactionAborted(RuntimeError):
+    """The outermost transaction() ended after PostgreSQL had aborted it; it was rolled back."""
+
+
+def _bad_lock_timeout(value: str) -> ValueError:
+    return ValueError(
+        f"lock timeout {value!r} is not a PostgreSQL duration; set {LOCK_TIMEOUT_SETTING} "
+        "to a value such as 30s, 500ms or 2min (0 waits forever)"
+    )
+
+
 def _redact(text: str, *secrets: str) -> str:
     for secret in secrets:
         if secret:
@@ -104,6 +120,8 @@ class PostgresDatabase:
     def __init__(self, url: str, lock_timeout: str = "30s", vector_index: str = "none") -> None:
         if vector_index not in VECTOR_INDEXES:
             raise ValueError(f"vector_index must be one of {VECTOR_INDEXES}, not {vector_index!r}")
+        if not _DURATION.fullmatch(lock_timeout):
+            raise _bad_lock_timeout(lock_timeout)
         import psycopg  # fails early with a clear error if the extra is missing
 
         self._where, password = _describe(url)
@@ -167,7 +185,14 @@ class PostgresDatabase:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """One write transaction under the database-wide lock; nested calls join the outer one."""
+        """One write transaction under the database-wide lock; nested calls join the outer one.
+
+        As in SQLite, an exception that leaves the outermost block rolls everything back,
+        and an exception the caller catches inside it does not by itself. One difference:
+        a failed statement makes PostgreSQL abort the whole transaction. If the caller
+        catches that error and carries on, the outermost block rolls back at its end and
+        raises TransactionAborted instead of committing, so no writes are lost silently.
+        """
         with self._lock:
             outer = self._depth == 0
             if outer:
@@ -182,15 +207,18 @@ class PostgresDatabase:
                 raise
             self._depth -= 1
             if outer:
-                self.con.execute("COMMIT")
+                self._commit()
 
     def _begin(self) -> None:
-        from psycopg.errors import LockNotAvailable
+        from psycopg.errors import InvalidParameterValue, LockNotAvailable
 
         self.con.execute("BEGIN")
         try:
             # set_config(..., true) is SET LOCAL with a bound value.
-            self.con.execute("SELECT set_config('lock_timeout', %s, true)", (self.lock_timeout,))
+            try:
+                self.con.execute("SELECT set_config('lock_timeout', %s, true)", (self.lock_timeout,))
+            except InvalidParameterValue:  # matches the pattern but PostgreSQL refuses it
+                raise _bad_lock_timeout(self.lock_timeout) from None
             self.con.execute("SELECT pg_advisory_xact_lock(%s)", (TRANSACTION_LOCK,))
         except LockNotAvailable:
             self._rollback()
@@ -202,12 +230,45 @@ class PostgresDatabase:
             self._rollback()
             raise
 
+    def _commit(self) -> None:
+        from psycopg.pq import TransactionStatus
+
+        if self.con.info.transaction_status == TransactionStatus.INERROR:
+            # COMMIT would answer ROLLBACK without raising; say so instead.
+            self._rollback()
+            raise TransactionAborted(
+                "a statement inside this transaction failed and the error was caught; "
+                "PostgreSQL aborted the transaction, so it was rolled back and nothing "
+                "in it was committed"
+            )
+        try:
+            self.con.execute("COMMIT")
+        except BaseException:
+            # The server usually ends a failed COMMIT itself; if the transaction is still
+            # open (the COMMIT never arrived), end it so the advisory lock is released.
+            self._rollback()
+            raise
+
     def _rollback(self) -> None:
-        # A broken connection has no transaction left to end; keep the original error.
-        if not self.con.broken:
-            self.con.execute("ROLLBACK")
+        """End the open transaction if there is one; never mask the error being raised."""
+        from psycopg import Error
+        from psycopg.pq import TransactionStatus
+
+        con = self.con
+        if con.closed or con.broken or con.info.transaction_status == TransactionStatus.IDLE:
+            return  # nothing left to end: the server drops a lost session's transaction
+        try:
+            con.execute("ROLLBACK")
+        except Error:
+            pass  # the connection died meanwhile; the caller's error is the one to see
 
     def query(self, sql: str, params: Any = ()) -> list[tuple]:
+        """Run one statement and return its rows ([] when it returns none).
+
+        Takes the in-process lock, so a call from another thread waits while this object
+        has a transaction open. It takes no database lock: outside a transaction it sees
+        committed rows, inside one it also sees that transaction's own writes.
+        """
         with self._lock:
             cur = self.con.execute(sql, params)
             return cur.fetchall() if cur.description is not None else []

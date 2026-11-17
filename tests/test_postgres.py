@@ -110,24 +110,25 @@ def _hold(db: PostgresDatabase, holding: threading.Event, release: threading.Eve
 def test_transaction_serializes_two_connections(pg_schema):
     with closing(PostgresDatabase(pg_schema)) as a, closing(PostgresDatabase(pg_schema)) as b:
         holding, release, entered = threading.Event(), threading.Event(), threading.Event()
+
+        def enter() -> None:
+            with b.transaction():
+                entered.set()
+
         holder = threading.Thread(target=_hold, args=(a, holding, release))
+        waiter = threading.Thread(target=enter)
         holder.start()
         try:
             assert holding.wait(WAIT)
-
-            def enter() -> None:
-                with b.transaction():
-                    entered.set()
-
-            waiter = threading.Thread(target=enter)
             waiter.start()
             assert not entered.wait(0.3), "B entered while A held the transaction"
             release.set()
             assert entered.wait(WAIT), "B did not enter after A finished"
-            waiter.join(WAIT)
         finally:
             release.set()
             holder.join(WAIT)
+            if waiter.is_alive() or waiter.ident is not None:
+                waiter.join(WAIT)
 
 
 def test_lock_timeout_raises_a_clear_error(pg_schema):
@@ -175,3 +176,91 @@ def test_password_is_not_in_errors_or_repr(pg_schema):
     )
     if params.get("password"):
         assert params["password"] not in text
+
+
+def _lock_is_free(url: str) -> None:
+    """Take the write lock from another connection; TimeoutError if someone still holds it."""
+    with closing(PostgresDatabase(url, lock_timeout="200ms")) as other, other.transaction():
+        pass
+
+
+def test_caught_inner_failure_is_not_committed_silently(pg_schema):
+    import psycopg
+
+    with closing(PostgresDatabase(pg_schema)) as db:
+        with pytest.raises(RuntimeError, match="rolled back"), db.transaction():
+            db.query("INSERT INTO vector_meta (key, value) VALUES ('outer', '1')")
+            # The caller catches a failed statement; PostgreSQL has aborted the transaction.
+            with pytest.raises(psycopg.errors.UniqueViolation), db.transaction():
+                db.query("INSERT INTO vector_meta (key, value) VALUES ('outer', '2')")
+        assert db.query("SELECT key FROM vector_meta") == []
+        _lock_is_free(pg_schema)
+        with db.transaction():
+            db.query("INSERT INTO vector_meta (key, value) VALUES ('later', '1')")
+        assert db.query("SELECT key FROM vector_meta") == [("later",)]
+
+
+def test_rollback_keeps_the_original_error_when_the_connection_is_gone(pg_schema):
+    import psycopg
+
+    # Closed by this process.
+    db = PostgresDatabase(pg_schema)
+    with pytest.raises(KeyError, match="original"), db.transaction():
+        db.con.close()
+        raise KeyError("original")
+    # Ended by the server; the client has not noticed yet.
+    with closing(PostgresDatabase(pg_schema)) as db:
+        pid = db.query("SELECT pg_backend_pid()")[0][0]
+        with pytest.raises(KeyError, match="original"), db.transaction():
+            with psycopg.connect(pg_schema, autocommit=True) as admin:
+                admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            raise KeyError("original")
+    _lock_is_free(pg_schema)
+
+
+class _CommitFails:
+    """Wrap a connection so COMMIT fails on the client and never reaches the server."""
+
+    def __init__(self, con):
+        self._con = con
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def execute(self, sql, *args, **kwargs):
+        if sql == "COMMIT":
+            import psycopg
+
+            raise psycopg.OperationalError("simulated commit failure")
+        return self._con.execute(sql, *args, **kwargs)
+
+
+def test_failed_commit_releases_the_lock(pg_schema):
+    import psycopg
+
+    with closing(PostgresDatabase(pg_schema)) as db:
+        # A real COMMIT failure: a deferred constraint is checked at COMMIT.
+        db.query("CREATE TABLE deferred (k text UNIQUE DEFERRABLE INITIALLY DEFERRED)")
+        with pytest.raises(psycopg.errors.UniqueViolation), db.transaction():
+            db.query("INSERT INTO deferred VALUES ('a'), ('a')")
+        _lock_is_free(pg_schema)
+        assert db.query("SELECT count(*) FROM deferred") == [(0,)]
+        # A COMMIT that fails before the server ends the transaction.
+        real = db.con
+        db.con = _CommitFails(real)
+        try:
+            with pytest.raises(psycopg.OperationalError, match="simulated"), db.transaction():
+                db.query("INSERT INTO vector_meta (key, value) VALUES ('lost', '1')")
+        finally:
+            db.con = real
+        _lock_is_free(pg_schema)
+        assert db.query("SELECT key FROM vector_meta") == []
+
+
+def test_lock_timeout_is_validated_at_construction(pg_schema):
+    for bad in ("bogus", "30 seconds", "-1s", "", "9999999999999d"):
+        with pytest.raises(ValueError, match="CORTEX_DB_LOCK_TIMEOUT"):
+            PostgresDatabase(pg_schema, lock_timeout=bad)
+    for good in ("30s", "500ms", "2min", "0", "1.5s"):
+        with closing(PostgresDatabase(pg_schema, lock_timeout=good)) as db, db.transaction():
+            pass
