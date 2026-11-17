@@ -60,8 +60,13 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
 
 def float32(vector: Iterable[float]) -> list[float]:
     """The vector rounded to float32, as every store keeps vectors (contract
-    §5), back as Python floats."""
-    return array("f", vector).tolist()
+    §5), back as Python floats. Raises ValueError on NaN, an infinity, or a
+    value beyond float32 range (which would round to an infinity): a NaN
+    compares false with everything and would silently break the rankings."""
+    values = array("f", vector).tolist()
+    if not all(math.isfinite(x) for x in values):
+        raise ValueError("a vector must have finite values within float32 range")
+    return values
 
 
 def top_by_cosine[T](

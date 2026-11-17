@@ -113,14 +113,14 @@ def test_schema_2_file_gains_text_redacted(tmp_path):
 
     db = SqliteDatabase(path)
 
-    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 5
     [old] = db.events.get(["e1"])
     assert (old.text, old.text_redacted) == ("old", False)
     db.events.append(ev("e2", "new"))
     assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
 
 
-def test_schema_3_file_migrates_to_4_and_keeps_events(tmp_path):
+def test_schema_3_file_migrates_to_5_and_keeps_events(tmp_path):
     import sqlite3
 
     path = tmp_path / "old.db"
@@ -147,10 +147,82 @@ def test_schema_3_file_migrates_to_4_and_keeps_events(tmp_path):
 
     db = SqliteDatabase(path)
 
-    assert db.query("PRAGMA user_version")[0][0] == 4
+    assert db.query("PRAGMA user_version")[0][0] == 5
     assert [e.id for e in db.events.get(["e1"])] == ["e1"]
     db.vectors.put_vector("event", "e1", [1.0])
     assert db.vectors.vector("event", "e1") == [1.0]
+
+
+def test_schema_4_file_drops_its_float64_vectors_and_cache_and_reembeds(tmp_path):
+    """Schema 4 kept float64 BLOBs; read as float32 they are 2n garbage values.
+    Opening such a file empties every vector table, the cache included, so the
+    rebuild embeds again instead of reusing the old cache."""
+    import sqlite3
+    from array import array
+
+    from cortex_mem.embed import HashEmbedder, text_digest
+    from cortex_mem.index import Index
+    from cortex_mem.runtime import Runtime
+
+    path = tmp_path / "v4.db"
+    SqliteDatabase(path).con.close()  # the tables are the same in 4 and 5; only the BLOB format changed
+    text = "deploy uses tags"
+    old = HashEmbedder().embed([text], "passage")[0]
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO events (seq, id, kind, at, user, team, session, scope, text, agent, signal, outcome, "
+        "conditions, refs, repo, rev, text_redacted) VALUES (1, 'e1', 'record', ?, 'u1', 't1', 's1', "
+        "'personal', ?, NULL, NULL, NULL, '{}', '[]', NULL, NULL, 0)",
+        (T0.isoformat(), text),
+    )
+    con.execute("INSERT INTO events_fts (rowid, words, grams) VALUES (1, 'deploy uses tags', '')")
+    blob = array("d", old).tobytes()
+    con.execute("INSERT INTO embed_cache VALUES ('hash-256', ?, ?)", (text_digest(text), blob))
+    con.execute("INSERT INTO vectors VALUES ('event', 'e1', 1, ?)", (blob,))
+    con.execute("INSERT INTO vector_groups VALUES ('e1', 'e1', 'personal', 'u1', 1)")
+    con.execute("""INSERT INTO vector_meta VALUES ('meta', '{"model": "hash-256", "group_threshold": 0.9}')""")
+    con.execute("INSERT INTO vector_meta VALUES ('indexed', '1')")
+    con.execute("PRAGMA user_version = 4")
+    con.commit()
+    con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.query("PRAGMA user_version")[0][0] == 5
+    for table in ("embed_cache", "vectors", "vector_groups", "vector_meta"):
+        assert db.query(f"SELECT count(*) FROM {table}") == [(0,)], table
+    assert [e.id for e in db.events.get(["e1"])] == ["e1"]  # events stay
+
+    class Counting:
+        model, dim = "hash-256", 256
+
+        def __init__(self):
+            self.calls = []
+
+        def embed(self, texts, kind):
+            self.calls.extend(texts)
+            return HashEmbedder().embed(texts, kind)
+
+    class Quiet:
+        def observe(self, event, ctx):
+            return []
+
+        def tick(self, now, ctx):
+            return []
+
+        def handoff(self, query, caller, scope, ctx, k=6):
+            return []
+
+    emb = Counting()
+    index = Index(db.vectors, emb, 0.9)
+    rt = Runtime(Quiet(), db.events, db.knowledge, db.state("probe"), db.transaction, index=index)
+    rt.sync()
+
+    assert emb.calls == [text]  # embedded again, not read from the float64 cache
+    assert db.vectors.vector("event", "e1") == f32(old)
+    assert index.reader(db.events, db.knowledge).group("e1").members == ("e1",)
+    db.con.close()
+    assert SqliteDatabase(path).vectors.vector("event", "e1") == f32(old)  # a later open keeps 5's rows
 
 
 def test_vectors_groups_and_cursor_survive_reopening(tmp_path):

@@ -2,6 +2,7 @@
 with the SQLite store's tokens; ties keep append order for events and id order
 for knowledge, so results are deterministic."""
 
+import bisect
 import json
 import math
 from collections import Counter
@@ -180,6 +181,9 @@ class InMemoryVectorBackend:
             "knowledge": {},
         }
         self._groups: dict[str, tuple[str, Scope, str, int]] = {}
+        # (seq, event_id) of each (scope, owner) cell, kept sorted on put_group so
+        # grouping each new event does not sort every group again.
+        self._cells: dict[tuple[Scope, str], list[tuple[int, str]]] = {}
         self._cache: dict[tuple[str, str], list[float]] = {}
         self._meta: dict | None = None
         self._indexed = 0
@@ -191,6 +195,7 @@ class InMemoryVectorBackend:
         for table in self._vectors.values():
             table.clear()
         self._groups.clear()
+        self._cells.clear()
         self._indexed = 0
         self._meta = dict(meta)
 
@@ -225,7 +230,11 @@ class InMemoryVectorBackend:
     def put_group(
         self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int
     ) -> None:
+        previous = self._groups.get(event_id)
+        if previous is not None:
+            self._cells[(previous[1], previous[2])].remove((previous[3], event_id))
         self._groups[event_id] = (group_id, scope, owner, seq)
+        bisect.insort(self._cells.setdefault((scope, owner), []), (seq, event_id))
 
     def group_of(self, event_id: str) -> str | None:
         found = self._groups.get(event_id)
@@ -240,12 +249,7 @@ class InMemoryVectorBackend:
         return [e for _, e in sorted(rows)]
 
     def partition(self, scope: Scope, owner: str) -> list[str]:
-        rows = [
-            (g[3], e)
-            for e, g in self._groups.items()
-            if g[1] == scope and g[2] == owner
-        ]
-        return [e for _, e in sorted(rows)]
+        return [e for _, e in self._cells.get((scope, owner), [])]
 
     def cached(self, model: str, digest: str) -> list[float] | None:
         found = self._cache.get((model, digest))
@@ -269,8 +273,10 @@ class InMemoryVectorBackend:
         query = float32(vector)
         table = self._vectors["event"]
         best: tuple[str, float] | None = None
-        for id in self._grouped(upto):
-            if self._groups[id][1] == scope and self._groups[id][2] == owner:
+        for seq, id in self._cells.get((scope, owner), []):  # (seq, id) order
+            if seq > upto:
+                break
+            if id in table:
                 score = cosine(query, table[id])
                 if best is None or score > best[1]:  # strictly: a tie keeps the earlier
                     best = (id, score)

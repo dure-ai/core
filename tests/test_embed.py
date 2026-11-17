@@ -3,7 +3,7 @@ import math
 
 import pytest
 
-from cortex_mem.embed import HashEmbedder, cosine, text_digest
+from cortex_mem.embed import HashEmbedder, cosine, float32, text_digest
 
 
 def e(text, dim=256, kind="passage"):
@@ -96,3 +96,17 @@ def test_cosine_survives_a_product_of_norms_out_of_float_range():
 def test_cosine_keeps_precision_when_the_norm_product_is_subnormal():
     assert cosine([1e-160, 0], [1e-160, 1e-160]) == pytest.approx(0.70711, rel=1e-4)
     assert cosine([1e-160, 0], [1e-160, 1e-160]) == pytest.approx(math.sqrt(0.5), rel=1e-9)
+
+
+def test_float32_rounds_finite_values():
+    assert float32([0.5, -2.0, 1e-50]) == [0.5, -2.0, 0.0]
+    assert float32((1, 2)) == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    "bad", [[float("nan")], [1.0, float("inf")], [float("-inf")], [1e39], [-3.5e38]],
+    ids=["nan", "inf", "-inf", "overflows", "overflows-negative"],
+)
+def test_float32_refuses_non_finite_values(bad):
+    with pytest.raises(ValueError, match="finite"):
+        float32(bad)

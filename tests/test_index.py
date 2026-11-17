@@ -714,3 +714,15 @@ def test_the_index_asks_the_store_for_similarity_instead_of_scanning():
     assert ids(r.search("deploy uses tags", caller(), "org")) == ["e1", "e2"]
     assert ids(r.neighbors("e1", caller(), "org")) == ["e2"]
     assert ids(r.knowledge("deploy\ndeploy uses tags", caller(), "team")) == ["k1"]
+
+
+@pytest.mark.parametrize("make", [InMemoryDatabase, SqliteDatabase], ids=["memory", "sqlite"])
+def test_a_non_finite_embedding_fails_loudly_and_writes_nothing(make):
+    db = make()
+    db.events.append(ev("e1", "a"))
+    emb = TableEmbedder({"a": [float("nan"), 1.0, 0.0]})
+    index = Index(db.vectors, emb, 0.9)
+    with pytest.raises(ValueError, match="finite"):
+        index.catch_up(db.events, 1)
+    assert (list(db.vectors.vectors("event")), db.vectors.group_of("e1"), db.vectors.indexed()) == ([], None, 0)
+    assert db.vectors.cached("table", text_digest("a")) is None

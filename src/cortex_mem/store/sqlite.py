@@ -28,7 +28,7 @@ from ..embed import cosine, float32, top_by_cosine
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's write lock
 
 _EVENT_COLUMNS = (
@@ -81,7 +81,16 @@ class SqliteDatabase:
                 self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
                 self.con.execute("PRAGMA user_version = 3")
             version = 3
-        # 3 -> 4 only adds the vector tables, which the CREATE IF NOT EXISTS below makes.
+        if has_tables and version == 4:
+            # 4 -> 5: vectors and the embedding cache became float32 BLOBs (contract
+            # 0.3.0). The float64 ones would read back as garbage of twice the length,
+            # so drop them all; the next sync rebuilds the index and embeds again.
+            with self.transaction():
+                for table in ("embed_cache", "vectors", "vector_groups", "vector_meta"):
+                    self.con.execute(f"DELETE FROM {table}")
+                self.con.execute("PRAGMA user_version = 5")
+            version = 5
+        # 3 -> 5 only adds the vector tables (3 has none), which the CREATE IF NOT EXISTS below makes.
         if has_tables and version not in (3, SCHEMA_VERSION):
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
@@ -340,10 +349,10 @@ class SqliteStateBackend:
 
 
 def _pack(vector: Sequence[float]) -> bytes:
-    """float32 BLOB: the store keeps vectors at float32 (contract §5). Blobs
-    written as float64 before contract 0.3.0 are not read back correctly; the
-    index version names the store, so such an index is rebuilt anyway."""
-    return array("f", vector).tobytes()
+    """float32 BLOB: the store keeps vectors at float32 (contract §5). Schema 4
+    wrote float64 BLOBs; opening such a file deletes them (the 4 -> 5 step).
+    float32() refuses non-finite values before anything is written."""
+    return array("f", float32(vector)).tobytes()
 
 
 def _unpack(blob: bytes) -> list[float]:

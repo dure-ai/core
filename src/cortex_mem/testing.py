@@ -481,6 +481,19 @@ class VectorBackendContract(_Contract):
         assert vb.partition("personal", "u1") == ["c"]
         assert vb.partition("org", "t1") == []
 
+    def test_put_group_again_moves_the_event_to_its_new_cell_and_seq(self, vb):
+        for id, seq in (("a", 1), ("b", 2)):
+            vb.put_vector("event", id, [1.0, 0.0])
+            vb.put_group(id, id, "team", "t1", seq)
+
+        vb.put_group("a", "a", "team", "t1", 3)  # same cell, later seq
+        assert vb.partition("team", "t1") == ["b", "a"]
+        assert vb.nearest_member("team", "t1", [1.0, 0.0], 3)[0] == "b"
+        vb.put_group("a", "a", "team", "t2", 3)  # another cell
+        assert vb.partition("team", "t1") == ["b"]
+        assert vb.partition("team", "t2") == ["a"]
+        assert vb.nearest_member("team", "t2", [1.0, 0.0], 3)[0] == "a"
+
     def test_reset_clears_vectors_groups_and_cursor_but_keeps_the_cache(self, vb):
         vb.reset({"model": "m1", "group_threshold": 0.8})
         vb.put_vector("event", "e1", [1.0])
