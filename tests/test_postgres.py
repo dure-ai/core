@@ -9,13 +9,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cortex_mem.contract import Event
+from cortex_mem.contract import Event, Knowledge
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
     require_vector_type,
 )
-from cortex_mem.testing import EventStoreContract, caller, ev
+from cortex_mem.testing import (
+    EventStoreContract,
+    KnowledgeStoreContract,
+    caller,
+    ev,
+    item,
+)
 
 TABLES = {
     "cortex_meta", "events", "event_terms", "event_stats", "knowledge", "knowledge_terms",
@@ -356,3 +362,81 @@ class TestPgEvents(EventStoreContract):
 
         assert [e.id for _, e in store.since(0)] == ["e1"]
         assert store.search("deploy", caller(), "personal") == []
+
+
+class TestPgKnowledge(KnowledgeStoreContract):
+    """The shared knowledge-store contract on PostgreSQL, plus what only PostgreSQL has to prove."""
+
+    @pytest.fixture(autouse=True)
+    def _databases(self, pg_schema):
+        self.url = pg_schema
+        self.dbs: list[PostgresDatabase] = []
+        yield
+        for db in self.dbs:
+            db.close()
+
+    def open(self) -> PostgresDatabase:
+        db = PostgresDatabase(self.url)
+        self.dbs.append(db)
+        return db
+
+    def make(self):
+        return self.open().knowledge
+
+    def test_knowledge_is_created_once(self):
+        db = self.open()
+
+        assert db.knowledge is db.knowledge
+
+    def test_put_replaces_terms(self, kb):
+        kb.put(item("k1", "canary rollout"))
+        kb.put(item("k1", "blue green"))
+
+        assert kb.search("canary", caller(), "team") == []
+        assert [i.id for i, _ in kb.search("green", caller(), "team")] == ["k1"]
+        db = kb.db
+        assert db.query("SELECT count(*) FROM knowledge_stats WHERE id = 'k1'") == [(1,)]
+        assert db.query("SELECT count(*) FROM knowledge_terms WHERE term = 'canary'") == [(0,)]
+
+    def test_remove_drops_terms_and_stats(self, kb):
+        kb.put(item("k1", "canary rollout"))
+        kb.remove("k1")
+
+        assert kb.db.query("SELECT count(*) FROM knowledge_terms") == [(0,)]
+        assert kb.db.query("SELECT count(*) FROM knowledge_stats") == [(0,)]
+        assert kb.search("canary", caller(), "team") == []
+
+    def test_get_keeps_requested_order_and_skips_unknown(self, kb):
+        for id in ["a", "b", "c"]:
+            kb.put(item(id))
+
+        assert [i.id for i in kb.get(["c", "x", "a"])] == ["c", "a"]
+
+    def test_ids_order_by_bytes_not_locale(self, kb):
+        for id in ["b", "B", "a", "_"]:
+            kb.put(item(id))
+
+        assert [i.id for i in kb.all()] == ["B", "_", "a", "b"]
+        assert [i.id for i, _ in kb.search("deploy", caller(), "team")] == ["B", "_", "a", "b"]
+
+    def test_json_fields_round_trip_exactly(self, kb):
+        original = Knowledge(
+            id="k1", kind="knowledge", title="t", body="deploy", scope="team", owner="t1",
+            sources=("e2", "e1"), conditions={"z": "1", "a": "2", "m": "3"},
+        )  # fmt: skip
+        kb.put(original)
+
+        (got,) = kb.get(["k1"])
+        assert list(got.conditions) == ["z", "a", "m"]
+        assert got.sources == ("e2", "e1")
+        assert got == original
+
+    def test_hidden_items_do_not_change_a_visible_score(self, kb):
+        kb.put(item("mine", "canary rollout"))
+        kb.put(item("other", "plain text"))
+        before = kb.search("canary", caller(), "team")
+
+        kb.put(item("hidden1", "canary canary canary", scope="team", owner="t2"))
+        kb.put(item("hidden2", "canary " * 40, scope="personal", owner="u2"))
+
+        assert kb.search("canary", caller(), "team") == before

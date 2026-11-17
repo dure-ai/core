@@ -12,9 +12,10 @@ silently: see transaction().
 Tables are created in the connection's current schema (the first one on ``search_path``),
 never a hard-coded one.
 
-``PgEventStore`` (``db.events``) is the append-only event log with BM25 text search. The
-knowledge, state and vector stores land on top of this in later steps; until then
-``knowledge``, ``vectors`` and ``state()`` raise ``NotImplementedError``.
+``PgEventStore`` (``db.events``) is the append-only event log and ``PgKnowledgeStore``
+(``db.knowledge``) the knowledge base, both with BM25 text search. The state and vector
+stores land on top of this in later steps; until then
+``vectors`` and ``state()`` raise ``NotImplementedError``.
 
 Shared SQL fragments are written with ``:name`` parameters and turned into psycopg's
 ``%(name)s`` by ``pg_params``. That rewrite does not parse string literals, so it would
@@ -32,8 +33,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
-from ..contract import Caller, Event, Kind, Scope
-from .text import EVENT_VISIBLE_SQL, bigrams, pg_params, words
+from ..contract import Caller, Event, Kind, Knowledge, Scope
+from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, pg_params, words
 
 SCHEMA_VERSION = 1
 VECTOR_INDEXES = ("none", "hnsw")
@@ -154,6 +155,7 @@ class PostgresDatabase:
         self._lock = threading.RLock()
         self._depth = 0
         self._events = PgEventStore(self)
+        self._knowledge = PgKnowledgeStore(self)
         try:
             require_vector_type(self.con)
             self._create()
@@ -186,8 +188,8 @@ class PostgresDatabase:
         return self._events
 
     @property
-    def knowledge(self) -> Any:
-        raise NotImplementedError("the PostgreSQL knowledge store is not implemented yet")
+    def knowledge(self) -> "PgKnowledgeStore":
+        return self._knowledge
 
     @property
     def vectors(self) -> Any:
@@ -396,3 +398,96 @@ class PgEventStore:
             params["kinds"] = list(kinds)
         sql += " GROUP BY e.seq ORDER BY score DESC, e.seq LIMIT %(k)s"
         return [(_row_to_event(row[:-1]), row[-1]) for row in self.db.query(sql, params)]
+
+
+_KNOWLEDGE_COLUMNS = "id, kind, title, body, scope, owner, sources, conditions"
+
+# The same BM25 over knowledge_terms, but df, N and the average length count only the items
+# the caller may see: corpus-wide statistics would let a score reveal hidden items' words.
+_KNOWLEDGE_SEARCH_SQL = f"""
+WITH vis AS (
+    SELECT k.* FROM knowledge k WHERE {pg_params(KNOWLEDGE_VISIBLE_SQL)}
+), df AS (
+    SELECT t.term, count(*)::float8 AS df
+    FROM knowledge_terms t JOIN vis ON vis.id = t.id WHERE t.term = ANY(%(terms)s) GROUP BY t.term
+), corpus AS (
+    SELECT count(*)::float8 AS n, avg(s.len)::float8 AS avgdl
+    FROM vis JOIN knowledge_stats s ON s.id = vis.id
+)
+SELECT {", ".join("k." + c for c in _KNOWLEDGE_COLUMNS.split(", "))},
+       sum(ln((corpus.n - df.df + 0.5) / (df.df + 0.5) + 1)
+           * t.tf * ({BM25_K1} + 1) / (t.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * s.len / corpus.avgdl))) AS score
+FROM knowledge_terms t
+JOIN df ON df.term = t.term
+JOIN vis k ON k.id = t.id
+JOIN knowledge_stats s ON s.id = t.id
+CROSS JOIN corpus
+WHERE t.term = ANY(%(terms)s)
+GROUP BY k.id, {", ".join("k." + c for c in _KNOWLEDGE_COLUMNS.split(", ")[1:])}
+ORDER BY score DESC, k.id COLLATE "C" LIMIT %(k)s
+"""
+
+
+def _row_to_knowledge(row: tuple) -> Knowledge:
+    id, kind, title, body, scope, owner, sources, conditions = row
+    return Knowledge(
+        id=id, kind=kind, title=title, body=body, scope=scope, owner=owner,
+        sources=tuple(json.loads(sources)), conditions=json.loads(conditions),
+    )  # fmt: skip
+
+
+class PgKnowledgeStore:
+    def __init__(self, db: PostgresDatabase) -> None:
+        self.db = db
+
+    def put(self, item: Knowledge) -> None:
+        tokens = Counter(words(f"{item.title} {item.body}") + bigrams(f"{item.title} {item.body}"))
+        con = self.db.con
+        with self.db.transaction():
+            con.execute(
+                f"INSERT INTO knowledge ({_KNOWLEDGE_COLUMNS}) VALUES ({', '.join(['%s'] * 8)}) "
+                "ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, "
+                "body = excluded.body, scope = excluded.scope, owner = excluded.owner, "
+                "sources = excluded.sources, conditions = excluded.conditions",
+                (
+                    item.id, item.kind, item.title, item.body, item.scope, item.owner,
+                    json.dumps(list(item.sources)), json.dumps(dict(item.conditions)),
+                ),
+            )  # fmt: skip
+            con.execute("DELETE FROM knowledge_terms WHERE id = %s", (item.id,))
+            con.execute("DELETE FROM knowledge_stats WHERE id = %s", (item.id,))
+            if tokens:
+                with con.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO knowledge_terms (id, term, tf) VALUES (%s, %s, %s)",
+                        [(item.id, term, tf) for term, tf in tokens.items()],
+                    )
+            con.execute(
+                "INSERT INTO knowledge_stats (id, len) VALUES (%s, %s)", (item.id, sum(tokens.values()))
+            )
+
+    def remove(self, id: str) -> None:
+        with self.db.transaction():
+            for table in ("knowledge", "knowledge_terms", "knowledge_stats"):
+                self.db.con.execute(f"DELETE FROM {table} WHERE id = %s", (id,))
+
+    def get(self, ids: Collection[str]) -> list[Knowledge]:
+        ids = list(ids)
+        rows = self.db.query(f"SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge WHERE id = ANY(%s)", (ids,))
+        found = {row[0]: _row_to_knowledge(row) for row in rows}
+        return [found[i] for i in ids if i in found]
+
+    def all(self) -> list[Knowledge]:
+        rows = self.db.query(f'SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge ORDER BY id COLLATE "C"')
+        return [_row_to_knowledge(row) for row in rows]
+
+    def search(
+        self, query: str, caller: Caller, scope: Scope, k: int = 20
+    ) -> list[tuple[Knowledge, float]]:
+        terms = list(dict.fromkeys(words(query) + bigrams(query)))
+        if not terms or k <= 0:
+            return []
+        params: dict[str, Any] = {
+            "terms": terms, "user": caller.user, "team": caller.team, "scope": scope, "k": k,
+        }  # fmt: skip
+        return [(_row_to_knowledge(row[:-1]), row[-1]) for row in self.db.query(_KNOWLEDGE_SEARCH_SQL, params)]
