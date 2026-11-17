@@ -339,15 +339,18 @@ class TestPgEvents(EventStoreContract):
         assert list(got.conditions["alpha"]) == ["y", "b"]
         assert got.refs == ("h2", "h1")
 
-    def test_search_uses_corpus_statistics_not_the_visible_subset(self):
+    def test_hidden_events_do_not_change_visible_scores(self):
         store = self.make()
-        # The word is common in the corpus (hidden events count) so it scores low in every case.
-        store.append(ev("a", "release", user="u2"))
-        store.append(ev("b", "release", user="u2"))
         store.append(ev("mine", "release notes", user="u1"))
         store.append(ev("other", "canary notes", user="u1"))
+        before = store.search("release canary", caller(), "personal")
 
-        assert [e.id for e, _ in store.search("release canary", caller(), "personal")] == ["other", "mine"]
+        store.append(ev("hidden1", "release release release", user="u2"))
+        store.append(ev("hidden2", "release canary", user="u2", team="t2", scope="team"))
+
+        after = store.search("release canary", caller(), "personal")
+        assert [(e.id, score) for e, score in after] == [(e.id, score) for e, score in before]
+        assert len(after) == 2
 
     def test_search_ignores_empty_query_and_non_positive_k(self):
         store = self.make()

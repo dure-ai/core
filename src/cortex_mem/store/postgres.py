@@ -299,23 +299,29 @@ _EVENT_COLUMNS = (
 BM25_K1 = 1.2
 BM25_B = 0.75
 
-# BM25 over event_terms. Corpus statistics (N, average length, df) count every event, not
-# only the ones the caller may see, as SQLite FTS5 does. Placeholders are psycopg's.
+# BM25 over event_terms. N, average length and df count only the events the caller may
+# see: corpus-wide statistics would let a score reveal hidden events' words. kinds is a
+# final filter and does not change them. Placeholders are psycopg's.
+_EVENT_COLS = ", ".join("e." + c for c in _EVENT_COLUMNS.split(", "))
 _SEARCH_SQL = f"""
-WITH df AS (
-    SELECT term, count(*)::float8 AS df FROM event_terms WHERE term = ANY(%(terms)s) GROUP BY term
+WITH vis AS (
+    SELECT e.seq FROM events e WHERE {pg_params(EVENT_VISIBLE_SQL)}
+), df AS (
+    SELECT t.term, count(*)::float8 AS df
+    FROM event_terms t JOIN vis ON vis.seq = t.seq WHERE t.term = ANY(%(terms)s) GROUP BY t.term
 ), corpus AS (
-    SELECT (SELECT count(*) FROM events)::float8 AS n, (SELECT avg(len) FROM event_stats)::float8 AS avgdl
+    SELECT count(*)::float8 AS n, avg(s.len)::float8 AS avgdl
+    FROM vis JOIN event_stats s ON s.seq = vis.seq
 )
-SELECT {", ".join("e." + c for c in _EVENT_COLUMNS.split(", "))},
+SELECT {_EVENT_COLS},
        sum(ln((corpus.n - df.df + 0.5) / (df.df + 0.5) + 1)
            * t.tf * ({BM25_K1} + 1) / (t.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * s.len / corpus.avgdl))) AS score
 FROM event_terms t
 JOIN df ON df.term = t.term
+JOIN vis ON vis.seq = t.seq
 JOIN events e ON e.seq = t.seq
 JOIN event_stats s ON s.seq = t.seq
 CROSS JOIN corpus
-WHERE t.term = ANY(%(terms)s) AND {pg_params(EVENT_VISIBLE_SQL)}
 """
 
 
@@ -394,7 +400,7 @@ class PgEventStore:
             "terms": terms, "user": caller.user, "team": caller.team, "scope": scope, "k": k,
         }  # fmt: skip
         if kinds is not None:
-            sql += " AND e.kind = ANY(%(kinds)s)"
+            sql += " WHERE e.kind = ANY(%(kinds)s)"
             params["kinds"] = list(kinds)
         sql += " GROUP BY e.seq ORDER BY score DESC, e.seq LIMIT %(k)s"
         return [(_row_to_event(row[:-1]), row[-1]) for row in self.db.query(sql, params)]
