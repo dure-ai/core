@@ -67,19 +67,35 @@ def _ensure_vector_extension(base: str) -> None:
 
 
 @pytest.fixture
-def pg_schema():
-    """Yield a URL whose connections land in a fresh, empty schema; drop it afterwards."""
+def pg_schemas():
+    """Yield a function that makes a fresh, empty schema and returns its URL.
+
+    Every schema it made is dropped at teardown, so a test can ask for as many as it needs.
+    """
     base = pg_url()
     if base is None:
         pytest.skip(f"{ENV} is not set")
     import psycopg
 
     _ensure_vector_extension(base)
-    schema = f"t_{uuid.uuid4().hex[:8]}"
-    with psycopg.connect(base, autocommit=True) as conn:
-        conn.execute(f'CREATE SCHEMA "{schema}"')
+    made: list[str] = []
+
+    def new_schema() -> str:
+        schema = f"t_{uuid.uuid4().hex[:8]}"
+        with psycopg.connect(base, autocommit=True) as conn:
+            conn.execute(f'CREATE SCHEMA "{schema}"')
+        made.append(schema)
+        return url_with_search_path(base, schema)
+
     try:
-        yield url_with_search_path(base, schema)
+        yield new_schema
     finally:
         with psycopg.connect(base, autocommit=True) as conn:
-            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            for schema in made:
+                conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@pytest.fixture
+def pg_schema(pg_schemas):
+    """Yield a URL whose connections land in a fresh, empty schema; drop it afterwards."""
+    return pg_schemas()

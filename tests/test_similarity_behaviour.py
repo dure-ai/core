@@ -17,7 +17,8 @@ from cortex_mem.store.sqlite import SqliteDatabase
 
 T0 = datetime(2026, 11, 15, tzinfo=UTC)
 
-STORES = ["memory", "sqlite"]
+STORES = ["memory", "sqlite", "pg"]
+OPENED = []  # PostgreSQL connections opened by a test; closed before its schemas are dropped
 
 
 class CountingEmbedder:
@@ -32,7 +33,37 @@ class CountingEmbedder:
         return self.inner.embed(texts, kind)
 
 
+@pytest.fixture
+def where(tmp_path, request):
+    """where(kind, name): a place for one store of that kind (a file, or a fresh PG schema URL).
+
+    A PG kind skips the test when CORTEX_TEST_PG_URL is unset.
+    """
+    new_schema = None
+
+    def close_all():
+        while OPENED:
+            OPENED.pop().close()
+
+    def locate(kind, name):
+        nonlocal new_schema
+        if kind != "pg":
+            return tmp_path / name
+        if new_schema is None:
+            new_schema = request.getfixturevalue("pg_schemas")
+            request.addfinalizer(close_all)  # runs before the schemas are dropped
+        return new_schema()
+
+    return locate
+
+
 def make_db(kind, path):
+    if kind == "pg":
+        from cortex_mem.store.postgres import PostgresDatabase
+
+        db = PostgresDatabase(path)
+        OPENED.append(db)
+        return db
     return InMemoryDatabase() if kind == "memory" else SqliteDatabase(path)
 
 
@@ -122,30 +153,61 @@ def flow(kind, path):
     return observe(db, rt)
 
 
-def test_stores_agree_on_groups_and_search(tmp_path):
-    memory = flow("memory", None)
-    sqlite = flow("sqlite", tmp_path / "a.db")
-
+def assert_nonvacuous(memory):
     assert any(hits for hits in memory[1].values())  # equality is not vacuous
     assert any(hits for hits in memory[2].values())
     assert any(g and len(g.members) > 1 for g in memory[0].values())
+
+
+def test_stores_agree_on_groups_and_search(where):
+    memory = flow("memory", None)
+    sqlite = flow("sqlite", where("sqlite", "a.db"))
+
+    assert_nonvacuous(memory)
     assert memory[0] == sqlite[0]
     # Scores compared exactly: both stores keep float32 and score with the same Python code.
     assert memory[1] == sqlite[1]
     assert memory[2] == sqlite[2]
 
 
+def test_two_postgres_schemas_agree_exactly(where):
+    a = flow("pg", where("pg", ""))
+    b = flow("pg", where("pg", ""))
+
+    assert_nonvacuous(a)
+    assert a == b  # groups and scores, exactly
+
+
+def close_enough(left, right):
+    """Same keys, same ids in the same order, scores within 1e-6."""
+    assert left.keys() == right.keys()
+    for key in left:
+        assert [id for id, _ in left[key]] == [id for id, _ in right[key]], key
+        for (_, x), (_, y) in zip(left[key], right[key], strict=True):
+            assert abs(x - y) < 1e-6, key
+
+
+def test_postgres_agrees_with_memory_within_tolerance(where):
+    memory = flow("memory", None)
+    pg = flow("pg", where("pg", ""))
+
+    assert_nonvacuous(memory)
+    assert memory[0] == pg[0]  # the same groups
+    close_enough(memory[1], pg[1])
+    close_enough(memory[2], pg[2])
+
+
 @pytest.mark.parametrize("kind", STORES)
-def test_the_same_events_make_the_same_groups_twice(kind, tmp_path):
-    first = flow(kind, tmp_path / "a.db")
-    second = flow(kind, tmp_path / "b.db")
+def test_the_same_events_make_the_same_groups_twice(kind, where):
+    first = flow(kind, where(kind, "a.db"))
+    second = flow(kind, where(kind, "b.db"))
 
     assert first == second
 
 
 @pytest.mark.parametrize("kind", STORES)
-def test_groups_are_what_the_scenario_intends(kind, tmp_path):
-    groups = flow(kind, tmp_path / "a.db")[0]
+def test_groups_are_what_the_scenario_intends(kind, where):
+    groups = flow(kind, where(kind, "a.db"))[0]
 
     assert groups["p1"].members == ("p1", "p2")
     assert groups["p2"].id == groups["p1"].id
@@ -238,8 +300,8 @@ def assert_written_once(log, all_events, complete):
 PLAN = "aabbaaaaabaaabbbabab"
 
 
-def run_two_runtimes(path, all_events, embedder, log, b_cursor=None):
-    db_a, db_b = SqliteDatabase(path), SqliteDatabase(path)
+def run_two_runtimes(path, all_events, embedder, log, b_cursor=None, kind="sqlite"):
+    db_a, db_b = make_db(kind, path), make_db(kind, path)
     runtimes = {
         "a": recording_runtime(db_a, embedder, log),
         "b": recording_runtime(db_b, embedder, log, b_cursor),
@@ -257,12 +319,13 @@ def run_two_runtimes(path, all_events, embedder, log, b_cursor=None):
     return db_a, db_b, runtimes
 
 
+@pytest.mark.parametrize("kind", ["sqlite", "pg"])
 @pytest.mark.parametrize("texts", ["repeated", "unique"])
-def test_two_runtimes_on_one_file_index_each_event_once(texts, tmp_path):
+def test_two_runtimes_on_one_store_index_each_event_once(texts, kind, where):
     embedder, log = CountingEmbedder(), []
     all_events = events() if texts == "repeated" else unique(events())
 
-    db_a, db_b, runtimes = run_two_runtimes(tmp_path / "shared.db", all_events, embedder, log)
+    db_a, db_b, runtimes = run_two_runtimes(where(kind, "shared.db"), all_events, embedder, log, kind=kind)
 
     assert_written_once(log, all_events, complete=True)  # the writes themselves, across both runtimes
     passages = [t for t, kind in embedder.calls if kind == "passage"]
@@ -275,12 +338,15 @@ def test_two_runtimes_on_one_file_index_each_event_once(texts, tmp_path):
     assert observe(db_a, runtimes["a"]) == observe(db_b, runtimes["b"])
 
 
-def test_the_write_log_catches_a_runtime_that_ignores_the_shared_cursor(tmp_path):
+@pytest.mark.parametrize("kind", ["sqlite", "pg"])
+def test_the_write_log_catches_a_runtime_that_ignores_the_shared_cursor(kind, where):
     """Control for the test above: runtime b told its cursor is always 0
     re-indexes events a already indexed, and the log shows it."""
     log = []
     with pytest.raises(AssertionError, match="wrote an event twice"):
-        run_two_runtimes(tmp_path / "shared.db", events(), CountingEmbedder(), log, b_cursor=lambda: 0)
+        run_two_runtimes(
+            where(kind, "shared.db"), events(), CountingEmbedder(), log, b_cursor=lambda: 0, kind=kind
+        )
 
 
 def evidence_scenario(with_index):

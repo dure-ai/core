@@ -18,6 +18,7 @@ from cortex_mem.store.postgres import (
     require_vector_type,
 )
 from cortex_mem.testing import (
+    DatabaseContract,
     EngineStateBackendContract,
     EventStoreContract,
     KnowledgeStoreContract,
@@ -700,3 +701,23 @@ class TestPgVectors(VectorBackendContract):
         assert "halfvec" in caplog.text
         got = reopened.vectors.search_events([1.0, 0.0], caller(), "personal", 5)
         self.scores_match(got, [("big", 1.0)])
+
+
+class TestPgDatabase(DatabaseContract):
+    """The shared multi-process contract: every opener call is a new connection to one schema."""
+
+    @pytest.fixture(autouse=True)
+    def _databases(self, pg_schema):
+        self.url = pg_schema
+        self.dbs: list[PostgresDatabase] = []
+        yield
+        for db in self.dbs:
+            db.close()
+
+    def make(self, tmp_path):
+        def opener():
+            db = PostgresDatabase(self.url)
+            self.dbs.append(db)
+            return db
+
+        return opener
