@@ -155,11 +155,23 @@ class Runtime:
     checks that nothing it read has moved: the engine's epoch and cursor
     (a commit, a skip or a reset by any process moves the epoch), and with an
     index, the index generation read before observe and an index position at
-    or past the event. When any of them moved, the result is dropped and the
-    event is read and observed again; nothing is written and no failure is
-    counted. So an engine may observe one event, or tick at one cursor, more
-    than once, even in two processes at once, and only one result lands. A
-    slow engine or embedder never holds a durable store's write lock.
+    or past the event, and that the engine's state is still under the version
+    this Runtime expects (the engine's state_version, with the index
+    fingerprint when there is an index). When any of them moved, the result
+    is dropped and the event is read and observed again; nothing is written
+    and no failure is counted. So an engine may observe one event, or tick at
+    one cursor, more than once, even in two processes at once, and only one
+    result lands. A slow engine or embedder never holds a durable store's
+    write lock.
+
+    The restart for a moved index or engine version is bounded: after
+    MAX_CONFIG_RETRIES (3) restarts of one event, sync raises
+    IndexConfigChanged or StateVersionChanged. Processes with another index
+    config, or another engine state_version, on one store are not supported;
+    they fail loudly instead of mixing.
+
+    `sync()` returns how many events it delivered; `pending()` returns how
+    many still wait after the engine's cursor.
     """
 
     def __init__(
