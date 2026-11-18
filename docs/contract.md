@@ -151,7 +151,7 @@ class Engine(Protocol):
     def handoff(self, query, caller, scope, ctx, k=6) -> list[Handoff]: ...
 ```
 
-- **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다. 벡터는 float32로 저장되므로 같은 데이터라도 저장소(인메모리·SQLite·PostgreSQL)에 따라 점수가 마지막 자리(1e-6 안)에서 다를 수 있다. 같은 저장소에서는 실행마다 같다.
+- **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다. 벡터는 float32로 저장되므로 같은 데이터라도 저장소(인메모리·SQLite·PostgreSQL)에 따라 점수가 마지막 자리(약 1e-6 이내, 차원이 커질수록 커진다)에서 다를 수 있다. 같은 저장소에서는 실행마다 같다.
 - **가시성**: 세 검색 모두 `access.event_visible`·`knowledge_visible`로 거른 집합 안에서만 찾는다(SQL 저장소는 같은 규칙의 SQL 조건으로 거른다, §5). `group()`은 호출자를 받지 않는다. 엔진은 모든 이벤트를 관찰하므로 묶음 정보가 엔진에게 새 노출이 아니고, 엔진이 내보내는 것은 결정 검증과 handoff 필터를 지난다(§3-5).
 - **묶음 멤버를 handoff에 쓰면 근거로 인용한다**: handoff 필터는 Handoff가 `sources`에 적은 이벤트만 검사한다. 엔진이 `group().members`(또는 `neighbors` 결과) 이벤트의 내용을 Handoff의 `content`에 넣으면 그 이벤트들을 모두 `sources`에 넣어야 한다. 빠뜨리면 호출자가 볼 수 없는 기록의 내용이 필터를 지나 나간다.
 - **엔진이 본 데까지만**: `similar`는 엔진이 이미 받은 이벤트까지만 읽는다. `observe` 중에는 지금 관찰하는 이벤트까지, `tick`·`handoff` 중에는 엔진의 커서까지다. 그 뒤의 이벤트는 `search`·`neighbors` 결과에도, `group().members`에도 나오지 않고, 그 뒤의 이벤트로 `group()`을 부르면 `None`이다. 그래서 처음부터 다시 전달할 때(§3-8)도 처음 전달 때와 같은 결과를 읽는다(§3-7). 지식(`knowledge`)은 지금의 지식 베이스다.
@@ -249,7 +249,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
   retrieval:<session>:<handoff_id>    이 세션에 건넨 항목 (자기강화 차단용)
   ```
   증거 키에 `event_id`를 넣으면 같은 이벤트를 다시 받아도 두 번 세지 않는다(재전달에 대한 안전장치).
-- **색인 버전**: 색인 버전(임베딩 모델, 묶음 문턱값)이 바뀌면 엔진 상태를 비우고 이벤트 로그 처음부터 다시 전달한다. 엔진의 `state_version`이 바뀐 것과 같은 처리다. 색인은 저장소(파일)에 하나지만 엔진 상태는 엔진마다 있으므로, 런타임은 엔진마다 "이 상태를 어느 색인 버전 위에서 만들었는지"를 그 엔진의 상태에 `_runtime/index` 키로 남기고 `sync` 때마다 확인한다. 같은 저장소의 다른 엔진이 먼저 색인을 다시 만들었어도 이 엔진의 표시가 지금 색인 버전과 다르면 이 엔진도 처음부터 다시 받는다.
+- **색인 버전**: 색인 버전(임베딩 모델, 묶음 문턱값, 저장소 종류 `store`)이 바뀌면 엔진 상태를 비우고 이벤트 로그 처음부터 다시 전달한다. 엔진의 `state_version`이 바뀐 것과 같은 처리다. 색인은 저장소(DB)에 하나지만 엔진 상태는 엔진마다 있으므로, 런타임은 엔진마다 "이 상태를 어느 색인 버전 위에서 만들었는지"를 그 엔진의 상태에 `_runtime/index` 키로 남기고 `sync` 때마다 확인한다. 같은 저장소의 다른 엔진이 먼저 색인을 다시 만들었어도 이 엔진의 표시가 지금 색인 버전과 다르면 이 엔진도 처음부터 다시 받는다.
   - `_runtime/`로 시작하는 상태 키는 임베딩 설정과 관계없이 런타임 몫이니 엔진은 쓰지 않는다. 엔진의 `ctx.state`에서는 보이지 않고(`get`은 `None`, `scan`에서 빠짐), `put`·`delete`는 `ValueError`를 던진다.
   - **주의: 저장소 하나에는 색인 설정 하나.** 임베딩 모델이나 `CORTEX_GROUP_THRESHOLD`가 다른 프로세스가 같은 DB(파일)를 쓰면 서로 자기 설정으로 색인을 다시 만들어, 색인이 왔다 갔다 하고 엔진들이 계속 처음부터 다시 받는다. 설정을 바꿀 때는 그 DB(파일)를 쓰는 프로세스를 모두 내리고 새 설정으로 다시 띄운다.
 - **상태 형식 버전**: 엔진에 `state_version: str`을 두면, 저장된 버전과 다를 때 런타임이 상태를 지우고 커서를 0으로 돌려 이벤트 로그 처음부터 다시 전달한다. 마이그레이션 코드는 필요 없다. 지식 베이스는 지우지 않는다(다시 나온 Promote가 같은 id를 덮어쓴다). 버전이 다른 서버 프로세스를 동시에 띄우지 않는다.
@@ -324,7 +324,7 @@ class VectorBackend(Protocol):                                # 색인 상태·�
   - `search_knowledge(vector, caller, scope, k)`: 볼 수 있는 지식 중 점수 > 0인 것 k개, 동점은 id 순.
   - **위치**는 `put_group`에 준 seq(= 이벤트 로그 위치)다. 묶음이 없는 이벤트 벡터는 검색 후보가 아니고, 이벤트·지식 저장소에 없는 id도 후보가 아니다.
   - 가시성은 같은 `Database`의 이벤트·지식으로 판단한다. 그래서 백엔드는 그 옆에서 만든다(인메모리는 `InMemoryVectorBackend(events, knowledge)`, SQL 저장소는 `events`·`knowledge` 표와 잇는다). 파이썬 구현은 `access.event_visible`·`knowledge_visible`, SQL 구현은 텍스트 검색과 같은 조건(`store/text.py`의 `EVENT_VISIBLE_SQL`·`KNOWLEDGE_VISIBLE_SQL`)을 쓴다. `VectorBackendContract`의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려주고, 범위 × 호출자 조합의 기대 id 표로 두 구현이 같은지 고정한다.
-  - 인메모리와 SQLite는 같은 파이썬 코드로 계산하므로 점수가 비트까지 같다. PostgreSQL(pgvector)은 DB 안에서 계산하므로 점수가 1e-6 안에서 같다고 본다. 색인 버전(`Index.want()`)에 `store: backend.kind`가 들어 있어 저장소를 옮기면 색인을 다시 만들고 엔진에 처음부터 다시 전달한다.
+  - 인메모리와 SQLite는 같은 파이썬 코드로 계산하므로 점수가 비트까지 같다. PostgreSQL(pgvector)은 DB 안에서 계산하므로 점수가 약 1e-6 이내에서 같다(차원이 커질수록 오차가 커진다. 4096차원에서 8e-7까지 측정, 1024차원은 `tests/test_postgres.py`가 `SCORE_TOLERANCE`로 확인한다). 색인 버전(`Index.want()`)에 `store: backend.kind`가 들어 있어 저장소를 옮기면 색인을 다시 만들고 엔진에 처음부터 다시 전달한다.
 - 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
 - **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 시퀀스(`bigserial`·`IDENTITY`)는 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, 스키마는 `seq bigint PRIMARY KEY`로 두고 PG 구현(`PostgresDatabase`)은 `transaction()`을 바깥에서만 `BEGIN` + `pg_advisory_xact_lock`(DB 전체 잠금 하나)으로 열고, 위치를 잠금 안에서 `max(seq)+1`로 정한다. 롤백된 append는 번호를 남기지 않는다. 잠금 대기는 `lock_timeout`(서버 `CORTEX_DB_LOCK_TIMEOUT`, 기본 `30s`)으로 끊고 분명한 오류를 낸다. 트랜잭션 안에서 DB 오류를 잡아 넘기면 안 된다(중단된 트랜잭션은 커밋되지 않는다). 동시 append·전달을 섞는 시험은 `tests/test_postgres.py`와 `tests/test_similarity_behaviour.py`에 있다(`DatabaseContract`만으로는 잡히지 않는다).
 - **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL은 같은 토큰(`store/text.py`)을 역색인 표(`event_terms`, `knowledge_terms`, 문서 길이 표)에 쓰고 BM25(k1=1.2, b=0.75)를 SQL 집계로 계산한다. 기본 전문 검색(`tsvector`)은 한국어를 나누지 못하고 IDF가 없어 쓰지 않으며, 확장도 필요 없다. df·문서 수·평균 길이는 호출자가 볼 수 있는 기록만으로 계산한다(숨은 기록이 점수를 바꾸지 않는다). 점수 값은 저장소마다 다르고 순서의 성질만 같다.
@@ -335,7 +335,8 @@ class VectorBackend(Protocol):                                # 색인 상태·�
 | 버전 | 바뀐 것 | 엔진 영향 |
 | --- | --- | --- |
 | 0.2.0 | 코어 임베딩 색인과 읽기 전용 `ctx.similar`(`SimilarityReader`: search·neighbors·knowledge·group), `Database.vectors`, `VectorBackend` | 엔진이 `ctx.similar`를 쓸 수 있다(없으면 `None`) |
-| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(1e-6 안) 달라질 수 있다. PostgreSQL + pgvector 구현(`PostgresDatabase`)이 같은 적합성 시험을 통과하는 기준 저장소로 추가된다 |
+| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(약 1e-6 이내) 달라질 수 있다. PostgreSQL + pgvector 구현(`PostgresDatabase`)이 같은 적합성 시험을 통과하는 기준 저장소로 추가된다 |
+| 0.3.0 (하네스·제3자 백엔드) | 하네스는 `CONTRACT_VERSION` 0.3.0을 읽어 `EngineInfo.version`이 `contract-0.3.0`이 된다. 제3자 `VectorBackendContract` 하위 클래스의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려줘야 한다(벡터 백엔드만 돌려주면 안 된다) | 엔진 코드는 그대로. 하네스 리포트의 버전 문자열과 제3자 적합성 시험의 `make()`가 바뀐다 |
 
 ## 6. v0.2 이후로 미룬 것
 
@@ -382,7 +383,7 @@ class VectorBackend(Protocol):                                # 색인 상태·�
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
 - [ ] 공용 DB 위치: team scope는 공용 DB가 있어야 사람 간 독립 출처를 셀 수 있다.
-- **운영 요구**: PostgreSQL 14 이상, pgvector: 정확 검색(기본)은 0.7 이상, `CORTEX_VECTOR_INDEX=hnsw`는 0.8 이상이 필요하다(HNSW 검색은 `SET LOCAL hnsw.iterative_scan = relaxed_order`를 항상 실행한다). 코드는 PG와 pgvector 버전을 검사하지 않으므로 이 버전 요구는 "가정(검사 안 함)"이다. 검사하는 것은 `vector` 타입이 있는지(`require_vector_type`)뿐이다. DB마다 `CREATE EXTENSION vector`가 필요하고, 확장이 없을 때만 시작할 때 빠진 것을 알리고 멈춘다. 드라이버는 선택 의존성 `cortex-mem[postgres]`(psycopg 3).
+- **운영 요구**: PostgreSQL 14 이상, pgvector: 정확 검색(기본)은 0.7 이상, `CORTEX_VECTOR_INDEX=hnsw`는 0.8 이상이 필요하다(HNSW 검색은 `SET LOCAL hnsw.iterative_scan = relaxed_order`를 항상 실행한다). 열 때 `vector` 타입이 있는지(`require_vector_type`) 검사하고, hnsw를 켤 때는 pgvector가 0.8 이상인지도 검사한다(`require_hnsw_support`, 낮으면 필요한 버전과 설치된 버전을 알리고 멈춘다). PostgreSQL 버전과 정확 검색의 0.7 요구는 검사하지 않는다(가정). DB마다 `CREATE EXTENSION vector`가 필요하고, 확장이 없으면 시작할 때 빠진 것을 알리고 멈춘다. 드라이버는 선택 의존성 `cortex-mem[postgres]`(psycopg 3).
 - [ ] 전역 잠금(DB 하나에 잠금 하나)을 유지할지는 지연을 잰 뒤 정한다. 근사 색인 기본값도 측정 뒤 정한다.
 
 **모두**

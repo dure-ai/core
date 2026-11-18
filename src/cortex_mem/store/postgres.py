@@ -98,6 +98,34 @@ def require_vector_type(conn: Any) -> None:
         )
 
 
+HNSW_MIN_PGVECTOR = (0, 8)  # hnsw.iterative_scan, set before every HNSW search, came in 0.8
+
+
+def pgvector_version(text: str) -> tuple[int, ...]:
+    """``"0.8.1"`` -> ``(0, 8, 1)``, so versions compare as numbers ("0.10" is after "0.8").
+    A part that does not start with a digit ends the version."""
+    parts = []
+    for part in text.split("."):
+        digits = re.match(r"\d+", part)
+        if digits is None:
+            break
+        parts.append(int(digits.group()))
+    return tuple(parts)
+
+
+def require_hnsw_support(conn: Any) -> None:
+    """Raise RuntimeError unless the installed pgvector is new enough for ``vector_index="hnsw"``."""
+    row = conn.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'").fetchone()
+    found = None if row is None else str(row[0])
+    if found is None or pgvector_version(found) < HNSW_MIN_PGVECTOR:
+        need = ".".join(map(str, HNSW_MIN_PGVECTOR))
+        raise RuntimeError(
+            f"vector_index='hnsw' needs pgvector {need} or later, but this database has "
+            f"{'no vector extension version' if found is None else found}; upgrade pgvector "
+            "(ALTER EXTENSION vector UPDATE) or use vector_index='none' (exact search, pgvector 0.7+)"
+        )
+
+
 def _describe(url: str) -> tuple[str, str | None]:
     """Return ("host=…, port=…, dbname=…", password) for ``url``; never the URL itself.
 
@@ -130,6 +158,12 @@ def check_lock_timeout(raw: str) -> str:
     if not _DURATION.fullmatch(raw):
         raise _bad_lock_timeout(raw)
     return raw
+
+
+def _text_ids(ids: list[Any]) -> list[str]:
+    """The string ids in ``ids``: a text column compared with another type is an error in
+    PostgreSQL (one that aborts the transaction), and such an id matches nothing anyway."""
+    return [i for i in ids if isinstance(i, str)]
 
 
 def _redact(text: str, *secrets: str) -> str:
@@ -170,6 +204,8 @@ class PostgresDatabase:
         self._vectors = PgVectorBackend(self)
         try:
             require_vector_type(self.con)
+            if vector_index == "hnsw":
+                require_hnsw_support(self.con)
             self._create()
             self._vectors.load()
         except BaseException:
@@ -393,7 +429,7 @@ class PgEventStore:
 
     def get(self, ids: Collection[str]) -> list[Event]:
         ids = list(ids)
-        rows = self.db.query(f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ANY(%s)", (ids,))
+        rows = self.db.query(f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ANY(%s)", (_text_ids(ids),))
         found = {row[0]: _row_to_event(row) for row in rows}
         return [found[i] for i in ids if i in found]
 
@@ -492,7 +528,9 @@ class PgKnowledgeStore:
 
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         ids = list(ids)
-        rows = self.db.query(f"SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge WHERE id = ANY(%s)", (ids,))
+        rows = self.db.query(
+            f"SELECT {_KNOWLEDGE_COLUMNS} FROM knowledge WHERE id = ANY(%s)", (_text_ids(ids),)
+        )
         found = {row[0]: _row_to_knowledge(row) for row in rows}
         return [found[i] for i in ids if i in found]
 

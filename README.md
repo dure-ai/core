@@ -22,7 +22,7 @@ uv workspace 하나에 패키지 두 개.
 | SQLite | 개인 로컬 | `CORTEX_DB_URL`이 없을 때의 기본. 파일 하나에 쓰기 잠금이 하나뿐이다 |
 | 인메모리 | 시험·하니스 비교 | 프로세스가 끝나면 사라진다 |
 
-PostgreSQL은 14 이상, pgvector는 정확 검색(기본)에 0.7 이상, `CORTEX_VECTOR_INDEX=hnsw`에 0.8 이상이 필요하다고 가정한다. 서버는 버전을 검사하지 않고 `vector` 타입이 있는지만 확인한다(DB마다 `CREATE EXTENSION vector`, 없으면 시작할 때 멈춘다). 설치: `uv add "cortex-mem[postgres]"`. 서버는 이미 이것에 의존한다.
+PostgreSQL은 14 이상, pgvector는 정확 검색(기본)에 0.7 이상, `CORTEX_VECTOR_INDEX=hnsw`에 0.8 이상이 필요하다. 서버는 열 때 `vector` 타입이 있는지 확인하고(DB마다 `CREATE EXTENSION vector`, 없으면 시작할 때 멈춘다), hnsw를 켤 때는 pgvector가 0.8 이상인지도 검사한다(낮으면 시작할 때 멈춘다). PostgreSQL 버전과 정확 검색의 0.7 요구는 검사하지 않는다. 설치: `uv add "cortex-mem[postgres]"`. 서버는 이미 이것에 의존한다.
 
 ## 개발
 
@@ -88,8 +88,9 @@ claude mcp add cortex-mem -e CORTEX_TEAM=payments \
 ```
 
 - 쓰기는 DB 전체 잠금 하나(advisory lock)로 직렬화한다. 이벤트 전달과 색인이 프로세스 사이에서 한 번씩만 일어나고 위치는 커밋 순서대로 늘어난다. 잠금을 기다리는 세션은 `CORTEX_DB_LOCK_TIMEOUT`까지 기다린 뒤 분명한 오류를 낸다.
-- 벡터는 pgvector `vector`(float32)로 저장하고 코사인 유사도는 DB 안에서 계산한다. 인메모리·SQLite와는 점수가 1e-6 안에서 같다.
-- **HNSW는 기본 꺼져 있다.** 기본은 정확 검색이라 같은 데이터에서 실행마다 같은 결과가 나오고, 팀 규모(수천~수만 행)에서는 충분히 빠르다고 본다. `CORTEX_VECTOR_INDEX=hnsw`는 `search_events`·`search_knowledge`에만 쓰이고 묶기는 늘 정확 검색이다(묶음이 실행마다 달라지면 엔진 상태가 달라진다). 근사 색인은 진짜 최근접을 놓칠 수 있고 가시성 필터 때문에 k개보다 적게 돌려줄 수 있다. 차원이 4000을 넘으면 색인 없이 정확 검색만 한다. 색인은 halfvec(반정밀도)로 만들어지므로 결과가 근사다. HNSW 검색은 pgvector 0.8 이상이 필요하다. 기본값은 지연을 잰 뒤 정한다.
+- 벡터는 pgvector `vector`(float32)로 저장하고 코사인 유사도는 DB 안에서 계산한다. 인메모리·SQLite와는 점수가 약 1e-6 이내에서 같다(차원이 커질수록 오차가 커진다. 4096차원에서 8e-7까지 측정).
+- **HNSW는 기본 꺼져 있다.** 기본은 정확 검색이라 같은 데이터에서 실행마다 같은 결과가 나오고, 팀 규모(수천~수만 행)에서는 충분히 빠르다고 본다. `CORTEX_VECTOR_INDEX=hnsw`는 `search_events`·`search_knowledge`에만 쓰이고 묶기는 늘 정확 검색이다(묶음이 실행마다 달라지면 엔진 상태가 달라진다). 근사 색인은 진짜 최근접을 놓칠 수 있고 가시성 필터 때문에 k개보다 적게 돌려줄 수 있다. 차원이 4000을 넘으면 색인 없이 정확 검색만 한다. 색인은 halfvec(반정밀도)로 만들어지므로 결과가 근사다. HNSW 검색은 pgvector 0.8 이상이 필요하고, 열 때 검사한다. 색인 버전이 바뀌어 색인을 다시 만드는 동안(임베딩 모델이나 묶음 문턱값을 바꾼 뒤 첫 `sync`) HNSW 색인을 지우는 잠금이 재구축 트랜잭션 끝까지 남아, 다른 세션의 벡터 검색이 그동안 기다린다. 기본값은 지연을 잰 뒤 정한다.
+- 연결이 끊기면(PostgreSQL 재시작, 유휴 연결 끊김 등) 다시 접속하지 않는다. 그 서버 프로세스는 세션을 다시 시작할 때까지 오류를 낸다.
 
 기존 SQLite 파일을 빈 PostgreSQL DB로 옮기려면(원본은 바꾸지 않는다):
 
@@ -101,7 +102,7 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 ## 임베딩
 
-core는 `record` 이벤트와 지식 항목을 임베딩해 저장하고, 같은 (범위, 소유자) 안에서 비슷한 기록을 묶음(group)으로 묶는다. 엔진은 `ctx.similar`로 이 색인을 읽는다. 임베딩을 켜지 않으면 `ctx.similar`는 `None`이고 동작은 이전과 같다. 이벤트는 엔진에 전달되기 전 같은 트랜잭션에서 색인되고, PostgreSQL이 기준 저장소이고, 인메모리·SQLite는 PostgreSQL과 같은 묶음을 만들며 점수는 1e-6 안에서 같다.
+core는 `record` 이벤트와 지식 항목을 임베딩해 저장하고, 같은 (범위, 소유자) 안에서 비슷한 기록을 묶음(group)으로 묶는다. 엔진은 `ctx.similar`로 이 색인을 읽는다. 임베딩을 켜지 않으면 `ctx.similar`는 `None`이고 동작은 이전과 같다. 이벤트는 엔진에 전달되기 전 같은 트랜잭션에서 색인되고, PostgreSQL이 기준 저장소이고, 인메모리·SQLite는 PostgreSQL과 같은 묶음을 만들며 점수는 약 1e-6 이내에서 같다(차원이 커질수록 오차가 커진다. 4096차원에서 8e-7까지 측정).
 
 임베딩 API 호출은 저장소의 쓰기 잠금(SQLite 파일 잠금, PostgreSQL advisory lock) 밖에서 한다. 아직 색인되지 않은 기록의 본문을 전달 전에 최대 64개씩 묶어 임베딩해 캐시에 넣고, 잠금 안에서는 캐시만 읽는다. SQLite에서 다른 세션은 잠금을 5초(`busy_timeout`)까지만 기다리고, 그보다 오래 막히면 그쪽 기록이 실패하기 때문이다. PostgreSQL에서는 `CORTEX_DB_LOCK_TIMEOUT`(기본 30초)까지 기다린 뒤 오류를 낸다. 예외는 둘이다. 하나는 엔진이 승격한 지식 항목으로, 결정과 함께 원자적으로 반영돼야 해서 잠금 안에서 항목 하나당 한 번 임베딩한다. 다른 하나는 엔진이 `observe`나 `tick` 중에 부르는 `ctx.similar.search`·`ctx.similar.knowledge`로, 캐시에 없는 질의를 전달 트랜잭션 안에서 임베딩한다. 둘 다 임베더 시간 제한이 한 번의 호출을 묶는다. 엔진은 `observe`에서 캐시만 읽는 `group`·`neighbors`를 쓰는 편이 낫다. 그래서 서버는 Upstage 요청 시간 제한을 SQLite의 5초보다 짧은 4초로 둔다(SQLite 기준이다. 소켓 동작 하나마다의 제한이라, 응답이 아주 느리게 조금씩 오면 더 걸릴 수 있다).
 

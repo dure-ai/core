@@ -61,6 +61,13 @@ class EventStoreContract(_Contract):
 
         assert [e.id for e in store.get(["e2", "missing", "e1"])] == ["e2", "e1"]
 
+    def test_get_finds_nothing_for_ids_that_are_not_strings(self, store):
+        store.append(ev("1", "a"))
+        store.append(ev("e2", "b"))
+
+        assert store.get([1, 2, None]) == []  # an engine bug, not a store error
+        assert [e.id for e in store.get(["e2", 1, "1"])] == ["e2", "1"]
+
     def test_get_round_trips_every_field(self, store):
         original = Event(
             id="e1", kind="outcome", at=T0, user="u1", team="t1", session="s1", scope="team",
@@ -150,6 +157,13 @@ class KnowledgeStoreContract(_Contract):
 
         assert kb.get(["k1"]) == []
         assert kb.all() == []
+
+    def test_knowledge_get_finds_nothing_for_ids_that_are_not_strings(self, kb):
+        kb.put(item("1"))
+        kb.put(item("k2"))
+
+        assert kb.get([1, 2, None]) == []  # an engine bug, not a store error
+        assert [i.id for i in kb.get(["k2", 1, "1"])] == ["k2", "1"]
 
     def test_knowledge_all_is_ordered_by_id(self, kb):
         for id in ["b", "c", "a"]:

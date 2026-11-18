@@ -1,10 +1,12 @@
 """PostgreSQL database: connection, the one advisory-locked transaction, and the schema.
 
-Every test uses the ``pg_schema`` fixture, so all of them skip without ``CORTEX_TEST_PG_URL``.
+Every test that needs a server uses the ``pg_schema`` fixture, so those skip without
+``CORTEX_TEST_PG_URL``; the pgvector version checks run without one.
 """
 
 import math
 import random
+import re
 import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -12,13 +14,17 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cortex_mem.contract import Event, Knowledge
+from cortex_mem.embed import cosine
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
+    pgvector_version,
+    require_hnsw_support,
     require_vector_type,
 )
 from cortex_mem.testing import (
+    SCORE_TOLERANCE,
     DatabaseContract,
     EngineStateBackendContract,
     EventStoreContract,
@@ -26,6 +32,7 @@ from cortex_mem.testing import (
     VectorBackendContract,
     caller,
     ev,
+    f32,
     item,
 )
 
@@ -94,6 +101,46 @@ def test_missing_vector_extension_is_reported(pg_schema):
     message = str(info.value)
     assert "CREATE EXTENSION vector" in message
     assert "postgresql://" not in message
+
+
+class _Answers:
+    """A connection stand-in whose every query returns ``row``."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, sql, params=()):
+        return self
+
+    def fetchone(self):
+        return self.row
+
+
+@pytest.mark.parametrize(
+    ("version", "ok"),
+    [("0.7.4", False), ("0.5.1", False), ("0.8.0", True), ("0.8.1", True), ("0.10.1", True), ("1.0", True)],
+)
+def test_hnsw_needs_pgvector_0_8(version, ok):
+    # Numbers, not strings: "0.10.1" < "0.8" as text, but it is the newer release.
+    if ok:
+        require_hnsw_support(_Answers((version,)))
+        return
+    with pytest.raises(RuntimeError, match=rf"0\.8.*{re.escape(version)}") as info:
+        require_hnsw_support(_Answers((version,)))
+    assert "postgresql://" not in str(info.value)
+
+
+def test_hnsw_refuses_when_the_pgvector_version_is_unknown():
+    with pytest.raises(RuntimeError, match="0.8"):
+        require_hnsw_support(_Answers(None))
+
+
+def test_opening_with_hnsw_checks_the_server_version(pg_schema):
+    with closing(PostgresDatabase(pg_schema)) as db:
+        found = db.query("SELECT extversion FROM pg_extension WHERE extname = 'vector'")[0][0]
+    with closing(PostgresDatabase(pg_schema, vector_index="hnsw")) as db:  # the test server has 0.8+
+        require_hnsw_support(db.con)
+    assert pgvector_version(found) >= (0, 8)
 
 
 def test_nested_transaction_rolls_back_everything(pg_schema):
@@ -518,6 +565,24 @@ class TestPgVectors(VectorBackendContract):
 
     def make(self):
         return self.open()
+
+    def test_scores_match_python_cosine_at_1024_dimensions(self, db, vb):
+        # The error grows with the dimension (8e-7 measured at 4096); 1024 is a real model's size.
+        rng = random.Random(1024)
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        query = [rng.gauss(0, 1) for _ in range(1024)]
+        stored = {}
+        for i in range(40):
+            noise = 0.1 + i * 0.1  # from near duplicates to almost unrelated
+            vector = [x + rng.gauss(0, noise) for x in query]
+            self.index_event(db, ev(f"e{i}", "x"), vector, i + 1)
+            stored[f"e{i}"] = f32(vector)
+
+        got = vb.search_events(query, caller(), "personal", 40)
+
+        assert len(got) == 40
+        for id, score in got:
+            assert score == pytest.approx(cosine(stored[id], f32(query)), abs=SCORE_TOLERANCE)
 
     def test_vectors_is_one_backend_per_database(self, db):
         assert db.vectors is db.vectors

@@ -274,6 +274,20 @@ def test_a_read_only_source_migrates(tmp_path, pg_schema):
     assert pg_count(pg_schema, "events") == 5
 
 
+def test_a_path_with_uri_characters_migrates(tmp_path, pg_schema):
+    # ?, # and % mean something in a file: URI; the path must reach SQLite as written.
+    folder = tmp_path / "a?b#c%41 d"
+    folder.mkdir()
+    path = folder / "core.db"
+    build_source(path)
+    before = sha(path)
+    result = run(str(path), pg_schema)
+    assert result.returncode == 0, result.stderr
+    assert pg_count(pg_schema, "events") == 5
+    assert sha(path) == before
+    assert [p.name for p in tmp_path.iterdir()] == [folder.name]  # no stray file from a cut-off URI
+
+
 def test_a_schema_4_source_warns_and_migrates_without_a_cache(tmp_path, pg_schema):
     path = tmp_path / "core.db"
     build_source(path)

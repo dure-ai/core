@@ -98,7 +98,8 @@ def _snapshot(path: Path, into: Path) -> Path:
     import sqlite3
 
     try:
-        ro = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # as_uri() percent-encodes the path, so ?, # and % in it stay part of the file name.
+        ro = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     except sqlite3.Error as exc:
         raise MigrationError(f"cannot read {path}: {exc}") from None
     try:
