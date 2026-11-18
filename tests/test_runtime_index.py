@@ -4,6 +4,7 @@ engines read similarity through ctx.similar, knowledge vectors follow the
 knowledge base after each decision commits, and a changed index version
 replays the engine (spec §7)."""
 
+import json
 import sqlite3
 import threading
 import time
@@ -23,7 +24,7 @@ from cortex_mem.contract import (
 )
 from cortex_mem.embed import EmbeddingError, HashEmbedder
 from cortex_mem.index import Index, IndexConfigChanged
-from cortex_mem.runtime import INDEX_STATE_KEY, Runtime
+from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -123,6 +124,31 @@ class ProbeEngine:
 
 def make_db(kind, tmp_path):
     return InMemoryDatabase() if kind == "memory" else SqliteDatabase(tmp_path / "core.db")
+
+
+def reopener(store, tmp_path, request):
+    """A zero-argument opener: each call is one more process on the same storage.
+    "postgres" runs only when CORTEX_TEST_PG_URL is set."""
+    if store == "memory":
+        shared = InMemoryDatabase()
+        return lambda: shared
+    if store == "sqlite":
+        return lambda: SqliteDatabase(tmp_path / "core.db")
+    url = request.getfixturevalue("pg_schema")
+    from cortex_mem.store.postgres import PostgresDatabase
+
+    opened = []
+
+    def open_pg():
+        db = PostgresDatabase(url)
+        opened.append(db)
+        return db
+
+    request.addfinalizer(lambda: [db.close() for db in opened])
+    return open_pg
+
+
+STORES = ["memory", "sqlite", "postgres"]
 
 
 def runtime(engine, db, embedder=None, threshold=0.9, max_failures=None, with_index=True, name="probe"):
@@ -375,7 +401,8 @@ def test_changed_threshold_rebuilds_groups_and_replays_the_engine(tmp_path):
     assert second.groups["e3"].id == "e3"
     assert db.vectors.meta() == {"model": "table", "group_threshold": 0.5, "store": "sqlite"}
     assert rt.state.get("n") == 3  # state was reset, not added to
-    assert rt.state.version() == ""  # no state_version on the engine, none stored
+    # No state_version on the engine: the version records only the index it was built on.
+    assert json.loads(rt.state.version()) == [None, fingerprint(db, 0.5, model="table")]
     assert [i.id for i in db.knowledge.all()] == ["k1"]  # knowledge is kept
     assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1"]
     assert emb.calls == []  # every passage came from the cache
@@ -391,7 +418,7 @@ def test_rebuild_keeps_the_engines_state_version():
     rt = runtime(engine, db, threshold=0.5)
     rt.sync()
     assert engine.seen == ["e1"]
-    assert rt.state.version() == "v7"
+    assert json.loads(rt.state.version()) == ["v7", fingerprint(db, 0.5)]
 
 
 # ── knowledge vectors and cursors ───────────────────────────────────────────
@@ -542,12 +569,9 @@ def test_a_failing_text_in_a_batch_stops_only_its_own_event():
 # ── every engine on one store follows the index version ─────────────────────
 
 
-@pytest.mark.parametrize("store", ["memory", "sqlite"])
-def test_every_engine_on_the_store_is_replayed_after_the_index_changes(store, tmp_path):
-    shared = InMemoryDatabase()
-
-    def reopen():  # a new process on the same storage
-        return shared if store == "memory" else SqliteDatabase(tmp_path / "core.db")
+@pytest.mark.parametrize("store", STORES)
+def test_every_engine_on_the_store_is_replayed_after_the_index_changes(store, tmp_path, request):
+    reopen = reopener(store, tmp_path, request)  # each call: a new process on the same storage
 
     a_old, b_old = ProbeEngine(), ProbeEngine()
     rt_a = runtime(a_old, reopen(), TableEmbedder(TABLE), threshold=0.9, name="a")
@@ -598,23 +622,227 @@ def test_the_index_is_checked_on_every_sync_not_once_per_process():
     assert engine.groups["e2"].members == ("e2",)
 
 
-def test_the_index_marker_is_hidden_from_the_engine():
-    class Peeks(ProbeEngine):
+# ── the engine version records the index generation (spec §3.5) ─────────────
+
+
+def fingerprint(db, threshold=0.9, model="hash-256"):
+    return {"model": model, "group_threshold": threshold, "store": db.vectors.kind, "generation": db.vectors.generation()}
+
+
+def composite(state_version, fp):
+    return json.dumps([state_version, fp], sort_keys=True, separators=(",", ":"))
+
+
+class ScanKeys(ProbeEngine):
+    """Also records every key ctx.state.scan() shows while observing."""
+
+    def __init__(self):
+        super().__init__()
+        self.keys = set()
+
+    def observe(self, event, ctx):
+        self.keys.update(k for k, _ in ctx.state.scan())
+        decisions = super().observe(event, ctx)
+        self.keys.update(k for k, _ in ctx.state.scan())
+        return decisions
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_changed_index_config_replays_every_engine_without_reserved_keys(store, tmp_path, request):
+    reopen = reopener(store, tmp_path, request)
+    first = reopen()
+    spy_a, spy_b = SpyEmbedder(TxnSpy(first)), SpyEmbedder(TxnSpy(first))
+    a, b = ScanKeys(), ScanKeys()
+    rt_a = runtime(a, first, spy_a, threshold=0.9, name="a")
+    rt_b = runtime(b, first, spy_b, threshold=0.9, name="b")
+    for i in range(3):
+        rt_a.append(ev(f"e{i}", f"fact {i}"))
+    rt_b.sync()
+    assert a.seen == b.seen == ["e0", "e1", "e2"]
+
+    # Both restart with another threshold, each in a new process.
+    db_a, db_b = reopen(), reopen()
+    a2, b2 = ScanKeys(), ScanKeys()
+    spy_a2, spy_b2 = SpyEmbedder(TxnSpy(db_a)), SpyEmbedder(TxnSpy(db_b))
+    rt_a = runtime(a2, db_a, spy_a2, threshold=0.5, name="a")
+    rt_b = runtime(b2, db_b, spy_b2, threshold=0.5, name="b")
+    assert rt_a.sync() == 3
+    assert rt_b.sync() == 3
+
+    assert a2.seen == b2.seen == ["e0", "e1", "e2"]
+    for rt in (rt_a, rt_b):
+        assert (rt.state.cursor(), rt.state.get("n")) == (3, 3)  # started over, not added to
+        assert [k for k, _ in rt.state.scan()] == ["n"]
+        assert rt.state.version() == composite(None, fingerprint(db_a, 0.5))
+    for engine in (a, b, a2, b2):
+        assert engine.keys == {"n"}
+    for spy in (spy_a, spy_b, spy_a2, spy_b2):
+        assert spy.inside == []
+
+
+def test_an_engine_can_use_runtime_looking_keys():
+    class UsesRuntimeKeys(ProbeEngine):
         def observe(self, event, ctx):
-            self.keys = [k for k, _ in ctx.state.scan()]
-            self.marker = ctx.state.get(INDEX_STATE_KEY)
-            with pytest.raises(ValueError, match="reserved"):
-                ctx.state.put(INDEX_STATE_KEY, "mine")
-            with pytest.raises(ValueError, match="reserved"):
-                ctx.state.delete(INDEX_STATE_KEY)
+            if event.id == "e1":
+                ctx.state.put("_runtime/x", 1)
+                ctx.state.put("_runtime/gone", 2)
+            else:
+                self.read = ctx.state.get("_runtime/x")
+                self.keys = [k for k, _ in ctx.state.scan("_runtime/")]
+                ctx.state.delete("_runtime/gone")
             return super().observe(event, ctx)
 
-    engine = Peeks()
+    engine = UsesRuntimeKeys()
     rt = runtime(engine, InMemoryDatabase())
     rt.append(ev("e1"))
     rt.append(ev("e2"))
-    assert engine.keys == ["n"] and engine.marker is None
-    assert rt.state.get(INDEX_STATE_KEY) == {"model": "hash-256", "group_threshold": 0.9, "store": "memory"}
+    assert engine.read == 1
+    assert engine.keys == ["_runtime/gone", "_runtime/x"]
+    assert dict(rt.state.scan()) == {"_runtime/x": 1, "n": 2}
+
+
+@pytest.mark.parametrize("state_version", ["a@b", 'say "hi"', "one,two", "버전-✓", ""])
+def test_composite_version_is_json_and_survives_odd_state_versions(state_version):
+    class Versioned(ProbeEngine):
+        pass
+
+    Versioned.state_version = state_version
+    db = InMemoryDatabase()
+    engine = Versioned()
+    rt = runtime(engine, db)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+
+    stored = rt.state.version()
+    assert json.loads(stored) == [state_version, fingerprint(db)]
+    assert stored == composite(state_version, fingerprint(db))
+
+    # The same version on the next sync and in a new process: no needless replay.
+    engine.seen.clear()
+    rt.sync()
+    again = Versioned()
+    runtime(again, db).sync()
+    assert engine.seen == again.seen == []
+
+    # Turning the index off replays once, and only once.
+    off = Versioned()
+    assert runtime(off, db, with_index=False).sync() == 2
+    assert runtime(Versioned(), db, with_index=False).sync() == 0
+    assert db.state("probe").version() == state_version
+
+    # Turning it back on replays once, and only once.
+    on = Versioned()
+    assert runtime(on, db).sync() == 2
+    assert runtime(Versioned(), db).sync() == 0
+    assert json.loads(db.state("probe").version()) == [state_version, fingerprint(db)]
+
+
+def test_an_engine_without_a_state_version_is_checked_when_an_index_is_present():
+    db = InMemoryDatabase()
+    rt = runtime(ProbeEngine(), db)
+    rt.append(ev("e1"))
+    assert json.loads(rt.state.version()) == [None, fingerprint(db)]
+
+    # A changed fingerprint (here, the threshold) replays it.
+    replayed = ProbeEngine()
+    assert runtime(replayed, db, threshold=0.5).sync() == 1
+    assert json.loads(db.state("probe").version()) == [None, fingerprint(db, 0.5)]
+
+    # Without an index and without a state_version nothing is checked, as before.
+    unchecked = ProbeEngine()
+    assert runtime(unchecked, db, with_index=False).sync() == 0
+    assert unchecked.seen == []
+
+
+def test_rebuild_by_another_process_with_the_same_config_replays_this_engine():
+    db = InMemoryDatabase()
+    engine = ProbeEngine()
+    rt = runtime(engine, db)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    before = db.vectors.generation()
+
+    # Another process finds the index reset (by a third config) and rebuilds it
+    # with the same config as this runtime: same meta, a later generation.
+    db.vectors.reset({"model": "someone-else", "group_threshold": 0.1, "store": "memory"})
+    other = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    assert other.ensure_current(db.knowledge) is True
+    assert db.vectors.meta() == rt.index.want() and db.vectors.generation() == before + 2
+
+    # This runtime's own Index rebuilt nothing, yet its engine's state was built
+    # on an older generation: it is replayed.
+    engine.seen.clear()
+    assert rt.sync() == 2
+    assert engine.seen == ["e1", "e2"]
+    assert rt.state.get("n") == 2
+    assert json.loads(rt.state.version()) == [None, fingerprint(db)]
+    assert rt.sync() == 0
+
+
+def test_ensure_current_failure_does_not_touch_engine_state():
+    db = InMemoryDatabase()
+    db.knowledge.put(item("k1", ("e1",)))
+    rt = runtime(ProbeEngine(), db)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    # Another process promoted an item whose passage is not cached yet.
+    db.knowledge.put(item("k2", ("e2",), body="never embedded"))
+    state = db.state("probe")
+    before = (state.cursor(), dict(state.scan()), state.version())
+    index_before = (db.vectors.meta(), db.vectors.generation(), db.vectors.indexed())
+
+    engine = ProbeEngine()
+    failing = runtime(engine, db, FailingEmbedder({"deploy\nnever embedded"}), threshold=0.5)
+    with pytest.raises(EmbeddingError):
+        failing.sync()
+
+    assert engine.seen == []
+    assert (state.cursor(), dict(state.scan()), state.version()) == before
+    assert (db.vectors.meta(), db.vectors.generation(), db.vectors.indexed()) == index_before
+
+
+class BumpsOnFirstVersionRead:
+    """An EngineStateBackend that, on the first version() read, lets `hook`
+    run first: another process changes the index between that read and the
+    runtime's transaction."""
+
+    def __init__(self, inner, hook):
+        self._inner = inner
+        self._hook = hook
+        self.version_reads = 0
+        self.resets = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def version(self):
+        self.version_reads += 1
+        if self.version_reads == 1:
+            self._hook()
+        return self._inner.version()
+
+    def reset(self, version):
+        self.resets.append(version)
+        self._inner.reset(version)
+
+
+def test_a_stale_version_check_inside_the_transaction_uses_the_fresh_fingerprint():
+    db = InMemoryDatabase()
+    db.events.append(ev("e1"))
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    seen_generation = db.vectors.generation()
+    # Another process rebuilds with the same config after the first read.
+    state = BumpsOnFirstVersionRead(db.state("probe"), lambda: db.vectors.reset(index.want()))
+    engine = ProbeEngine()
+    rt = Runtime(engine, db.events, db.knowledge, state, db.transaction, index=index)
+
+    assert rt.sync() == 1
+
+    assert db.vectors.generation() == seen_generation + 1
+    assert state.resets == [composite(None, fingerprint(db))]  # one reset, with the fresh generation
+    assert state.version() == composite(None, fingerprint(db))
+    assert rt.sync() == 0 and engine.seen == ["e1"]  # no loop: it matches from now on
 
 
 # ── replay sees what live delivery saw ──────────────────────────────────────

@@ -86,6 +86,13 @@ class Index:
             "store": self._backend.kind,
         }
 
+    def fingerprint(self) -> dict:
+        """want() plus the stored index's generation (one read): what an
+        engine's state built on this index depends on. A rebuild, by any
+        process and with any config, adds 1 to the generation, so it changes
+        the fingerprint even when the config ends up the same."""
+        return {**self.want(), "generation": self._backend.generation()}
+
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
 

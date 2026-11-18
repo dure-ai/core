@@ -34,8 +34,6 @@ from .store.base import CursorConflict, EngineStateBackend, EventStore, Knowledg
 _ABSENT = object()
 MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
-RESERVED_STATE_PREFIX = "_runtime/"  # the runtime's own keys in the engine's state, hidden from the engine
-INDEX_STATE_KEY = RESERVED_STATE_PREFIX + "index"  # the index version the engine's state was built on
 
 
 @dataclass(frozen=True)
@@ -79,10 +77,9 @@ class _StagedState:
     Pending values are kept as JSON text, so a value is copied on the way in
     and on the way out, as it is once committed."""
 
-    def __init__(self, backend: EngineStateBackend, read_only: bool = False, reserved: str | None = None) -> None:
+    def __init__(self, backend: EngineStateBackend, read_only: bool = False) -> None:
         self._backend = backend
         self._read_only = read_only
-        self._reserved = reserved  # key prefix the engine may neither see nor write
         self._writes: dict[str, str] = {}
         self.deletes: set[str] = set()
 
@@ -92,7 +89,7 @@ class _StagedState:
         return {key: json.loads(raw) for key, raw in self._writes.items()}
 
     def get(self, key: str) -> Any | None:
-        if key in self.deletes or self._is_reserved(key):
+        if key in self.deletes:
             return None
         if key in self._writes:
             return json.loads(self._writes[key])
@@ -100,7 +97,6 @@ class _StagedState:
 
     def put(self, key: str, value: Any) -> None:
         self._check_writable()
-        self._check_not_reserved(key)
         raw = json.dumps(value)
         size = len(raw.encode())
         if size > MAX_STATE_VALUE_BYTES:
@@ -110,7 +106,6 @@ class _StagedState:
 
     def delete(self, key: str) -> None:
         self._check_writable()
-        self._check_not_reserved(key)
         self._writes.pop(key, None)
         self.deletes.add(key)
 
@@ -118,19 +113,12 @@ class _StagedState:
         merged = dict(self._backend.scan(prefix))
         merged.update((k, json.loads(v)) for k, v in self._writes.items() if k.startswith(prefix))
         for key in sorted(merged):
-            if key not in self.deletes and not self._is_reserved(key):
+            if key not in self.deletes:
                 yield key, merged[key]
 
     def _check_writable(self) -> None:
         if self._read_only:
             raise PermissionError("state is read-only during handoff")
-
-    def _is_reserved(self, key: str) -> bool:
-        return self._reserved is not None and key.startswith(self._reserved)
-
-    def _check_not_reserved(self, key: str) -> None:
-        if self._is_reserved(key):
-            raise ValueError(f"state keys starting with {self._reserved!r} are reserved for the runtime")
 
 
 class Runtime:
@@ -191,7 +179,6 @@ class Runtime:
         self.verdicts: list[Verdict] = []
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
-        self._version_checked = False
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
 
@@ -200,7 +187,7 @@ class Runtime:
         return [v for v in self.verdicts if not v.accepted]
 
     def _staged(self, read_only: bool = False) -> _StagedState:
-        return _StagedState(self.state, read_only=read_only, reserved=RESERVED_STATE_PREFIX)
+        return _StagedState(self.state, read_only=read_only)
 
     def _ctx(self, state: _StagedState, upto: int) -> EngineContext:
         """upto: the last event the engine has been given (the one it observes,
@@ -228,8 +215,7 @@ class Runtime:
         If another process rebuilds the index with another config meanwhile,
         it is rebuilt for this one and delivery starts again, at most
         MAX_CONFIG_RETRIES times per event; then IndexConfigChanged is raised."""
-        self._check_state_version()
-        self._check_index_version()
+        self._check_versions()
         self._follow_knowledge()
         delivered = 0
         ahead = self.index is not None
@@ -259,12 +245,12 @@ class Runtime:
                     self.index.advance(self.events, seq)
                 except IndexConfigChanged:
                     # Another process rebuilt the index with another config. Rebuild
-                    # it for ours (that replays this engine) and try again, a few
-                    # times: two configs on one store are not supported.
+                    # it for ours (a new generation: that replays this engine) and
+                    # try again, a few times: two configs on one store are not supported.
                     retries[seq] = retries.get(seq, 0) + 1
                     if retries[seq] > MAX_CONFIG_RETRIES:
                         raise
-                    self._check_index_version()
+                    self._check_versions()
                     self._follow_knowledge()
                     ahead, outage = True, None
                     continue
@@ -364,43 +350,34 @@ class Runtime:
             return None
         return attempts
 
-    def _check_state_version(self) -> None:
-        """Drop the engine's state and start delivery over when the engine's
-        state_version differs from the stored one. The knowledge base is kept;
-        replayed Promotes replace items with the same id."""
-        want = getattr(self.engine, "state_version", None)
-        if want is None or self._version_checked:
-            return
-        with self.transaction():
-            if self.state.version() != want:
-                self.state.reset(want)
-        self._version_checked = True
-
-    def _check_index_version(self) -> None:
-        """Runs on every sync. The index version (model, threshold) is one per
-        store, but each engine's state was built on the version it saw. So:
-        when the stored index has another version than this Index wants (or
-        none), rebuild it (Index.ensure_current, outside any transaction of
-        this Runtime); and when this engine's state was built on another
-        version than the current one, or the index was just rebuilt (it starts
-        again at position 0, behind this engine's cursor), reset the state and
-        deliver from the start, as a changed state_version does. The state
-        keeps its version: the engine's, else the stored one."""
+    def _want_version(self) -> str | None:
+        """The version this engine's state must have been written with. With
+        an index it is the JSON of [state_version or None, index fingerprint]:
+        the state records which index generation it was built on. Without
+        one it is the engine's state_version, and None means nothing to check."""
+        state_version = getattr(self.engine, "state_version", None)
         if self.index is None:
-            return
-        if not self.index.stale() and self.state.get(INDEX_STATE_KEY) == self.index.want():
-            return  # two reads: the common case takes no lock
-        rebuilt = self.index.ensure_current(self.knowledge)
-        if rebuilt:
+            return state_version
+        return json.dumps([state_version, self.index.fingerprint()], sort_keys=True, separators=(",", ":"))
+
+    def _check_versions(self) -> None:
+        """Runs on every sync. With an index, first rebuild it if it is stale
+        (Index.ensure_current, which embeds with no transaction open). Then,
+        when the stored version differs from _want_version(), drop the
+        engine's state and start delivery over, in one short transaction that
+        computes the version again (the index may have been rebuilt
+        meanwhile). A rebuild by any process adds 1 to the index generation,
+        so it changes the version of every engine on the store. The knowledge
+        base is kept; replayed Promotes replace items with the same id."""
+        if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
+        want = self._want_version()
+        if want is None or self.state.version() == want:
+            return  # the common case takes no lock
         with self.transaction():
-            current = self.index.want()  # what the store holds now
-            if rebuilt or self.state.get(INDEX_STATE_KEY) != current:
-                version = getattr(self.engine, "state_version", None)
-                if version is None:
-                    version = self.state.version()
-                self.state.reset("" if version is None else version)
-                self.state.commit(0, 0, {INDEX_STATE_KEY: current}, set())
+            want = self._want_version()
+            if want is not None and self.state.version() != want:
+                self.state.reset(want)
 
     def tick(self, now: datetime) -> None:
         self.sync()
