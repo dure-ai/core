@@ -133,6 +133,7 @@ class InMemoryStateBackend:
     def __init__(self) -> None:
         self._data: dict[str, str] = {}  # stored as JSON text, like a durable store
         self._cursor = 0
+        self._epoch = 0
         self._version: str | None = None
 
     def get(self, key: str) -> Any | None:
@@ -147,16 +148,28 @@ class InMemoryStateBackend:
     def cursor(self) -> int:
         return self._cursor
 
+    def epoch(self) -> int:
+        return self._epoch
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
-        if self._cursor != expected:
-            raise CursorConflict(f"cursor is {self._cursor}, expected {expected}")
+        if self._cursor != expected or self._epoch != epoch:
+            raise CursorConflict(
+                f"cursor is {self._cursor} at epoch {self._epoch}, expected {expected} at epoch {epoch}"
+            )
         encoded = {key: json.dumps(_copy(value)) for key, value in writes.items()}
         for key in deletes:
             self._data.pop(key, None)
         self._data.update(encoded)
         self._cursor = cursor
+        self._epoch += 1
 
     def version(self) -> str | None:
         return self._version
@@ -164,6 +177,7 @@ class InMemoryStateBackend:
     def reset(self, version: str) -> None:
         self._data.clear()
         self._cursor = 0
+        self._epoch += 1
         self._version = version
 
 
@@ -185,8 +199,10 @@ class InMemoryVectorBackend:
         # grouping each new event does not sort every group again.
         self._cells: dict[tuple[Scope, str], list[tuple[int, str]]] = {}
         self._cache: dict[tuple[str, str], list[float]] = {}
+        self._digests: dict[str, str] = {}
         self._meta: dict | None = None
         self._indexed = 0
+        self._generation = 0
 
     def meta(self) -> dict | None:
         return None if self._meta is None else dict(self._meta)
@@ -196,18 +212,38 @@ class InMemoryVectorBackend:
             table.clear()
         self._groups.clear()
         self._cells.clear()
+        self._digests.clear()
         self._indexed = 0
         self._meta = dict(meta)
+        self._generation += 1
+
+    def generation(self) -> int:
+        return self._generation
 
     def indexed(self) -> int:
         return self._indexed
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
+        if self._indexed != expected or self._generation != generation:
+            raise CursorConflict(
+                f"index at {self._indexed} (generation {self._generation}), "
+                f"not {expected} (generation {generation})"
+            )
         self._indexed = seq
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
         # Assigning to an existing dict key keeps its original position.
         self._vectors[kind][id] = float32(vector)
+        if kind == "knowledge":
+            if digest is None:
+                self._digests.pop(id, None)
+            else:
+                self._digests[id] = digest
+
+    def knowledge_digests(self) -> dict[str, str]:
+        return dict(self._digests)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         found = self._vectors[kind].get(id)
@@ -226,6 +262,8 @@ class InMemoryVectorBackend:
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
         for id in ids:
             self._vectors[kind].pop(id, None)
+            if kind == "knowledge":
+                self._digests.pop(id, None)
 
     def put_group(
         self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int

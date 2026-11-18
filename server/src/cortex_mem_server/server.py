@@ -63,11 +63,13 @@ ENGINE_ALIASES = {
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
 log = logging.getLogger("cortex_mem_server")
-# Two things are embedded while SQLite's write lock is held: a promoted item
-# (one call per item) and an engine's query text in ctx.similar.search or
-# .knowledge during observe/tick (engines should prefer group/neighbors there).
-# Every other passage is embedded outside it. Below the busy timeout, so
-# another session's write still gets in after a stalled call.
+# Nothing is embedded while a write transaction is open: passages, promoted
+# items and an engine's query text (ctx.similar.search or .knowledge during
+# observe/tick) are all embedded with no write lock held, so a slow or failing
+# Upstage call never blocks another session's write. This bound is how long a
+# tool call waits on one stalled request (per socket operation, so a response
+# that trickles in can take longer) before the delivery fails with an
+# EmbeddingError and is retried on the next call.
 UPSTAGE_TIMEOUT_S = 4.0
 
 
@@ -167,8 +169,11 @@ class Service:
         self._log_skipped()
         return caller
 
-    def _append(self, caller: Caller, **fields) -> tuple[str, bool]:
-        """Append an event; returns its id and whether the engine has seen it.
+    def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
+        """Append an event; returns its id, whether the engine has seen
+        everything (pending() == 0 after the call: false while an earlier
+        event, an embedding outage or a failing engine holds delivery back)
+        and how many events still wait (None when that could not be read).
         Once stored, the event is not lost if delivery fails: it is retried
         later, so the agent must not record it again."""
         event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
@@ -179,10 +184,16 @@ class Service:
             if not self.runtime.events.get([event.id]):
                 raise  # refused before it was stored (e.g. missing refs)
             log.exception("event %s stored, but the engine failed to take it in", event.id)
-            return event.id, False
         finally:
             self._log_skipped()
-        return event.id, True
+        try:
+            pending: int | None = self.runtime.pending()
+        except Exception:
+            # The event is stored: answer delivered false, never an error the
+            # agent would answer by recording it again.
+            log.exception("event %s stored, but its delivery could not be checked", event.id)
+            return event.id, False, None
+        return event.id, pending == 0, pending
 
     def _log_skipped(self) -> None:
         for skipped in self.runtime.skipped[self._skipped_logged:]:
@@ -203,11 +214,11 @@ class Service:
     ) -> dict:
         caller = self._caller(repo)
         effective = self.policy.resolve(scope, self.repo)
-        id, delivered = self._append(
+        id, delivered, pending = self._append(
             caller, kind="record", scope=effective, text=text, signal="self",
             conditions=conditions or {}, refs=tuple(refs), repo=caller.repo, rev=rev,
         )
-        return {"id": id, "scope": effective, "delivered": delivered}
+        return {"id": id, "scope": effective, "delivered": delivered, "pending": pending}
 
     def recall(
         self,
@@ -238,11 +249,13 @@ class Service:
         # The judgement must reach whoever sees the judged item, but the agent's
         # words follow the repo's policy: past it, only the judgement is shared.
         redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
-        id, delivered = self._append(
+        id, delivered, pending = self._append(
             caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
             signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
         )
-        return {"id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered}
+        return {
+            "id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered, "pending": pending,
+        }
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
         """An outcome is evidence about what it judges, so by default it is
@@ -376,7 +389,7 @@ def get_service() -> Service:
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
             max_failures=_max_failures(),
-            index=None if embedder is None else Index(db.vectors, embedder, threshold),
+            index=None if embedder is None else Index(db.vectors, embedder, threshold, transaction=db.transaction),
         )
     return _service
 
@@ -396,9 +409,11 @@ def record_episode(
     conditions: when it holds, e.g. {"service": "api"}. refs: ids of recalled
     memories this builds on. repo/rev: where the evidence is (repo, commit);
     repo defaults to the project's configured repo and does not change who may
-    see the record. Returns the id, the scope actually used, and delivered:
-    false means it is stored and will reach memory later, so do not record it
-    again."""
+    see the record. Returns the id, the scope actually used, delivered and
+    pending: delivered false (pending > 0 events wait) means it is stored and
+    will reach memory later, so do not record it again. pending is an integer,
+    or null when it could not be read (delivered is then false; the record is
+    still stored)."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 
@@ -435,8 +450,9 @@ def report_outcome(
     see the judged memories, e.g. the whole org for an org memory; scope can
     only narrow that. If that is wider than this repo's policy, text is not
     stored (text_redacted: true). Returns the id, the scope actually used,
-    text_redacted, and delivered (false: stored, reaches memory later; do not
-    report it again)."""
+    text_redacted, delivered and pending (delivered false: stored, reaches
+    memory later, pending events wait; do not report it again). pending is an
+    integer, or null when it could not be read (delivered is then false)."""
     try:
         return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed

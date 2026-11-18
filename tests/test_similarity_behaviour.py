@@ -12,6 +12,7 @@ from cortex_mem.embed import HashEmbedder
 from cortex_mem.engines.evidence import EvidenceEngine
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -117,7 +118,7 @@ class Quiet:
 
 
 def runtime(db, embedder=None, name="probe"):
-    index = Index(db.vectors, embedder or HashEmbedder(), 0.9)
+    index = Index(db.vectors, embedder or HashEmbedder(), 0.9, transaction=db.transaction)
     return Runtime(Quiet(), db.events, db.knowledge, db.state(name), db.transaction, index=index)
 
 
@@ -250,33 +251,45 @@ def unique(all_events):
 
 class RecordingBackend:
     """Delegates to a VectorBackend and logs every vector and group write, so a
-    re-index is visible even though the writes are upserts."""
+    re-index is visible even though the writes are upserts. ignore_cursor
+    makes a broken indexer: it reads its position as 0 and moves the shared
+    position without checking it."""
 
-    def __init__(self, inner, log, indexed_override=None):
+    def __init__(self, inner, log, ignore_cursor=False):
         self._inner = inner
         self.log = log
-        self._indexed_override = indexed_override
+        self._ignore_cursor = ignore_cursor
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def put_vector(self, kind, id, vector):
+    def put_vector(self, kind, id, vector, digest=None):
         self.log.append(("put_vector", kind, id))
-        self._inner.put_vector(kind, id, vector)
+        self._inner.put_vector(kind, id, vector, digest)
 
     def put_group(self, event_id, *args, **kw):
         self.log.append(("put_group", event_id))
         self._inner.put_group(event_id, *args, **kw)
 
     def indexed(self):
-        if self._indexed_override is not None:
-            return self._indexed_override()
-        return self._inner.indexed()
+        return 0 if self._ignore_cursor else self._inner.indexed()
+
+    def set_indexed(self, expected, seq, generation):
+        """Logged as ("set_indexed", expected, seq, accepted), refused attempts too."""
+        if self._ignore_cursor:
+            current = self._inner.indexed()
+            expected, seq, generation = current, max(seq, current), self._inner.generation()
+        try:
+            self._inner.set_indexed(expected, seq, generation)
+        except CursorConflict:
+            self.log.append(("set_indexed", expected, seq, False))
+            raise
+        self.log.append(("set_indexed", expected, seq, True))
 
 
-def recording_runtime(db, embedder, log, indexed_override=None):
-    backend = RecordingBackend(db.vectors, log, indexed_override)
-    index = Index(backend, embedder, 0.9)
+def recording_runtime(db, embedder, log):
+    backend = RecordingBackend(db.vectors, log)
+    index = Index(backend, embedder, 0.9, transaction=db.transaction)
     return Runtime(Quiet(), db.events, db.knowledge, db.state("probe"), db.transaction, index=index)
 
 
@@ -295,16 +308,41 @@ def assert_written_once(log, all_events, complete):
             assert sorted(got) == want
 
 
+def assert_claims_disjoint(log):
+    """Accepted set_indexed attempts claim disjoint position ranges, and every
+    vector or group write follows an accepted claim of its event: a refused
+    attempt never wrote."""
+    claims = [(e[1], e[2]) for e in log if e[0] == "set_indexed" and e[3]]
+    covered = [p for lo, hi in claims for p in range(lo + 1, hi + 1)]
+    assert len(covered) == len(set(covered)), f"overlapping claims: {claims}"
+    last = None
+    for entry in log:
+        if entry[0] == "set_indexed":
+            last = entry
+        elif entry[0] == "put_group" or (entry[0] == "put_vector" and entry[1] == "event"):
+            assert last is not None and last[3], f"{entry} written after a refused claim {last}"
+
+
+def test_the_write_log_check_fails_on_a_duplicate():
+    duplicated = [("put_vector", "event", "p1"), ("put_group", "p1"), ("put_vector", "event", "p1")]
+    with pytest.raises(AssertionError, match="wrote an event twice"):
+        assert_written_once(duplicated, events(), complete=False)
+    with pytest.raises(AssertionError, match="overlapping claims"):
+        assert_claims_disjoint([("set_indexed", 0, 2, True), ("set_indexed", 1, 2, True)])
+    with pytest.raises(AssertionError, match="refused claim"):
+        assert_claims_disjoint([("set_indexed", 0, 1, False), ("put_group", "p1")])
+
+
 # who appends event i: b falls several events behind between its turns, so it
 # must catch up on events another runtime indexed, and each sync is checked
 PLAN = "aabbaaaaabaaabbbabab"
 
 
-def run_two_runtimes(path, all_events, embedder, log, b_cursor=None, kind="sqlite"):
+def run_two_runtimes(path, all_events, embedder, log, kind="sqlite"):
     db_a, db_b = make_db(kind, path), make_db(kind, path)
     runtimes = {
         "a": recording_runtime(db_a, embedder, log),
-        "b": recording_runtime(db_b, embedder, log, b_cursor),
+        "b": recording_runtime(db_b, embedder, log),
     }
     for i, (who, e) in enumerate(zip(PLAN, all_events, strict=True)):
         runtimes[who].append(e)
@@ -328,6 +366,7 @@ def test_two_runtimes_on_one_store_index_each_event_once(texts, kind, where):
     db_a, db_b, runtimes = run_two_runtimes(where(kind, "shared.db"), all_events, embedder, log, kind=kind)
 
     assert_written_once(log, all_events, complete=True)  # the writes themselves, across both runtimes
+    assert_claims_disjoint(log)
     passages = [t for t, kind in embedder.calls if kind == "passage"]
     assert sorted(passages) == sorted({e.text for e in embeddable(all_events)})
     if texts == "unique":
@@ -339,14 +378,37 @@ def test_two_runtimes_on_one_store_index_each_event_once(texts, kind, where):
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "pg"])
-def test_the_write_log_catches_a_runtime_that_ignores_the_shared_cursor(kind, where):
-    """Control for the test above: runtime b told its cursor is always 0
-    re-indexes events a already indexed, and the log shows it."""
+def test_the_write_log_catches_an_indexer_that_ignores_the_shared_cursor(kind, where):
+    """Control for the test above. After two runtimes indexed everything, an
+    indexer that reads its position as 0 and moves the shared position
+    unchecked re-indexes every event, and the write log shows it. With the
+    checked set_indexed (only the read is wrong) the same indexer gets
+    CursorConflict before its first write, and the log shows nothing twice."""
+    path = where(kind, "shared.db")
     log = []
+    run_two_runtimes(path, events(), CountingEmbedder(), log, kind=kind)
+    assert_written_once(log, events(), complete=True)
+    db = make_db(kind, path)
+    last = list(db.events.since(0))[-1][0]
+
+    class ReadsZero(RecordingBackend):
+        def indexed(self):
+            return 0
+
+    checked = Index(ReadsZero(db.vectors, log), CountingEmbedder(), 0.9, transaction=db.transaction)
+    with pytest.raises(CursorConflict):
+        checked.advance(db.events, last)
+    assert log[-1] == ("set_indexed", 0, 1, False)  # refused, and nothing written after it
+    assert_written_once(log, events(), complete=True)
+    assert_claims_disjoint(log)
+
+    rogue = Index(RecordingBackend(db.vectors, log, ignore_cursor=True), CountingEmbedder(), 0.9,
+                  transaction=db.transaction)
+    rogue.advance(db.events, last)
     with pytest.raises(AssertionError, match="wrote an event twice"):
-        run_two_runtimes(
-            where(kind, "shared.db"), events(), CountingEmbedder(), log, b_cursor=lambda: 0, kind=kind
-        )
+        assert_written_once(log, events(), complete=True)
+    got = writes(log, "put_group")
+    assert len(got) == 2 * len(set(got)), "the log shows every event written twice"
 
 
 def evidence_scenario(with_index):

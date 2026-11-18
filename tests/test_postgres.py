@@ -16,6 +16,7 @@ import pytest
 from cortex_mem.contract import Event, Knowledge
 from cortex_mem.embed import cosine
 from cortex_mem.runtime import Runtime
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
@@ -79,11 +80,47 @@ def test_fresh_schema_is_created_and_versioned(pg_schema):
         PostgresDatabase(pg_schema, vector_index="ivfflat")
 
 
+def test_generation_survives_reopening(pg_schema):
+    meta = {"model": "m", "group_threshold": 0.5}
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.generation() == 0
+        db.vectors.reset(meta)
+        db.vectors.reset(meta)
+        db.vectors.put_vector("knowledge", "k1", [1.0, 0.0], digest="dk")
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.generation() == 2
+        assert db.vectors.meta() == meta
+        assert db.vectors.knowledge_digests() == {"k1": "dk"}
+        with pytest.raises(CursorConflict):
+            db.vectors.set_indexed(0, 1, 1)
+        db.vectors.set_indexed(0, 1, 2)
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.indexed() == 1
+
+
 def test_unknown_schema_version_refuses_to_start(pg_schema):
     with closing(PostgresDatabase(pg_schema)) as db:
         db.query("UPDATE cortex_meta SET value = '99' WHERE key = 'schema_version'")
     with pytest.raises(RuntimeError, match=r"99.*\b1\b"):
         PostgresDatabase(pg_schema)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "CREATE TABLE engine_cursor (engine text PRIMARY KEY, cursor bigint, version text)",
+        "CREATE TABLE knowledge_vectors (id text PRIMARY KEY, emb vector)",
+    ],
+)
+def test_a_schema_from_before_the_epoch_and_digest_columns_is_refused(pg_schema, table):
+    import psycopg
+
+    with psycopg.connect(pg_schema, autocommit=True) as con:
+        con.execute(table)
+
+    with pytest.raises(RuntimeError, match="drop") as raised:
+        PostgresDatabase(pg_schema)
+    assert "postgresql://" not in str(raised.value) and "cortex@" not in str(raised.value)
 
 
 def test_missing_vector_extension_is_reported(pg_schema):
@@ -519,7 +556,7 @@ class TestPgState(EngineStateBackendContract):
 
     def test_values_keep_key_order(self):
         state = self.make()
-        state.commit(0, 1, {"k": {"b": 1, "a": 2}}, set())
+        state.commit(0, 1, {"k": {"b": 1, "a": 2}}, set(), epoch=state.epoch())
 
         assert list(state.get("k")) == ["b", "a"]
         (_, value), = state.scan()
@@ -528,8 +565,8 @@ class TestPgState(EngineStateBackendContract):
     def test_two_engines_do_not_share_state(self):
         db = self.open()
         a, b = db.state("a"), db.state("b")
-        a.commit(0, 2, {"k": "from a", "only-a": 1}, set())
-        b.commit(0, 5, {"k": "from b"}, set())
+        a.commit(0, 2, {"k": "from a", "only-a": 1}, set(), epoch=a.epoch())
+        b.commit(0, 5, {"k": "from b"}, set(), epoch=b.epoch())
 
         assert (a.get("k"), a.cursor()) == ("from a", 2)
         assert (b.get("k"), b.cursor()) == ("from b", 5)
@@ -652,7 +689,7 @@ class TestPgVectors(VectorBackendContract):
         vb.put_vector("event", "e1", [1.0, 0.0])
         vb.put_vector("knowledge", "k1", [1.0, 0.0])
         vb.put_group("e1", "g1", "team", "t1", 1)
-        vb.set_indexed(3)
+        vb.set_indexed(0, 3, vb.generation())
         assert _hnsw_indexes(db) == {"event_vectors_hnsw_d2", "knowledge_vectors_hnsw_d2"}
 
         vb.reset({"model": "m2", "group_threshold": 0.9})
@@ -788,8 +825,14 @@ class TestPgDatabase(DatabaseContract):
 
         return opener
 
-    def test_max_failures_skips_an_event_that_fails_with_a_db_error(self, open_db):
+    def test_poison_event_with_a_db_error_is_skipped(self, open_db):
+        """observe runs outside the write transaction, so a failed statement
+        aborts no transaction: the event is counted, skipped after max_failures
+        without being indexed again, and the next event is delivered."""
         import psycopg
+
+        from cortex_mem.embed import HashEmbedder
+        from cortex_mem.index import Index
 
         db = open_db()
 
@@ -801,7 +844,7 @@ class TestPgDatabase(DatabaseContract):
                 self.seen.append(event.id)
                 ctx.state.put(event.id, True)
                 if event.id == "e1":
-                    db.query("SELECT 1/0")  # PostgreSQL aborts the delivery transaction
+                    db.query("SELECT 1/0")
                 return []
 
             def tick(self, now, ctx):
@@ -811,7 +854,9 @@ class TestPgDatabase(DatabaseContract):
                 return []
 
         engine = Poison()
-        rt = Runtime(engine, db.events, db.knowledge, db.state("poison"), db.transaction, max_failures=2)
+        index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+        rt = Runtime(engine, db.events, db.knowledge, db.state("poison"), db.transaction, max_failures=2,
+                     index=index)
 
         with pytest.raises(psycopg.errors.DivisionByZero):
             rt.append(ev("e1", "x"))
@@ -820,11 +865,14 @@ class TestPgDatabase(DatabaseContract):
         assert engine.seen == ["e1", "e1", "e2"]
         assert [(s.seq, s.event_id, s.attempts) for s in rt.skipped] == [(1, "e1", 2)]
         assert rt.skipped[0].error.startswith("DivisionByZero")
-        assert rt.state.cursor() == 2
+        assert rt.state.cursor() == 2 and rt.pending() == 0
         assert [k for k, _ in rt.state.scan()] == ["e2"]
+        assert db.vectors.indexed() >= rt.state.cursor()
+        assert rt._failures == {}
 
         later = Poison()
         other = open_db()
         Runtime(later, other.events, other.knowledge, other.state("poison"), other.transaction,
-                max_failures=2).sync()
+                max_failures=2, index=Index(other.vectors, HashEmbedder(), 0.9,
+                                            transaction=other.transaction)).sync()
         assert later.seen == []

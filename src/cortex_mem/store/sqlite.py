@@ -108,10 +108,11 @@ class SqliteDatabase:
                 "PRIMARY KEY (engine, key))"
             )
             self.con.execute(
-                "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
+                "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0)"
             )
             self.con.execute(
-                "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, "
+                "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, digest TEXT, "
                 "PRIMARY KEY (kind, id))"
             )
             self.con.execute(
@@ -127,7 +128,18 @@ class SqliteDatabase:
                 "PRIMARY KEY (model, digest))"
             )
             self.con.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT)")
+            # Columns added without a version bump: main's schema-3 files have no
+            # engine_cursor.epoch, feat/core-embedding's schema-5 files no
+            # vectors.digest. CREATE IF NOT EXISTS keeps an old table as it is.
+            self._add_column("engine_cursor", "epoch", "INTEGER NOT NULL DEFAULT 0")
+            self._add_column("vectors", "digest", "TEXT")
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _add_column(self, table: str, column: str, definition: str) -> None:
+        """Inside the schema transaction: add the column if the table lacks it."""
+        columns = {row[1] for row in self.con.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def state(self, engine: str) -> "SqliteStateBackend":
         return SqliteStateBackend(self, engine)
@@ -312,14 +324,27 @@ class SqliteStateBackend:
         rows = self.db.query("SELECT cursor FROM engine_cursor WHERE engine = ?", (self.engine,))
         return rows[0][0] if rows else 0
 
+    def epoch(self) -> int:
+        rows = self.db.query("SELECT epoch FROM engine_cursor WHERE engine = ?", (self.engine,))
+        return rows[0][0] if rows else 0
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
         encoded = {key: json.dumps(value) for key, value in writes.items()}
         with self.db.transaction():
-            current = self.cursor()
-            if current != expected:
-                raise CursorConflict(f"cursor is {current}, expected {expected}")
+            rows = self.db.query("SELECT cursor, epoch FROM engine_cursor WHERE engine = ?", (self.engine,))
+            current, current_epoch = rows[0] if rows else (0, 0)
+            if current != expected or current_epoch != epoch:
+                raise CursorConflict(
+                    f"cursor is {current} at epoch {current_epoch}, expected {expected} at epoch {epoch}"
+                )
             self.db.con.executemany(
                 "DELETE FROM engine_state WHERE engine = ? AND key = ?", [(self.engine, k) for k in deletes]
             )
@@ -329,9 +354,9 @@ class SqliteStateBackend:
                 [(self.engine, k, v) for k, v in encoded.items()],
             )
             self.db.con.execute(
-                "INSERT INTO engine_cursor (engine, cursor) VALUES (?, ?) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = excluded.cursor",
-                (self.engine, cursor),
+                "INSERT INTO engine_cursor (engine, cursor, epoch) VALUES (?, ?, ?) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = excluded.cursor, epoch = excluded.epoch",
+                (self.engine, cursor, epoch + 1),
             )
 
     def version(self) -> str | None:
@@ -342,8 +367,9 @@ class SqliteStateBackend:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM engine_state WHERE engine = ?", (self.engine,))
             self.db.con.execute(
-                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (?, 0, ?) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version",
+                "INSERT INTO engine_cursor (engine, cursor, version, epoch) VALUES (?, 0, ?, 1) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version, "
+                "epoch = engine_cursor.epoch + 1",
                 (self.engine, version),
             )
 
@@ -385,28 +411,51 @@ class SqliteVectorBackend:
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (json.dumps(meta),),
             )
+            self.db.con.execute(
+                "INSERT INTO vector_meta (key, value) VALUES ('generation', '1') "
+                "ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+            )
+
+    def generation(self) -> int:
+        rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'generation'")
+        return int(rows[0][0]) if rows else 0
 
     def indexed(self) -> int:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
         return int(rows[0][0]) if rows else 0
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():
+            current, now = self.indexed(), self.generation()
+            if current != expected or now != generation:
+                raise CursorConflict(
+                    f"index at {current} (generation {now}), not {expected} (generation {generation})"
+                )
             self.db.con.execute(
                 "INSERT INTO vector_meta (key, value) VALUES ('indexed', ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (str(seq),),
             )
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
+        if kind != "knowledge":
+            digest = None
         with self.db.transaction():
             # seq is assigned on first insert; replacing keeps it (and the position).
             self.db.con.execute(
-                "INSERT INTO vectors (kind, id, seq, vec) VALUES "
-                "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM vectors WHERE kind = ?), ?) "
-                "ON CONFLICT (kind, id) DO UPDATE SET vec = excluded.vec",
-                (kind, id, kind, _pack(vector)),
+                "INSERT INTO vectors (kind, id, seq, vec, digest) VALUES "
+                "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM vectors WHERE kind = ?), ?, ?) "
+                "ON CONFLICT (kind, id) DO UPDATE SET vec = excluded.vec, digest = excluded.digest",
+                (kind, id, kind, _pack(vector), digest),
             )
+
+    def knowledge_digests(self) -> dict[str, str]:
+        rows = self.db.query(
+            "SELECT id, digest FROM vectors WHERE kind = 'knowledge' AND digest IS NOT NULL"
+        )
+        return dict(rows)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         rows = self.db.query("SELECT vec FROM vectors WHERE kind = ? AND id = ?", (kind, id))

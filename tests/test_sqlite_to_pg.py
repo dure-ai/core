@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
@@ -75,7 +76,7 @@ def ev(i, text):
 
 
 def runtime(db, embedder):
-    index = Index(db.vectors, embedder, 0.9)
+    index = Index(db.vectors, embedder, 0.9, transaction=db.transaction)
     return Runtime(CountEngine(), db.events, db.knowledge, db.state("count"), db.transaction, index=index)
 
 
@@ -127,7 +128,8 @@ def test_moves_everything_and_the_first_sync_embeds_nothing(tmp_path, pg_schema)
         s, p = src.state("count"), pg.state("count")
         assert dict(p.scan()) == dict(s.scan())
         assert p.cursor() == s.cursor() == 5
-        assert p.version() == s.version() == "count-1"
+        assert p.version() == s.version()  # copied as is
+        assert json.loads(p.version())[0] == "count-1"  # with the SQLite index it was built on
         digest = text_digest(TEXTS[0])
         model = HashEmbedder().model
         raw = src.query("SELECT vec FROM embed_cache WHERE model = ? AND digest = ?", (model, digest))[0][0]

@@ -60,11 +60,26 @@ class EngineStateBackend(Protocol):
         """Position of the last event delivered to the engine (0 = none)."""
         ...
 
+    def epoch(self) -> int:
+        """Counts every commit and every reset of this engine (0 = neither yet).
+        Read it before reading what a commit is based on, and pass it to commit()."""
+        ...
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
         """Apply writes and deletes and move the cursor to `cursor`, all or
-        nothing. Raises CursorConflict if the cursor is no longer `expected`."""
+        nothing, and move the epoch on to `epoch` + 1. Raises CursorConflict,
+        writing nothing, if the cursor is no longer `expected` or the epoch is
+        no longer `epoch`: the cursor alone cannot tell two commits from the
+        same cursor apart (a tick keeps it) or a commit from before a reset
+        (which puts it back to 0)."""
         ...
 
     def version(self) -> str | None:
@@ -72,7 +87,8 @@ class EngineStateBackend(Protocol):
         ...
 
     def reset(self, version: str) -> None:
-        """Drop every key, move the cursor back to 0 and record `version`."""
+        """Drop every key, move the cursor back to 0, record `version` and
+        add 1 to the epoch."""
         ...
 
 
@@ -95,23 +111,44 @@ class VectorBackend(Protocol):
 
     # Index state
     def meta(self) -> dict | None:
-        """{"model": str, "group_threshold": float}, None until reset() is called."""
+        """{"model": str, "group_threshold": float, "store": str} as the Index
+        passed it to reset(), None until reset() is called."""
         ...
 
     def reset(self, meta: dict) -> None:
-        """Drop every vector and group, move the cursor to 0 and record meta.
-        The embedding cache stays."""
+        """Drop every vector (and the knowledge digests) and group, move the cursor
+        to 0, record meta and add 1 to generation(), all in one step. The embedding
+        cache stays."""
+        ...
+
+    def generation(self) -> int:
+        """Which index this is: 0 until the first reset(), then one more for each
+        reset(). Not part of meta(). Durable stores keep it across reopening."""
         ...
 
     def indexed(self) -> int:
         """Position of the last event indexed (0 = none)."""
         ...
 
-    def set_indexed(self, seq: int) -> None: ...
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
+        """Move the position from `expected` to seq, atomically. Raises
+        CursorConflict, writing nothing, if indexed() is not `expected` or
+        generation() is not `generation`. Raised inside a caller's transaction
+        on a durable store, the conflict rolls back that whole transaction."""
+        ...
 
     # Vectors (kind: "event" | "knowledge")
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
-        """Store or replace. Replacing keeps the id's original position."""
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
+        """Store or replace. Replacing keeps the id's original position. For
+        "knowledge", digest (of the text the vector was made from) is stored with
+        it, and replacing replaces it (None leaves the id without one); for
+        "event" it is ignored."""
+        ...
+
+    def knowledge_digests(self) -> dict[str, str]:
+        """id -> digest of the knowledge vectors that have one."""
         ...
 
     def vector(self, kind: str, id: str) -> list[float] | None: ...
@@ -123,7 +160,7 @@ class VectorBackend(Protocol):
         ...
 
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
-        """Remove vectors only (not groups); unknown ids are ignored."""
+        """Remove vectors (and knowledge digests) only, not groups; unknown ids are ignored."""
         ...
 
     # Groups

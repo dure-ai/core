@@ -4,10 +4,12 @@ and read back through a SimilarityReader that respects visibility."""
 from datetime import UTC, datetime
 
 import pytest
+from spy import SpyBackend, SpyEmbedder, TxnSpy
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
 from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, float32, text_digest
-from cortex_mem.index import Index, PassageNotCached
+from cortex_mem.index import EMBED_BATCH, Index, IndexConfigChanged
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -72,9 +74,19 @@ def build(events, embedder=None, threshold=0.9, db=None):
     db = db or InMemoryDatabase()
     for e in events:
         db.events.append(e)
-    index = Index(db.vectors, embedder or HashEmbedder(), threshold)
-    index.catch_up(db.events, len(events))
+    index = Index(db.vectors, embedder or HashEmbedder(), threshold, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    index.advance(db.events, len(events))
     return db, index
+
+
+def put_knowledge(db, index, *items):
+    """Put items in the knowledge base and let the index follow them (built
+    first if it never was: sync_knowledge writes nothing into a stale index)."""
+    index.ensure_current(db.knowledge)
+    for k in items:
+        db.knowledge.put(k)
+    index.sync_knowledge(db.knowledge, [k.id for k in items])
 
 
 def reader(db, index):
@@ -176,51 +188,12 @@ def test_events_that_are_not_embedded_get_no_vector_or_group():
     assert len(emb.calls) == 1
 
 
-def test_catch_up_stops_at_upto_and_resumes():
-    db = InMemoryDatabase()
-    for i in range(1, 6):
-        db.events.append(ev(f"e{i}", text=f"fact number {i}"))
-    emb = CountingEmbedder()
-    index = Index(db.vectors, emb, 0.9)
-    index.catch_up(db.events, 2)
-    assert db.vectors.indexed() == 2
-    assert [t for t, _ in emb.calls] == ["fact number 1", "fact number 2"]
-    index.catch_up(db.events, 4)
-    assert db.vectors.indexed() == 4
-    assert [t for t, _ in emb.calls[2:]] == ["fact number 3", "fact number 4"]
-    assert all(kind == "passage" for _, kind in emb.calls)
-    assert db.vectors.vector("event", "e5") is None
-    index.catch_up(db.events, 4)  # nothing new up to 4
-    assert len(emb.calls) == 4
-
-
 def test_cache_avoids_a_second_embedding_of_the_same_text():
     emb = CountingEmbedder()
     db, _ = build([ev("e1", "same words"), ev("e2", "same words", user="u2")], emb)
     assert emb.calls == [("same words", "passage")]
     assert db.vectors.vector("event", "e2") == db.vectors.vector("event", "e1")
     assert db.vectors.cached(emb.model, text_digest("same words")) == db.vectors.vector("event", "e1")
-
-
-def test_failure_leaves_nothing_for_that_event():
-    db = InMemoryDatabase()
-    for e in [ev("e1", "fine"), ev("e2", "boom"), ev("e3", "also fine")]:
-        db.events.append(e)
-    emb = FailingEmbedder({"boom"})
-    index = Index(db.vectors, emb, 0.9)
-    with pytest.raises(EmbeddingError):
-        index.catch_up(db.events, 3)
-    assert db.vectors.indexed() == 1
-    assert db.vectors.vector("event", "e2") is None
-    assert db.vectors.group_of("e2") is None
-    assert db.vectors.cached(emb.model, text_digest("boom")) is None
-    assert db.vectors.vector("event", "e3") is None
-    assert [id for id, _ in db.vectors.vectors("event")] == ["e1"]
-    # The next try picks up where it stopped once the backend recovers.
-    emb.fail_on.clear()
-    index.catch_up(db.events, 3)
-    assert db.vectors.indexed() == 3
-    assert [id for id, _ in db.vectors.vectors("event")] == ["e1", "e2", "e3"]
 
 
 def test_index_gives_the_same_groups_on_sqlite():
@@ -240,62 +213,51 @@ def test_index_gives_the_same_groups_on_sqlite():
 # ── knowledge and index version ─────────────────────────────────────────────
 
 
-def test_knowledge_vectors_follow_put_and_remove():
+def test_knowledge_vectors_follow_the_knowledge_base():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9)
     emb = HashEmbedder()
-    index.put_knowledge(item("k1", title="deploy", body="uses tags"))
+    put_knowledge(db, index, item("k1", title="deploy", body="uses tags"))
     assert db.vectors.vector("knowledge", "k1") == float32(emb.embed(["deploy\nuses tags"], "passage")[0])
-    index.put_knowledge(item("k1", title="deploy", body="uses branches"))
+    assert db.vectors.knowledge_digests() == {"k1": text_digest("deploy\nuses tags")}
+    put_knowledge(db, index, item("k1", title="deploy", body="uses branches"))
     assert db.vectors.vector("knowledge", "k1") == float32(emb.embed(["deploy\nuses branches"], "passage")[0])
-    index.remove_knowledge("k1")
+    db.knowledge.remove("k1")
+    index.sync_knowledge(db.knowledge, ["k1", "never-there"])
     assert db.vectors.vector("knowledge", "k1") is None
-    index.remove_knowledge("never-there")
     assert list(db.vectors.vectors("knowledge")) == []
 
 
-def test_prepare_knowledge_embeds_and_caches_without_writing_a_vector():
-    db = InMemoryDatabase()
-    emb = FailingEmbedder({"deploy\nboom"})
-    index = Index(db.vectors, emb, 0.9)
-    with pytest.raises(EmbeddingError):
-        index.prepare_knowledge(item("k0", body="boom"))
-    assert db.vectors.cached(emb.model, text_digest("deploy\nboom")) is None
-
-    index.prepare_knowledge(item("k1", body="uses tags"))
-    assert db.vectors.vector("knowledge", "k1") is None
-    assert db.vectors.cached(emb.model, text_digest("deploy\nuses tags")) is not None
-    calls = len(emb.calls)
-    index.put_knowledge(item("k1", body="uses tags"))  # served from the cache
-    assert len(emb.calls) == calls
-    assert db.vectors.vector("knowledge", "k1") == db.vectors.cached(emb.model, text_digest("deploy\nuses tags"))
-
-
-def test_rebuild_resets_and_reembeds_knowledge():
+def test_ensure_current_resets_and_reembeds_knowledge():
     emb = CountingEmbedder()
-    db, index = build([ev("e1"), ev("e2", "other words")], emb)
-    for k in [item("k1"), item("k2", scope="personal", owner="u9", body="private note")]:
-        db.knowledge.put(k)
-        index.put_knowledge(k)
+    db, index = build([ev("e1"), ev("e2", "other words")], emb)  # built and advanced
+    put_knowledge(db, index, item("k1"), item("k2", scope="personal", owner="u9", body="private note"))
     db.vectors.put_vector("knowledge", "gone", [1.0, 0.0])  # not in the knowledge base
+    generation = db.vectors.generation()
     calls = len(emb.calls)
-    index.rebuild(db.knowledge)
-    assert db.vectors.meta() == index.want() == {"model": emb.model, "group_threshold": 0.9, "store": "memory"}
+    assert index.ensure_current(db.knowledge) is False  # current: nothing to do
+    assert db.vectors.indexed() == 2
+
+    other = Index(db.vectors, emb, 0.8)
+    assert other.ensure_current(db.knowledge) is True
+    assert db.vectors.meta() == other.want() == {"model": emb.model, "group_threshold": 0.8, "store": "memory"}
+    assert db.vectors.generation() == generation + 1
     assert list(db.vectors.vectors("event")) == []
     assert db.vectors.group_of("e1") is None
     assert db.vectors.indexed() == 0
     assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1", "k2"]
+    assert set(db.vectors.knowledge_digests()) == {"k1", "k2"}
     assert len(emb.calls) == calls  # same model: every passage comes from the cache
-    index.catch_up(db.events, 2)
+    other.advance(db.events, 2)
     assert len(emb.calls) == calls
-    assert reader(db, index).group("e1").id == "e1"
+    assert reader(db, other).group("e1").id == "e1"
 
 
 def test_stale_when_model_or_threshold_changes():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9)
     assert index.stale()  # never built
-    index.rebuild(db.knowledge)
+    assert index.ensure_current(db.knowledge) is True
     assert not index.stale()
     assert Index(db.vectors, HashEmbedder(), 0.9).stale() is False
     assert Index(db.vectors, HashEmbedder(), 0.8).stale()
@@ -398,9 +360,7 @@ def test_knowledge_respects_visibility():
         item("d-other-team", scope="team", owner="t2"),
         item("e-org", scope="org", owner="*"),
     ]
-    for k in items:
-        db.knowledge.put(k)
-        index.put_knowledge(k)
+    put_knowledge(db, index, *items)
     r = reader(db, index)
     me = caller("u1", "t1")
     q = "deploy\ndeploy uses tags"
@@ -414,18 +374,14 @@ def test_knowledge_respects_visibility():
 def test_knowledge_drops_unrelated_items():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9)
-    for k in [item("k1", title="deploy", body="uses tags"), item("k2", title="payments", body="vendor v2")]:
-        db.knowledge.put(k)
-        index.put_knowledge(k)
+    put_knowledge(db, index, item("k1", title="deploy", body="uses tags"), item("k2", title="payments", body="vendor v2"))
     assert ids(reader(db, index).knowledge("vendor v2 payments", caller(), "team")) == ["k2"]
 
 
 def test_query_is_not_stored():
     emb = CountingEmbedder()
     db, index = build([ev("e1")], emb)
-    k = item("k1")
-    db.knowledge.put(k)
-    index.put_knowledge(k)
+    put_knowledge(db, index, item("k1"))
     r = reader(db, index)
     before_vectors = {kind: list(db.vectors.vectors(kind)) for kind in ["event", "knowledge"]}
     r.search("secret plan", caller(), "org")
@@ -455,8 +411,7 @@ def test_query_lru_is_bounded():
 def test_empty_query_returns_nothing():
     emb = CountingEmbedder()
     db, index = build([ev("e1")], emb)
-    db.knowledge.put(item("k1"))
-    index.put_knowledge(item("k1"))
+    put_knowledge(db, index, item("k1"))
     calls = len(emb.calls)
     r = reader(db, index)
     for q in ["", "   ", "\n"]:
@@ -511,13 +466,15 @@ def test_wrong_vector_count_raises_embedding_error(out):
     db = InMemoryDatabase()
     db.events.append(ev("e1"))
     index = Index(db.vectors, CountMismatchEmbedder(out), 0.9)
+    index.ensure_current(db.knowledge)
     with pytest.raises(EmbeddingError):
-        index.catch_up(db.events, 1)
+        index.advance(db.events, 1)
     assert db.vectors.indexed() == 0
     assert db.vectors.vector("event", "e1") is None
     assert db.vectors.cached("broken", text_digest("deploy uses tags")) is None
+    db.knowledge.put(item("k1"))
     with pytest.raises(EmbeddingError):
-        index.put_knowledge(item("k1"))
+        index.sync_knowledge(db.knowledge, ["k1"])
     assert db.vectors.vector("knowledge", "k1") is None
     r = reader(db, index)
     with pytest.raises(EmbeddingError):
@@ -552,90 +509,12 @@ def test_query_lru_keeps_recently_used_queries():
 
 def test_negative_k_returns_nothing():
     db, index = visibility_world()
-    k = item("k1")
-    db.knowledge.put(k)
-    index.put_knowledge(k)
+    put_knowledge(db, index, item("k1"))
     r = reader(db, index)
     me = caller()
     assert r.search("deploy uses tags", me, "org", k=-1) == []
     assert r.neighbors("mine", me, "org", k=-1) == []
     assert r.knowledge("deploy\ndeploy uses tags", me, "org", k=-1) == []
-
-
-# ── warming the cache outside the write lock ────────────────────────────────
-
-
-class BatchCountingEmbedder(CountingEmbedder):
-    """Also remembers each embed call's batch."""
-
-    def __init__(self):
-        super().__init__()
-        self.batches = []
-
-    def embed(self, texts, kind):
-        self.batches.append(list(texts))
-        return super().embed(texts, kind)
-
-
-def test_failed_rebuild_leaves_the_index_as_it_was():
-    db, _ = build([ev("e1"), ev("e2", "other words")], threshold=0.9)
-    db.knowledge.put(item("k1", body="never embedded"))
-    before = (db.vectors.meta(), list(db.vectors.vectors("event")), db.vectors.indexed())
-    fresh = Index(db.vectors, FailingEmbedder({"deploy\nnever embedded"}), 0.5)
-
-    with pytest.raises(EmbeddingError):
-        fresh.rebuild(db.knowledge)
-
-    assert fresh.stale()  # the next sync tries again
-    assert (db.vectors.meta(), list(db.vectors.vectors("event")), db.vectors.indexed()) == before
-
-
-def test_warm_embeds_missing_passages_in_batches_and_writes_only_the_cache():
-    db = InMemoryDatabase()
-    emb = BatchCountingEmbedder()
-    index = Index(db.vectors, emb, 0.9)
-    index.warm(["already cached"])
-    emb.batches.clear()
-    texts = [f"text {i}" for i in range(130)] + ["text 0", "already cached"]
-
-    index.warm(texts)
-
-    assert [len(b) for b in emb.batches] == [64, 64, 2]  # missing, distinct, in order
-    assert emb.batches[0][0] == "text 0"
-    assert all(db.vectors.cached(emb.model, text_digest(t)) is not None for t in texts)
-    assert (db.vectors.meta(), db.vectors.indexed(), list(db.vectors.vectors("event"))) == (None, 0, [])
-    index.warm(texts)
-    assert len(emb.batches) == 3  # everything was cached
-
-
-def test_catch_up_without_embedding_stops_at_a_cache_miss():
-    db = InMemoryDatabase()
-    for e in [ev("e1", "first"), ev("e2", "second")]:
-        db.events.append(e)
-    emb = CountingEmbedder()
-    index = Index(db.vectors, emb, 0.9)
-    index.warm(["first"])
-    with pytest.raises(PassageNotCached) as miss:
-        index.catch_up(db.events, 2, embed=False)
-    assert miss.value.text == "second"
-    assert db.vectors.indexed() == 1 and db.vectors.vector("event", "e2") is None
-    assert [t for t, _ in emb.calls] == ["first"]
-
-    index.warm(index.pending_passages(db.events))
-    index.catch_up(db.events, 2, embed=False)
-    assert db.vectors.indexed() == 2
-    assert [t for t, _ in emb.calls] == ["first", "second"]
-
-
-def test_pending_passages_are_the_unindexed_embeddable_texts():
-    db = InMemoryDatabase()
-    for e in [ev("e1", "one"), ev("o1", kind="outcome", refs=("e1",)), ev("e2", "two"), ev("x1", text_redacted=True),
-              ev("e3", "two"), ev("e4", "four")]:
-        db.events.append(e)
-    index = Index(db.vectors, HashEmbedder(), 0.9)
-    index.catch_up(db.events, 1)
-    assert index.pending_passages(db.events) == ["two", "four"]
-    assert index.pending_passages(db.events, upto=3) == ["two"]
 
 
 # ── a reader bounded to what the engine has seen ────────────────────────────
@@ -666,9 +545,7 @@ def test_a_bounded_reader_sees_no_event_after_its_position():
 
 def test_a_bounded_reader_still_searches_all_current_knowledge():
     db, index = build([ev("e1")])
-    k = item("k1")
-    db.knowledge.put(k)
-    index.put_knowledge(k)
+    put_knowledge(db, index, item("k1"))
     assert ids(index.reader(db.events, db.knowledge, upto=0).knowledge("deploy\ndeploy uses tags", caller(), "team")) == [
         "k1"
     ]
@@ -680,7 +557,7 @@ def test_a_bounded_reader_still_searches_all_current_knowledge():
 @pytest.mark.parametrize("make", [InMemoryDatabase, SqliteDatabase], ids=["memory", "sqlite"])
 def test_the_index_version_names_the_store(make):
     db = make()
-    index = Index(db.vectors, HashEmbedder(), 0.9)
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
     assert index.want() == {"model": "hash-256", "group_threshold": 0.9, "store": db.vectors.kind}
     assert index.want()["store"] == ("memory" if make is InMemoryDatabase else "sqlite")
 
@@ -704,10 +581,9 @@ def test_the_index_asks_the_store_for_similarity_instead_of_scanning():
     for e in events:
         db.events.append(e)
     index = Index(NoScanBackend(db.vectors), HashEmbedder(), 0.9)
-    index.catch_up(db.events, len(events))
-    k = item("k1")
-    db.knowledge.put(k)
-    index.put_knowledge(k)
+    index.ensure_current(db.knowledge)
+    index.advance(db.events, len(events))
+    put_knowledge(db, index, item("k1"))
     r = reader(db, index)
 
     assert r.group("e2") == Group("e1", "personal", "u1", ("e1", "e2"))
@@ -721,8 +597,397 @@ def test_a_non_finite_embedding_fails_loudly_and_writes_nothing(make):
     db = make()
     db.events.append(ev("e1", "a"))
     emb = TableEmbedder({"a": [float("nan"), 1.0, 0.0]})
-    index = Index(db.vectors, emb, 0.9)
+    index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
     with pytest.raises(ValueError, match="finite"):
-        index.catch_up(db.events, 1)
+        index.advance(db.events, 1)
     assert (list(db.vectors.vectors("event")), db.vectors.group_of("e1"), db.vectors.indexed()) == ([], None, 0)
     assert db.vectors.cached("table", text_digest("a")) is None
+
+
+# ── indexing outside the write transaction (advance, sync_knowledge) ────────
+
+
+@pytest.fixture(params=["memory", "sqlite", "pg"])
+def opened(request, tmp_path):
+    """opened(): a connection to this test's one store. Memory gives the same
+    object each time; SQLite and PostgreSQL open a new connection to the same
+    file or schema, as a second process would."""
+    kind = request.param
+    url = request.getfixturevalue("pg_schema") if kind == "pg" else None
+    made = []
+
+    def open_db():
+        if kind == "memory":
+            db = made[0] if made else InMemoryDatabase()
+        elif kind == "sqlite":
+            db = SqliteDatabase(tmp_path / "core.db")
+        else:
+            from cortex_mem.store.postgres import PostgresDatabase
+
+            db = PostgresDatabase(url)
+        made.append(db)
+        return db
+
+    yield open_db
+    for db in made:
+        if kind == "sqlite":
+            db.con.close()
+        elif kind == "pg":
+            db.close()
+
+
+def spied(db, embedder=None, threshold=0.9, watch=("nearest_member", "group_of"), built=True):
+    """An Index whose transactions, embedder and backend calls are watched."""
+    spy = TxnSpy(db)
+    emb = embedder or SpyEmbedder(spy)
+    emb.spy = spy
+    backend = SpyBackend(db.vectors, spy, watch)
+    index = Index(backend, emb, threshold, transaction=spy.transaction)
+    if built and index.stale():
+        db.vectors.reset(index.want())  # an empty index of this config, without embedding anything
+    return index, emb, backend, spy
+
+
+def appended(db, *events):
+    for e in events:
+        db.events.append(e)
+    return db
+
+
+def test_advance_embeds_outside_any_transaction(opened):
+    db = appended(opened(), ev("e1", "one"), ev("e2", "two"), ev("o1", kind="outcome", refs=("e1",)), ev("e3", "one"))
+    index, emb, _, _ = spied(db)
+
+    index.advance(db.events, 4)
+
+    assert emb.texts == ["one", "two"]
+    assert emb.inside == []
+    assert db.vectors.indexed() == 4
+    assert reader(db, index).group("e3").members == ("e1", "e3")
+
+
+def test_advance_indexes_up_to_upto_and_resumes(opened):
+    db = appended(opened(), *[ev(f"e{i}", text=f"fact number {i}") for i in range(1, 6)])
+    index, emb, backend, _ = spied(db)
+
+    index.advance(db.events, 2)
+    assert db.vectors.indexed() == 2
+    assert emb.texts == ["fact number 1", "fact number 2"]
+    index.advance(db.events, 4)
+    assert db.vectors.indexed() == 4
+    assert emb.texts[2:] == ["fact number 3", "fact number 4"]
+    assert all(kind == "passage" for _, kind, _ in emb.calls)
+    assert db.vectors.vector("event", "e5") is None
+    assert [e for e in backend.log if e[0] == "put_group"] == [("put_group", f"e{i}") for i in range(1, 5)]
+
+
+def test_advance_with_upto_at_or_below_indexed_does_nothing(opened):
+    db = appended(opened(), ev("e1", "one"), ev("e2", "two"), ev("e3", "three"))
+    index, emb, backend, _ = spied(db)
+    index.advance(db.events, 3)
+    calls, log = len(emb.calls), len(backend.log)
+
+    index.advance(db.events, 3)
+    index.advance(db.events, 2)
+    index.advance(db.events, 0)
+
+    assert (len(emb.calls), len(backend.log), db.vectors.indexed()) == (calls, log, 3)
+
+
+def test_advance_failure_leaves_nothing_for_that_event(opened):
+    db = appended(opened(), ev("e1", "fine"), ev("e2", "boom"), ev("e3", "also fine"))
+    index, emb, backend, _ = spied(db)
+    emb.fail_on.add("boom")
+
+    with pytest.raises(EmbeddingError):
+        index.advance(db.events, 3)
+
+    # The batch failed, so its texts were tried one at a time: the event
+    # before the failing text is indexed, the failing one and after are not.
+    assert emb.batches == [["fine", "boom", "also fine"], ["fine"], ["boom"]]
+    assert db.vectors.indexed() == 1
+    assert [id for id, _ in db.vectors.vectors("event")] == ["e1"]
+    for id in ("e2", "e3"):
+        assert db.vectors.vector("event", id) is None
+        assert db.vectors.group_of(id) is None
+    assert db.vectors.cached(emb.model, text_digest("boom")) is None
+    assert [e[-1] for e in backend.log] == ["e1", "e1"]
+    assert emb.inside == []
+    # The next try picks up where it stopped once the backend recovers.
+    emb.fail_on.clear()
+    index.advance(db.events, 3)
+    assert db.vectors.indexed() == 3
+    assert [id for id, _ in db.vectors.vectors("event")] == ["e1", "e2", "e3"]
+
+
+def test_advance_failure_on_the_first_text_indexes_nothing(opened):
+    db = appended(opened(), ev("o1", kind="outcome", refs=("x",)), ev("e2", "boom"), ev("e3", "fine"))
+    index, emb, backend, _ = spied(db)
+    emb.fail_on.add("boom")
+
+    with pytest.raises(EmbeddingError):
+        index.advance(db.events, 3)
+
+    assert db.vectors.indexed() == 1  # the outcome before it needs no embedding
+    assert backend.log == []
+
+
+def test_advance_batches_embedder_calls(opened):
+    texts = [f"text {i}" for i in range(130)]
+    db = appended(
+        opened(),
+        *[ev(f"e{i}", t) for i, t in enumerate(texts)],
+        ev("again", "text 0"),  # cached by the first batch
+        ev("o1", kind="outcome", refs=("e0",)),
+    )
+    index, emb, _, _ = spied(db)
+
+    index.advance(db.events, 132)
+
+    assert [len(b) for b in emb.batches] == [EMBED_BATCH, EMBED_BATCH, 2]  # missing, distinct, in order
+    assert emb.batches[0][0] == "text 0"
+    assert emb.inside == []
+    assert db.vectors.indexed() == 132
+    assert reader(db, index).group("again").members == ("e0", "again")
+
+
+def test_two_indexers_one_wins(opened):
+    """The first indexer embeds; meanwhile a second one (another process)
+    indexes part of the same stretch. The first then finds the position moved
+    when it writes, reads it again and finishes from there: each event is
+    written once."""
+    db_a, db_b = opened(), opened()
+    appended(db_a, ev("e1", "one"), ev("e2", "two"), ev("o1", kind="outcome", refs=("e1",)), ev("e4", "one"))
+    log = []
+    second, _, b_backend, _ = spied(db_b)
+
+    def meanwhile(texts, kind):
+        if not log:
+            log.append("b ran")
+            second.advance(db_b.events, 2)
+
+    first, emb_a, a_backend, _ = spied(db_a, SpyEmbedder(None, during=meanwhile))
+
+    first.advance(db_a.events, 4)
+
+    assert log == ["b ran"]
+    assert db_a.vectors.indexed() == 4
+    writes = [e for e in b_backend.log + a_backend.log if e[0] in ("put_vector", "put_group")]
+    assert sorted(writes) == sorted(
+        [("put_vector", "event", id) for id in ("e1", "e2", "e4")] + [("put_group", id) for id in ("e1", "e2", "e4")]
+    )
+    assert [e[-1] for e in b_backend.log] == ["e1", "e1", "e2", "e2"]  # b indexed 1..2
+    assert [e[-1] for e in a_backend.log] == ["e4", "e4"]  # a went on from 2, from its cache
+    assert emb_a.inside == []
+    assert reader(db_a, first).group("e4").members == ("e1", "e4")
+
+
+def test_advance_raises_a_conflict_it_cannot_explain(opened):
+    """A backend whose position never moves (it ignores the shared cursor)
+    gets the conflict raised, not an endless retry, and writes nothing."""
+    db = appended(opened(), ev("e1", "one"), ev("e2", "two"))
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    index.advance(db.events, 2)
+
+    class Stuck(SpyBackend):
+        def indexed(self):
+            return 0
+
+    spy = TxnSpy(db)
+    backend = Stuck(db.vectors, spy)
+    with pytest.raises(CursorConflict):
+        Index(backend, HashEmbedder(), 0.9, transaction=spy.transaction).advance(db.events, 2)
+    assert backend.log == []
+
+
+def test_nearest_member_runs_outside_the_write_transaction(opened):
+    db = appended(opened(), ev("e1"), ev("e2"), ev("e3", "other words"), ev("e4"))
+    index, _, backend, _ = spied(db)
+
+    index.advance(db.events, 4)
+
+    assert [name for name, _ in backend.calls].count("nearest_member") == 4
+    assert backend.calls and not any(inside for _, inside in backend.calls)
+    assert reader(db, index).group("e4").members == ("e1", "e2", "e4")
+
+
+def test_sync_knowledge_touched_only(opened):
+    db = opened()
+    for k in [item("k1", body="first"), item("k2", body="second"), item("k3", body="third")]:
+        db.knowledge.put(k)
+    index, emb, _, _ = spied(db)
+
+    index.sync_knowledge(db.knowledge, {"k2"})
+
+    assert emb.texts == ["deploy\nsecond"]
+    assert emb.inside == []
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k2"]
+    assert db.vectors.knowledge_digests() == {"k2": text_digest("deploy\nsecond")}
+    index.sync_knowledge(db.knowledge, {"k2"})  # unchanged: nothing to embed or write
+    assert len(emb.calls) == 1
+
+    index.sync_knowledge(db.knowledge)  # full: the others too
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1", "k2", "k3"]
+    assert sorted(emb.texts) == ["deploy\nfirst", "deploy\nsecond", "deploy\nthird"]
+    assert emb.inside == []
+
+
+def test_sync_knowledge_removes_vectors_of_demoted_ids(opened):
+    db = opened()
+    for k in [item("k1"), item("k2", body="kept")]:
+        db.knowledge.put(k)
+    index, _, _, _ = spied(db)
+    index.sync_knowledge(db.knowledge)
+    db.knowledge.remove("k1")
+
+    index.sync_knowledge(db.knowledge, {"k1"})
+
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k2"]
+    # A full comparison removes the vector of an id the knowledge base lost
+    # meanwhile, and an old vector stored without a digest.
+    db.knowledge.remove("k2")
+    db.vectors.put_vector("knowledge", "old", db.vectors.vector("knowledge", "k2"))
+    index.sync_knowledge(db.knowledge)
+    assert list(db.vectors.vectors("knowledge")) == []
+    assert db.vectors.knowledge_digests() == {}
+
+
+def test_sync_knowledge_skips_a_write_when_the_item_changed_meanwhile(opened):
+    db = opened()
+    db.knowledge.put(item("k1", body="old words"))
+    other = opened()
+
+    def meanwhile(texts, kind):
+        if "deploy\nold words" in texts:
+            other.knowledge.put(item("k1", body="new words"))  # another process replaces the item
+
+    index, emb, backend, _ = spied(db, SpyEmbedder(None, during=meanwhile))
+
+    index.sync_knowledge(db.knowledge, {"k1"})
+
+    assert db.vectors.vector("knowledge", "k1") is None  # the old text's vector was not written
+    assert backend.log == []
+    index.sync_knowledge(db.knowledge, {"k1"})  # what the other writer's sync does
+    assert db.vectors.knowledge_digests() == {"k1": text_digest("deploy\nnew words")}
+    assert db.vectors.vector("knowledge", "k1") == db.vectors.cached(emb.model, text_digest("deploy\nnew words"))
+
+
+def test_ensure_current_embeds_outside_the_transaction(opened):
+    db = opened()
+    db.knowledge.put(item("k1", body="first"))
+    db.knowledge.put(item("k2", body="second"))
+    index, emb, _, _ = spied(db, built=False)
+
+    assert index.ensure_current(db.knowledge) is True
+
+    assert sorted(emb.texts) == ["deploy\nfirst", "deploy\nsecond"]
+    assert emb.inside == []
+    assert not index.stale()
+    assert db.vectors.generation() == 1
+    assert set(db.vectors.knowledge_digests()) == {"k1", "k2"}
+    assert index.ensure_current(db.knowledge) is False
+    assert db.vectors.generation() == 1
+
+
+def test_ensure_current_failure_changes_nothing(opened):
+    db = appended(opened(), ev("e1"), ev("e2", "other words"))
+    old = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    old.ensure_current(db.knowledge)
+    old.advance(db.events, 2)
+    db.knowledge.put(item("k1", body="never embedded"))
+
+    def state():
+        v = db.vectors
+        return v.meta(), v.generation(), v.indexed(), list(v.vectors("event")), list(v.vectors("knowledge"))
+
+    before = state()
+    spy = TxnSpy(db)
+    fresh = Index(db.vectors, SpyEmbedder(spy, fail_on={"deploy\nnever embedded"}), 0.5, transaction=spy.transaction)
+
+    with pytest.raises(EmbeddingError):
+        fresh.ensure_current(db.knowledge)
+
+    assert fresh.stale()  # the next sync tries again
+    assert state() == before
+
+
+# ── fix round 1: another config's generation, outage calls ─────────────────
+
+
+def test_advance_refuses_to_write_into_an_index_of_another_config(opened):
+    """Another process with another model rebuilds the index while this one
+    embeds: this one must not write its vectors into that generation."""
+    db_a, db_b = opened(), opened()
+    appended(db_a, ev("e1", "one"), ev("e2", "two"))
+    other = Index(db_b.vectors, HashEmbedder(dim=128), 0.9, transaction=db_b.transaction)
+
+    def meanwhile(texts, kind):
+        other.ensure_current(db_b.knowledge)
+
+    first, emb, backend, _ = spied(db_a, SpyEmbedder(None, during=meanwhile))
+
+    with pytest.raises(IndexConfigChanged):
+        first.advance(db_a.events, 2)
+
+    assert emb.calls  # it did embed, then found the other config
+    assert db_a.vectors.meta() == other.want()
+    assert list(db_a.vectors.vectors("event")) == [] and db_a.vectors.indexed() == 0
+    assert backend.log == []
+    other.advance(db_b.events, 2)
+    assert {len(v) for _, v in db_a.vectors.vectors("event")} == {128}
+
+
+def test_advance_refuses_an_index_never_built_for_it(opened):
+    db = appended(opened(), ev("e1"))
+    with pytest.raises(IndexConfigChanged):
+        Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction).advance(db.events, 1)
+    assert db.vectors.indexed() == 0
+
+
+def test_a_failing_batch_of_one_text_is_not_tried_again(opened):
+    db = appended(opened(), ev("e1", "fine"), ev("e2", "boom"))
+    index, emb, _, _ = spied(db)
+    index.advance(db.events, 1)
+    emb.fail_on.add("boom")
+
+    with pytest.raises(EmbeddingError):
+        index.advance(db.events, 2)
+
+    assert emb.batches[1:] == [["boom"]]  # one call: it is the culprit already
+
+
+def test_advance_does_not_raise_when_every_text_succeeds_on_its_own(opened):
+    db = appended(opened(), ev("e1", "one"), ev("e2", "two"), ev("e3", "three"))
+    failed = []
+
+    def flaky(texts, kind):
+        if not failed:
+            failed.append(texts)
+            raise EmbeddingError("a hiccup")
+
+    index, _, _, _ = spied(db, SpyEmbedder(None, during=flaky))
+
+    index.advance(db.events, 3)  # the batch failed once, every text then succeeded
+
+    assert failed == [["one", "two", "three"]]
+    assert db.vectors.indexed() == 3
+
+
+def test_advance_does_not_raise_when_another_process_indexed_past_the_failure(opened):
+    db_a, db_b = opened(), opened()
+    appended(db_a, ev("e1", "fine"), ev("e2", "boom"), ev("e3", "also fine"))
+    second, _, b_backend, _ = spied(db_b)
+
+    def meanwhile(texts, kind):
+        if texts == ["boom"]:
+            second.advance(db_b.events, 3)  # its embedder works
+
+    first, _, a_backend, _ = spied(db_a, SpyEmbedder(None, fail_on={"boom"}, during=meanwhile))
+
+    first.advance(db_a.events, 3)
+
+    assert db_a.vectors.indexed() == 3
+    assert a_backend.log == []  # the other process indexed every event, once
+    assert [e[-1] for e in b_backend.log] == ["e1", "e1", "e2", "e2", "e3", "e3"]

@@ -213,7 +213,7 @@ def test_skip_lost_to_another_process_is_not_reported():
 
     def first(expected, *args, **kw):
         state.commit = real_commit
-        real_commit(expected, 1, {}, set())  # another process moves past e1 first
+        real_commit(expected, 1, {}, set(), epoch=kw["epoch"])  # another process moves past e1 first
         return real_commit(expected, *args, **kw)
 
     state.commit = first
@@ -417,8 +417,8 @@ def test_each_delivery_runs_in_its_own_transaction():
     rt.events.append(ev("e2"))
     rt.sync()
 
-    # two deliveries, then one more transaction that finds nothing to deliver
-    assert log == ["begin", "commit", "begin", "commit", "begin", "commit"]
+    # two deliveries; finding nothing more to deliver is a read without a transaction
+    assert log == ["begin", "commit", "begin", "commit"]
 
 
 def test_event_delivered_by_another_process_is_not_applied_twice():
@@ -440,22 +440,67 @@ def test_event_delivered_by_another_process_is_not_applied_twice():
     assert state.cursor() == 1 and rt.rejections == []
 
 
-def test_the_runtime_state_prefix_is_reserved_without_an_index():
+def test_runtime_looking_keys_are_ordinary_without_an_index():
     class Peeks(Scripted):
         def observe(self, event, ctx):
             self.keys = [k for k, _ in ctx.state.scan()]
             self.value = ctx.state.get("_runtime/index")
-            with pytest.raises(ValueError, match="reserved"):
-                ctx.state.put("_runtime/index", "mine")
-            with pytest.raises(ValueError, match="reserved"):
-                ctx.state.delete("_runtime/other")
+            ctx.state.put("_runtime/index", "mine")
+            ctx.state.delete("_runtime/other")
             ctx.state.put("n", 1)
             return []
 
     state = InMemoryStateBackend()
-    state.commit(0, 0, {"_runtime/index": "theirs"}, set())
+    state.commit(0, 0, {"_runtime/index": "theirs", "_runtime/other": 2}, set(), epoch=state.epoch())
     engine = Peeks()
     rt = runtime(engine, state=state)
     rt.append(ev("e1"))
-    assert engine.keys == [] and engine.value is None
-    assert rt.state.get("_runtime/index") == "theirs" and rt.state.get("n") == 1
+    assert engine.keys == ["_runtime/index", "_runtime/other"] and engine.value == "theirs"
+    assert dict(rt.state.scan()) == {"_runtime/index": "mine", "n": 1}
+
+
+def test_a_tick_with_nothing_to_commit_does_not_move_the_epoch():
+    rt = runtime(Scripted())
+    rt.append(ev("e1"))
+    epoch = rt.state.epoch()
+
+    rt.tick(T0)
+    assert rt.state.epoch() == epoch  # no decisions, no state writes: no commit
+
+    class Writes(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.put("ticked", True)
+            return []
+
+    writer = runtime(Writes(), rt.events, rt.knowledge, rt.state)
+    writer.tick(T0)
+    assert rt.state.epoch() == epoch + 1 and rt.state.get("ticked") is True
+
+
+def test_failure_counts_for_events_delivered_elsewhere_are_dropped():
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    flaky = Runtime(_FailsOn("e1"), events, kb, state, max_failures=3)
+    with pytest.raises(RuntimeError):
+        flaky.append(ev("e1"))
+    assert flaky._failures == {1: 1}
+
+    runtime(Scripted(), events, kb, state).sync()  # another process delivers e1
+    flaky.sync()
+
+    assert flaky._failures == {}
+
+
+def test_a_tick_that_only_deletes_state_commits():
+    class Forgets(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.delete("old")
+            return []
+
+    state = InMemoryStateBackend()
+    state.commit(0, 0, {"old": 1}, set(), epoch=state.epoch())
+    rt = runtime(Forgets(), state=state)
+    epoch = state.epoch()
+
+    rt.tick(T0)
+
+    assert state.get("old") is None and state.epoch() == epoch + 1

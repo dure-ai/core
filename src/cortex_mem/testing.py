@@ -11,7 +11,10 @@ DatabaseContract runs the runtime over a whole Database, so delivery
 Needs pytest; import it from tests only.
 """
 
+import threading
+import time
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,7 +22,7 @@ import pytest
 
 from .access import owner_for
 from .contract import Caller, Event, Knowledge, Promote
-from .runtime import Runtime
+from .runtime import Runtime, StateVersionChanged
 from .store.base import CursorConflict
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
@@ -207,8 +210,8 @@ class EngineStateBackendContract(_Contract):
         return self.make()
 
     def test_state_commit_applies_writes_deletes_and_cursor(self, state):
-        state.commit(0, 3, {"a": 1, "b": {"x": [1, 2]}}, set())
-        state.commit(3, 5, {"c": "z"}, {"a"})
+        state.commit(0, 3, {"a": 1, "b": {"x": [1, 2]}}, set(), epoch=state.epoch())
+        state.commit(3, 5, {"c": "z"}, {"a"}, epoch=state.epoch())
 
         assert state.cursor() == 5
         assert state.get("a") is None
@@ -216,36 +219,90 @@ class EngineStateBackendContract(_Contract):
         assert list(state.scan()) == [("b", {"x": [1, 2]}), ("c", "z")]
 
     def test_state_commit_rejects_stale_cursor(self, state):
-        state.commit(0, 1, {"a": 1}, set())
+        state.commit(0, 1, {"a": 1}, set(), epoch=state.epoch())
 
         with pytest.raises(CursorConflict):
-            state.commit(0, 2, {"a": 2}, set())
+            state.commit(0, 2, {"a": 2}, set(), epoch=state.epoch())
         assert state.get("a") == 1 and state.cursor() == 1
 
     def test_state_values_are_copied(self, state):
         value = {"n": [1]}
-        state.commit(0, 0, {"k": value}, set())
+        state.commit(0, 0, {"k": value}, set(), epoch=state.epoch())
         value["n"].append(2)
         state.get("k")["n"].append(3)
 
         assert state.get("k") == {"n": [1]}
 
     def test_state_scan_filters_by_prefix(self, state):
-        state.commit(0, 0, {"cand/a": 1, "cand/b": 2, "seen/a": 3}, set())
+        state.commit(0, 0, {"cand/a": 1, "cand/b": 2, "seen/a": 3}, set(), epoch=state.epoch())
 
         assert [k for k, _ in state.scan("cand/")] == ["cand/a", "cand/b"]
 
     def test_state_rejects_non_json_values(self, state):
         with pytest.raises(TypeError):
-            state.commit(0, 0, {"k": object()}, set())
+            state.commit(0, 0, {"k": object()}, set(), epoch=state.epoch())
 
     def test_state_reset_drops_keys_and_cursor_and_records_version(self, state):
         assert state.version() is None
-        state.commit(0, 4, {"a": 1}, set())
+        state.commit(0, 4, {"a": 1}, set(), epoch=state.epoch())
 
         state.reset("2")
 
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
+
+    def test_epoch_starts_at_zero_and_commit_bumps_it(self, state):
+        assert state.epoch() == 0
+
+        state.commit(0, 1, {"a": 1}, set(), epoch=0)
+        assert state.epoch() == 1
+        state.commit(1, 1, {}, set(), epoch=1)  # a tick: the cursor stays, the epoch moves
+        assert state.epoch() == 2
+
+    def test_reset_bumps_the_epoch(self, state):
+        state.reset("1")  # no row yet: created at epoch 1
+        assert state.epoch() == 1
+
+        state.commit(0, 1, {"a": 1}, set(), epoch=1)
+        state.reset("2")
+        assert state.epoch() == 3
+
+    def test_two_commits_with_the_same_cursor_and_epoch_only_one_wins(self, state):
+        state.commit(0, 2, {"seed": 1}, set(), epoch=state.epoch())
+        cursor, epoch = state.cursor(), state.epoch()  # both ticks read this
+
+        state.commit(cursor, cursor, {"decided": "first"}, set(), epoch=epoch)
+        with pytest.raises(CursorConflict):
+            state.commit(cursor, cursor, {"decided": "second", "extra": 1}, {"seed"}, epoch=epoch)
+
+        assert state.get("decided") == "first"
+        assert state.get("extra") is None and state.get("seed") == 1
+        assert state.cursor() == cursor and state.epoch() == epoch + 1
+
+    def test_a_commit_after_a_reset_is_refused_even_if_the_cursor_matches(self, state):
+        state.reset("1")
+        cursor, epoch = state.cursor(), state.epoch()
+        assert cursor == 0
+
+        state.reset("2")  # another handle resets the engine: the cursor is 0 again
+        assert state.cursor() == cursor
+
+        with pytest.raises(CursorConflict):
+            state.commit(0, 1, {"a": 1}, set(), epoch=epoch)
+
+        assert state.get("a") is None and state.cursor() == 0
+        assert state.version() == "2" and state.epoch() == epoch + 1
+
+    def test_a_refused_commit_writes_nothing(self, state):
+        state.reset("v")
+        state.commit(0, 3, {"keep": 1, "gone": 2}, set(), epoch=state.epoch())
+        before = (list(state.scan()), state.cursor(), state.version(), state.epoch())
+
+        with pytest.raises(CursorConflict):  # wrong cursor
+            state.commit(0, 9, {"new": 1, "keep": 5}, {"gone"}, epoch=state.epoch())
+        with pytest.raises(CursorConflict):  # wrong epoch
+            state.commit(3, 9, {"new": 1, "keep": 5}, {"gone"}, epoch=state.epoch() - 1)
+
+        assert (list(state.scan()), state.cursor(), state.version(), state.epoch()) == before
 
 
 def f32(values):
@@ -515,7 +572,7 @@ class VectorBackendContract(_Contract):
         vb.put_vector("knowledge", "k1", [1.0])
         vb.put_group("e1", "g1", "team", "t1", 1)
         vb.cache("m1", "d1", [0.5])
-        vb.set_indexed(7)
+        vb.set_indexed(0, 7, vb.generation())
 
         vb.reset({"model": "m2", "group_threshold": 0.9})
 
@@ -554,10 +611,73 @@ class VectorBackendContract(_Contract):
             list(vb.vectors("knowledge", upto=20))
 
     def test_set_indexed_moves_the_cursor(self, vb):
-        vb.set_indexed(5)
+        g = vb.generation()
+        vb.set_indexed(0, 5, g)
         assert vb.indexed() == 5
-        vb.set_indexed(9)
+        vb.set_indexed(5, 9, g)
         assert vb.indexed() == 9
+
+    def test_generation_starts_at_zero_and_reset_bumps_it(self, vb):
+        assert vb.generation() == 0
+        meta = {"model": "m1", "group_threshold": 0.8}
+        vb.reset(meta)
+        assert vb.generation() == 1
+        assert vb.meta() == meta  # the generation is not part of meta
+        vb.reset({"model": "m2", "group_threshold": 0.9})
+        assert vb.generation() == 2
+
+    def test_set_indexed_checks_position_and_generation(self, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        g = vb.generation()
+        vb.set_indexed(0, 3, g)
+        assert vb.indexed() == 3
+
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(2, 4, g)  # the position is 3, not 2
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(3, 4, g + 1)  # another generation
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(3, 4, g - 1)
+        assert vb.indexed() == 3
+        assert vb.generation() == g
+
+        vb.set_indexed(3, 4, g)
+        assert vb.indexed() == 4
+        vb.reset({"model": "m1", "group_threshold": 0.8})  # a reset moves the generation on
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(0, 1, g)
+        assert vb.indexed() == 0
+        vb.set_indexed(0, 1, vb.generation())
+        assert vb.indexed() == 1
+
+    def test_knowledge_vectors_keep_their_digest(self, vb):
+        assert vb.knowledge_digests() == {}
+        vb.put_vector("knowledge", "k1", [1.0, 0.0], digest="d1")
+        vb.put_vector("knowledge", "k2", [0.0, 1.0], digest="d2")
+        vb.put_vector("knowledge", "k3", [1.0, 1.0])  # no digest: not listed
+        assert vb.knowledge_digests() == {"k1": "d1", "k2": "d2"}
+        assert vb.vector("knowledge", "k3") == f32([1.0, 1.0])
+
+        vb.put_vector("knowledge", "k1", [0.5, 0.5], digest="d1b")  # replaced with its digest
+        assert vb.knowledge_digests() == {"k1": "d1b", "k2": "d2"}
+        assert vb.vector("knowledge", "k1") == f32([0.5, 0.5])
+        vb.put_vector("knowledge", "k2", [0.5, 0.5])  # replaced without one: the old digest goes
+        assert vb.knowledge_digests() == {"k1": "d1b"}
+
+        vb.put_vector("event", "e1", [1.0, 0.0], digest="ignored")
+        assert vb.knowledge_digests() == {"k1": "d1b"}
+        assert vb.vector("event", "e1") == f32([1.0, 0.0])
+
+        vb.put_vector("knowledge", "k2", [0.0, 1.0], digest="d2")
+        vb.delete_vectors("knowledge", ["k1", "nope"])
+        assert vb.knowledge_digests() == {"k2": "d2"}
+        vb.put_vector("knowledge", "k1", [1.0, 0.0])  # a new vector under a deleted id has no old digest
+        assert vb.knowledge_digests() == {"k2": "d2"}
+
+        vb.cache("m1", "d1", [0.5])
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        assert vb.knowledge_digests() == {}
+        assert vb.cached("m1", "d1") == [0.5]
 
 
 class _Counting:
@@ -586,6 +706,101 @@ class _Counting:
         return []
 
 
+class _Blocking(_Counting):
+    """_Counting that, the first time it observes `block_on`, sets `entered`
+    and waits for `release`: a slow observe a test controls."""
+
+    def __init__(self, block_on, entered, release, state_version=None):
+        super().__init__([], state_version)
+        self.block_on, self.entered, self.release = block_on, entered, release
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if event.id == self.block_on and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10), "never released"
+        return decisions
+
+
+class _Ticking(_Counting):
+    """_Counting whose tick promotes "tick-<name>" from e1 and records itself
+    in state. `meanwhile`, if set, runs once inside the next tick."""
+
+    def __init__(self, name):
+        super().__init__([])
+        self.name = name
+        self.meanwhile = None
+
+    def tick(self, now, ctx):
+        meanwhile, self.meanwhile = self.meanwhile, None
+        if meanwhile is not None:
+            meanwhile()
+        ctx.state.put("ticked", self.name)
+        item = Knowledge(id=f"tick-{self.name}", kind="knowledge", title=self.name, body="tick",
+                         scope="personal", owner="u1", sources=("e1",))
+        return [Promote(item)]
+
+
+class _ResetWhileFailing(_Counting):
+    """state_version "1". Its first observe resets the engine through another
+    connection (same version) and then fails; later ones succeed, or fail
+    too when `always`."""
+
+    def __init__(self, open_db, always=False):
+        super().__init__([], state_version="1")
+        self.open_db = open_db
+        self.always = always
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if len(self.seen) == 1:
+            self.open_db().state("engine").reset("1")
+            raise RuntimeError("boom")
+        if self.always:
+            raise RuntimeError("boom")
+        return decisions
+
+
+class _OtherVersionResets(_Counting):
+    """state_version "1". Whenever it observes on state under "1", another
+    process (version "2") resets the state meanwhile."""
+
+    def __init__(self, open_db):
+        super().__init__([], state_version="1")
+        self.open_db = open_db
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        other = self.open_db().state("engine")
+        if other.version() == "1":
+            other.reset("2")
+        return decisions
+
+
+class _PerAttempt(_Counting):
+    """Promotes "k-attempt<n>" on its n-th observe."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        item = Knowledge(id=f"k-attempt{len(self.seen)}", kind="knowledge", title=event.id, body=event.text,
+                         scope="personal", owner=event.user, sources=(event.id,))
+        return [Promote(item)]
+
+
+class _Dying(_Counting):
+    """Writes to its state, then the process dies in the middle of observe."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        raise SystemExit("killed")
+
+
 class DatabaseContract:
     """make(tmp_path) returns a zero-argument opener. Each call to it is one
     more process (connection) on the same storage.
@@ -608,6 +823,19 @@ class DatabaseContract:
     def runtime(open_db, engine, name="engine", max_failures=None):
         db = open_db()
         return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction, max_failures)
+
+    def test_epoch_survives_reopening(self, open_db):
+        first = open_db().state("engine")
+        first.reset("v")
+        first.commit(0, 2, {"a": 1}, set(), epoch=first.epoch())
+
+        again = open_db().state("engine")
+
+        assert (again.epoch(), again.cursor(), again.get("a")) == (2, 2, 1)
+        with pytest.raises(CursorConflict):
+            again.commit(2, 3, {}, set(), epoch=1)
+        again.commit(2, 3, {}, set(), epoch=2)
+        assert open_db().state("engine").epoch() == 3
 
     def test_two_processes_deliver_each_event_once(self, open_db):
         seen = []
@@ -701,6 +929,181 @@ class DatabaseContract:
         self.runtime(open_db, _Counting(later, state_version="2")).sync()
         assert later == []
 
+    def test_a_slow_observe_does_not_block_other_writers(self, open_db):
+        """The engine runs with no write transaction open: while one process's
+        observe is stuck, another connection appends and delivers to its own
+        engine without waiting for a lock."""
+        entered, release = threading.Event(), threading.Event()
+        slow = self.runtime(open_db, _Blocking("e1", entered, release), name="slow")
+        slow.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(slow.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            seen = []
+            other = self.runtime(open_db, _Counting(seen), name="other")
+            started = time.monotonic()
+            other.append(ev("e2", "two"))  # appends, then delivers e1 and e2 to "other"
+            assert time.monotonic() - started < 2.0  # no lock wait
+            assert seen == ["e1", "e2"] and other.state.cursor() == 2
+            assert not worker.done()  # the slow observe is still stuck
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        assert worker.result() == 2
+        assert slow.state.cursor() == 2
+
+    def test_duplicate_ticks_apply_once(self, open_db):
+        """Two processes tick from the same cursor and epoch; both engines decide,
+        only the first commit lands (the epoch moved), the other is dropped."""
+        a = self.runtime(open_db, _Ticking("a"))
+        b = self.runtime(open_db, _Ticking("b"))
+        a.append(ev("e1", "one"))
+        a.engine.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
+        before = len(a.verdicts)  # e1's delivery
+
+        a.tick(T0)
+
+        assert [k.id for k in a.knowledge.all()] == ["k-e1", "tick-b"]
+        assert a.state.get("ticked") == "b" and a.state.cursor() == 1
+        assert [v.accepted for v in b.verdicts] == [True] and a.verdicts[before:] == []
+        a.tick(T0)  # the next tick runs again and lands
+        assert a.state.get("ticked") == "a"
+        assert [k.id for k in a.knowledge.all()] == ["k-e1", "tick-a", "tick-b"]
+
+    def test_stale_commit_after_a_reset_is_dropped(self, open_db):
+        """A process reads, then another resets the engine (a new state_version)
+        and delivers from the start; the first one's result is not stored under
+        the new version."""
+        entered, release = threading.Event(), threading.Event()
+        old = self.runtime(open_db, _Blocking("e1", entered, release, state_version="1"))
+        old.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(old.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            seen = []
+            new = self.runtime(open_db, _Counting(seen, state_version="2"))
+            assert new.sync() == 1  # resets (cursor back to 0), then delivers e1 again
+            assert seen == ["e1"]
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        assert worker.result() == 0  # its commit was refused; nothing left to deliver
+        state = open_db().state("engine")
+        assert state.version() == "2" and state.cursor() == 1
+        assert [k for k, _ in state.scan()] == ["2/e1"]  # nothing the old engine wrote
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1"]
+
+    def test_a_restarted_delivery_does_not_commit_an_older_engine_versions_output(self, open_db):
+        """A ("1") is observing when B ("2") resets the engine's state (B's own
+        observe then fails, so B delivers nothing). A's commit is refused
+        (epoch); on its restart A must not commit its "1" output onto state
+        named "2": it checks its version again (resetting to "1") first.
+        Asserted: every stored key was written by the version the state is
+        named after, whichever version holds it."""
+        entered, release = threading.Event(), threading.Event()
+        old = self.runtime(open_db, _Blocking("e1", entered, release, state_version="1"))
+        old.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(old.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            new = self.runtime(open_db, _Counting([], state_version="2", fail=True))
+            with pytest.raises(RuntimeError, match="boom"):
+                new.sync()  # resets the state to "2", then its observe fails
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        worker.result()
+
+        def consistent():
+            state = open_db().state("engine")
+            keys = [k for k, _ in state.scan()]
+            assert all(k.startswith(f"{state.version()}/") for k in keys), (state.version(), keys)
+            return state.version(), keys
+
+        assert consistent() == ("1", ["1/e1"])  # A re-checked its version and delivered on its own
+        new.engine.fail = False
+        assert new.sync() == 1  # B resets again and replays
+        assert consistent() == ("2", ["2/e1"])
+
+    def test_a_skip_with_a_stale_epoch_records_nothing(self, open_db):
+        """The engine is reset (same version) between the read and the skip:
+        the skip commit is refused, nothing is reported skipped, and the
+        event is observed again from the new start and delivered."""
+        engine = _ResetWhileFailing(open_db)
+        rt = self.runtime(open_db, engine, max_failures=1)
+        rt.events.append(ev("e1", "one"))
+
+        assert rt.sync() == 1
+
+        assert engine.seen == ["e1", "e1"]
+        assert rt.skipped == [] and rt._failures == {}
+        assert rt.state.cursor() == 1 and [k for k, _ in rt.state.scan()] == ["1/e1"]
+
+    def test_a_refused_commit_leaves_no_knowledge(self, open_db):
+        """Decisions valid, then state.commit refuses once (another process
+        moved first): nothing that attempt decided reaches the knowledge base
+        or the verdict log; the next attempt's decisions do."""
+        rt = self.runtime(open_db, _PerAttempt())
+        rt.events.append(ev("e1", "one"))
+        real = rt.state.commit
+
+        def lose(*args, **kw):
+            rt.state.commit = real
+            raise CursorConflict("another process moved first")
+
+        rt.state.commit = lose
+        assert rt.sync() == 1
+
+        assert [k.id for k in open_db().knowledge.all()] == ["k-attempt2"]
+        assert [v.decision.item.id for v in rt.verdicts] == ["k-attempt2"]
+
+    def test_two_engine_versions_resetting_each_other_end_in_state_version_changed(self, open_db):
+        """Another version of the engine resets the state each time this one
+        observes on its own version. After MAX_CONFIG_RETRIES restarts of the
+        event, sync raises StateVersionChanged; nothing is counted as an
+        engine failure and nothing is skipped."""
+        engine = _OtherVersionResets(open_db)
+        rt = self.runtime(open_db, engine, max_failures=1)
+        rt.events.append(ev("e1", "one"))
+
+        with pytest.raises(StateVersionChanged):
+            rt.sync()
+
+        assert rt._failures == {} and rt.skipped == []
+        assert open_db().state("engine").cursor() == 0
+
+    def test_a_failure_while_the_engine_was_reset_is_not_counted(self, open_db):
+        """observe fails while another process resets the engine: the result
+        was read from a state that no longer exists, so the failure is not
+        counted; the next one (on the new state) is."""
+        engine = _ResetWhileFailing(open_db, always=True)
+        rt = self.runtime(open_db, engine, max_failures=2)
+        rt.events.append(ev("e1", "one"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            rt.sync()
+
+        assert engine.seen == ["e1", "e1"]
+        assert rt._failures == {1: 1} and rt.skipped == []
+        assert rt.state.cursor() == 0
+
+    def test_process_dying_during_observe_leaves_no_trace(self, open_db):
+        dying = self.runtime(open_db, _Dying())
+        dying.events.append(ev("e1", "one"))
+        with pytest.raises(SystemExit):
+            dying.sync()
+
+        db = open_db()
+        state = db.state("engine")
+        assert (state.cursor(), state.epoch(), list(state.scan()), db.knowledge.all()) == (0, 0, [], [])
+        seen = []
+        assert self.runtime(open_db, _Counting(seen)).sync() == 1
+        assert seen == ["e1"]
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1"]
+
     def test_vector_writes_roll_back_with_the_transaction(self, open_db):
         if not self.rolls_back:
             pytest.skip("this store's transaction() does not roll back")
@@ -709,24 +1112,25 @@ class DatabaseContract:
         vb.reset({"model": "m1", "group_threshold": 0.9})
         vb.put_vector("event", "e1", [1.0, 0.0])
         vb.put_group("e1", "e1", "team", "t1", 1)
-        vb.put_vector("knowledge", "k1", [0.0, 1.0])
+        vb.put_vector("knowledge", "k1", [0.0, 1.0], digest="dk")
         vb.cache("m1", "d1", [0.5, 0.5])
-        vb.set_indexed(1)
+        vb.set_indexed(0, 1, vb.generation())
 
         def snapshot(v):
             return (
                 v.meta(), v.indexed(), list(v.vectors("event")), list(v.vectors("knowledge")),
                 v.members("e1"), v.group_of("e2"), v.cached("m1", "d1"), v.cached("m1", "d2"),
+                v.generation(), v.knowledge_digests(),
             )
 
         before = snapshot(vb)
         with pytest.raises(RuntimeError, match="boom"), db.transaction():
             vb.put_vector("event", "e2", [0.0, 1.0])
             vb.put_group("e2", "e1", "team", "t1", 2)
-            vb.put_vector("knowledge", "k1", [9.0, 9.0])
+            vb.put_vector("knowledge", "k1", [9.0, 9.0], digest="other")
             vb.delete_vectors("event", ["e1"])
             vb.cache("m1", "d2", [0.1, 0.2])
-            vb.set_indexed(2)
+            vb.set_indexed(1, 2, vb.generation())
             vb.reset({"model": "m2", "group_threshold": 0.5})
             raise RuntimeError("boom")
 

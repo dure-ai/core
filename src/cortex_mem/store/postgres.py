@@ -71,7 +71,10 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS knowledge_terms (id text, term text, tf int, PRIMARY KEY (term, id))",
     "CREATE TABLE IF NOT EXISTS knowledge_stats (id text PRIMARY KEY, len int)",
     "CREATE TABLE IF NOT EXISTS engine_state (engine text, key text, value text, PRIMARY KEY (engine, key))",
-    "CREATE TABLE IF NOT EXISTS engine_cursor (engine text PRIMARY KEY, cursor bigint, version text)",
+    (
+        "CREATE TABLE IF NOT EXISTS engine_cursor (engine text PRIMARY KEY, cursor bigint, version text, "
+        "epoch bigint NOT NULL DEFAULT 0)"
+    ),
     "CREATE TABLE IF NOT EXISTS event_vectors (event_id text PRIMARY KEY, ord bigint, emb vector)",
     (
         "CREATE TABLE IF NOT EXISTS vector_groups (event_id text PRIMARY KEY, group_id text, "
@@ -79,7 +82,7 @@ _SCHEMA = (
     ),
     "CREATE INDEX IF NOT EXISTS vector_groups_partition ON vector_groups (scope, owner, seq)",
     "CREATE INDEX IF NOT EXISTS vector_groups_group ON vector_groups (group_id, seq)",
-    "CREATE TABLE IF NOT EXISTS knowledge_vectors (id text PRIMARY KEY, emb vector)",
+    "CREATE TABLE IF NOT EXISTS knowledge_vectors (id text PRIMARY KEY, emb vector, digest text)",
     (
         "CREATE TABLE IF NOT EXISTS embed_cache (model text, digest text, emb vector, "
         "PRIMARY KEY (model, digest))"
@@ -226,6 +229,22 @@ class PostgresDatabase:
                 )
             for statement in _SCHEMA:
                 self.con.execute(statement)
+            # Columns added on this branch without a version bump. PostgreSQL is
+            # only in development until it ships, so an older schema is not migrated.
+            missing = [
+                f"{table}.{column}"
+                for table, column in (("engine_cursor", "epoch"), ("knowledge_vectors", "digest"))
+                if not self.con.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                    (table, column),
+                ).fetchone()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"the cortex schema in this database predates {', '.join(missing)}; "
+                    "drop that schema (or use a new one) and start again"
+                )
             if row is None:
                 self.con.execute(
                     "INSERT INTO cortex_meta (key, value) VALUES ('schema_version', %s)",
@@ -580,15 +599,28 @@ class PgStateBackend:
         rows = self.db.query("SELECT cursor FROM engine_cursor WHERE engine = %s", (self.engine,))
         return rows[0][0] if rows else 0
 
+    def epoch(self) -> int:
+        rows = self.db.query("SELECT epoch FROM engine_cursor WHERE engine = %s", (self.engine,))
+        return rows[0][0] if rows else 0
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: AbstractSet[str],
+        *,
+        epoch: int,
     ) -> None:
         # Serialize before any write, so a value that is not JSON leaves nothing half-written.
         encoded = [(self.engine, key, json.dumps(value)) for key, value in writes.items()]
         with self.db.transaction():
-            current = self.cursor()
-            if current != expected:
-                raise CursorConflict(f"cursor is {current}, expected {expected}")
+            rows = self.db.query("SELECT cursor, epoch FROM engine_cursor WHERE engine = %s", (self.engine,))
+            current, current_epoch = rows[0] if rows else (0, 0)
+            if current != expected or current_epoch != epoch:
+                raise CursorConflict(
+                    f"cursor is {current} at epoch {current_epoch}, expected {expected} at epoch {epoch}"
+                )
             con = self.db.con
             with con.cursor() as cur:
                 cur.executemany(
@@ -601,9 +633,9 @@ class PgStateBackend:
                     encoded,
                 )
             con.execute(
-                "INSERT INTO engine_cursor (engine, cursor) VALUES (%s, %s) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = EXCLUDED.cursor",
-                (self.engine, cursor),
+                "INSERT INTO engine_cursor (engine, cursor, epoch) VALUES (%s, %s, %s) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = EXCLUDED.cursor, epoch = EXCLUDED.epoch",
+                (self.engine, cursor, epoch + 1),
             )
 
     def version(self) -> str | None:
@@ -615,8 +647,9 @@ class PgStateBackend:
             con = self.db.con
             con.execute("DELETE FROM engine_state WHERE engine = %s", (self.engine,))
             con.execute(
-                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (%s, 0, %s) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version",
+                "INSERT INTO engine_cursor (engine, cursor, version, epoch) VALUES (%s, 0, %s, 1) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version, "
+                "epoch = engine_cursor.epoch + 1",
                 (self.engine, version),
             )
 
@@ -723,14 +756,24 @@ class PgVectorBackend:
                 con.execute(f"DELETE FROM {table}")
             con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
             self._set_meta("meta", encoded)
+            self._set_meta("generation", str(self.generation() + 1))
             self._hnsw_for = None
+
+    def generation(self) -> int:
+        value = self._get_meta("generation")
+        return int(value) if value is not None else 0
 
     def indexed(self) -> int:
         value = self._get_meta("indexed")
         return int(value) if value is not None else 0
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():
+            current, now = self.indexed(), self.generation()
+            if current != expected or now != generation:
+                raise CursorConflict(
+                    f"index at {current} (generation {now}), not {expected} (generation {generation})"
+                )
             self._set_meta("indexed", str(seq))
 
     # Dimension and the HNSW index
@@ -812,7 +855,9 @@ class PgVectorBackend:
 
     # Vectors
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
         table = _KINDS[kind]
         values = float32(vector)
         self._check_halfvec(values)  # before any write, so the transaction stays usable
@@ -833,10 +878,14 @@ class PgVectorBackend:
                 )
             else:
                 self.db.con.execute(
-                    f"INSERT INTO {table} (id, emb) VALUES (%s, %s::vector) "
-                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb",
-                    (id, _literal(values)),
+                    f"INSERT INTO {table} (id, emb, digest) VALUES (%s, %s::vector, %s) "
+                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb, digest = EXCLUDED.digest",
+                    (id, _literal(values), digest),
                 )
+
+    def knowledge_digests(self) -> dict[str, str]:
+        rows = self.db.query("SELECT id, digest FROM knowledge_vectors WHERE digest IS NOT NULL")
+        return dict(rows)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         key = "event_id" if kind == "event" else "id"
