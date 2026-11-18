@@ -175,6 +175,52 @@ def test_max_failures_must_allow_one_attempt(max_failures):
                 max_failures=max_failures)
 
 
+class _FailsOn(Scripted):
+    def __init__(self, bad):
+        super().__init__()
+        self.bad = bad
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        if event.id == self.bad:
+            raise RuntimeError("boom")
+        return []
+
+
+def test_skip_is_recorded_only_after_its_commit_succeeds():
+    state = InMemoryStateBackend()
+    rt = Runtime(_FailsOn("e1"), InMemoryEventStore(), InMemoryKnowledgeBase(), state, max_failures=1)
+    real_commit = state.commit
+
+    def down(*args, **kw):
+        raise OSError("store is down")
+
+    state.commit = down
+    with pytest.raises(OSError, match="store is down"):
+        rt.append(ev("e1"))
+    assert (state.cursor(), rt.skipped) == (0, [])  # not skipped, so not reported as skipped
+
+    state.commit = real_commit
+    rt.sync()
+    assert state.cursor() == 1
+    assert [(s.event_id, s.attempts) for s in rt.skipped] == [("e1", 2)]
+
+
+def test_skip_lost_to_another_process_is_not_reported():
+    state = InMemoryStateBackend()
+    rt = Runtime(_FailsOn("e1"), InMemoryEventStore(), InMemoryKnowledgeBase(), state, max_failures=1)
+    real_commit = state.commit
+
+    def first(expected, *args, **kw):
+        state.commit = real_commit
+        real_commit(expected, 1, {}, set())  # another process moves past e1 first
+        return real_commit(expected, *args, **kw)
+
+    state.commit = first
+    rt.append(ev("e1"))
+    assert (state.cursor(), rt.skipped) == (1, [])
+
+
 def test_oversized_state_value_is_refused():
     class Hoarder(Scripted):
         def observe(self, event, ctx):

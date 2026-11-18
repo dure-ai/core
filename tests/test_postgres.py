@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cortex_mem.contract import Event, Knowledge
+from cortex_mem.runtime import Runtime
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
@@ -721,3 +722,44 @@ class TestPgDatabase(DatabaseContract):
             return db
 
         return opener
+
+    def test_max_failures_skips_an_event_that_fails_with_a_db_error(self, open_db):
+        import psycopg
+
+        db = open_db()
+
+        class Poison:
+            def __init__(self):
+                self.seen = []
+
+            def observe(self, event, ctx):
+                self.seen.append(event.id)
+                ctx.state.put(event.id, True)
+                if event.id == "e1":
+                    db.query("SELECT 1/0")  # PostgreSQL aborts the delivery transaction
+                return []
+
+            def tick(self, now, ctx):
+                return []
+
+            def handoff(self, query, caller, scope, ctx, k=6):
+                return []
+
+        engine = Poison()
+        rt = Runtime(engine, db.events, db.knowledge, db.state("poison"), db.transaction, max_failures=2)
+
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            rt.append(ev("e1", "x"))
+        rt.append(ev("e2", "y"))  # the second attempt on e1 gives up, then e2 is delivered
+
+        assert engine.seen == ["e1", "e1", "e2"]
+        assert [(s.seq, s.event_id, s.attempts) for s in rt.skipped] == [(1, "e1", 2)]
+        assert rt.skipped[0].error.startswith("DivisionByZero")
+        assert rt.state.cursor() == 2
+        assert [k for k, _ in rt.state.scan()] == ["e2"]
+
+        later = Poison()
+        other = open_db()
+        Runtime(later, other.events, other.knowledge, other.state("poison"), other.transaction,
+                max_failures=2).sync()
+        assert later.seen == []

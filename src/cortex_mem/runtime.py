@@ -58,6 +58,19 @@ class Skipped:
     error: str  # the last exception, as "Type: message"
 
 
+class _Skip(Exception):
+    """Raised out of the delivery transaction for an event given up on, so
+    that transaction ends (rolled back) before the skip commits in a new one."""
+
+    def __init__(self, cursor: int, seq: int, event_id: str, attempts: int, error: Exception) -> None:
+        super().__init__(event_id)
+        self.cursor = cursor
+        self.seq = seq
+        self.event_id = event_id
+        self.attempts = attempts
+        self.error = error
+
+
 class _StagedState:
     """StateStore handed to the engine: writes stay here until the runtime commits.
 
@@ -221,33 +234,57 @@ class Runtime:
     def _deliver_next(self) -> int | None:
         """Deliver the next event in one transaction: 1 if delivered, 0 if not
         (skipped, or another process was first), None if nothing is pending."""
-        with self.transaction():
-            cursor = self.state.cursor()
-            pending = next(iter(self.events.since(cursor)), None)
-            if pending is None:
-                return None
-            seq, event = pending
-            if self.index is not None:
-                # Outside the observe try: an embedding failure is not the engine's.
-                # Cache only: embedding here would hold the write lock.
-                self.index.catch_up(self.events, seq, embed=False)
-            staged = self._staged()
-            try:
-                decisions = self.engine.observe(event, self._ctx(staged, seq))
-            except Exception as exc:
-                if not self._give_up(seq, event, exc):
-                    raise
+        try:
+            with self.transaction():
+                cursor = self.state.cursor()
+                pending = next(iter(self.events.since(cursor)), None)
+                if pending is None:
+                    return None
+                seq, event = pending
+                if self.index is not None:
+                    # Outside the observe try: an embedding failure is not the engine's.
+                    # Cache only: embedding here would hold the write lock.
+                    self.index.catch_up(self.events, seq, embed=False)
+                staged = self._staged()
                 try:
-                    self.state.commit(cursor, seq, {}, set())  # past it, with none of its writes
+                    decisions = self.engine.observe(event, self._ctx(staged, seq))
+                except Exception as exc:
+                    attempts = self._give_up(seq)
+                    if attempts is None:
+                        raise
+                    # Leave the transaction by raising, so a durable store rolls it back:
+                    # after a failed statement PostgreSQL accepts nothing more in it.
+                    raise _Skip(cursor, seq, event.id, attempts, exc) from exc
+                try:
+                    self._commit(decisions, staged, cursor, seq, event.at)
                 except CursorConflict:
-                    pass  # another process moved on first
-                return 0
-            try:
-                self._commit(decisions, staged, cursor, seq, event.at)
-            except CursorConflict:
-                return 0  # another process delivered it first; read the cursor again
-            self._failures.pop(seq, None)
+                    return 0  # another process delivered it first; read the cursor again
+                self._failures.pop(seq, None)
+        except _Skip as skip:
+            self._skip(skip)
+            return 0
         return 1
+
+    def _skip(self, skip: "_Skip") -> None:
+        """Move the cursor past a given-up event in a new transaction, with none
+        of its writes: the engine's were staged and are dropped, and nothing
+        else in the failed transaction is committed by this one. The event is
+        reported in `skipped` only once this has committed; if it fails, the
+        error is raised and the event is given up again on the next attempt.
+        The rollback also undid the event's indexing, so it is indexed again
+        here (from the cache, as in delivery): the index and the engine's
+        cursor move together."""
+        try:
+            with self.transaction():
+                if self.index is not None:
+                    self.index.catch_up(self.events, skip.seq, embed=False)
+                self.state.commit(skip.cursor, skip.seq, {}, set())
+        except CursorConflict:
+            self._failures.pop(skip.seq, None)  # another process moved on first
+            return
+        self._failures.pop(skip.seq, None)
+        error = f"{type(skip.error).__name__}: {skip.error}"
+        self.skipped.append(Skipped(skip.seq, skip.event_id, skip.attempts, error))
 
     def _warm_pending(self) -> None:
         """Embed every passage the index still has to add, in batches, before
@@ -261,15 +298,14 @@ class Runtime:
         except EmbeddingError:
             pass
 
-    def _give_up(self, seq: int, event: Event, exc: Exception) -> bool:
-        """Count a failed attempt; True when the event is to be skipped now."""
+    def _give_up(self, seq: int) -> int | None:
+        """Count a failed attempt; the attempt count when the event is to be
+        skipped now, else None. The count is kept until the skip commits."""
         attempts = self._failures.get(seq, 0) + 1
+        self._failures[seq] = attempts
         if self.max_failures is None or attempts < self.max_failures:
-            self._failures[seq] = attempts
-            return False
-        self._failures.pop(seq, None)
-        self.skipped.append(Skipped(seq, event.id, attempts, f"{type(exc).__name__}: {exc}"))
-        return True
+            return None
+        return attempts
 
     def _check_state_version(self) -> None:
         """Drop the engine's state and start delivery over when the engine's
