@@ -8,7 +8,7 @@ from spy import SpyBackend, SpyEmbedder, TxnSpy
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
 from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, float32, text_digest
-from cortex_mem.index import WARM_BATCH, Index
+from cortex_mem.index import WARM_BATCH, Index, IndexConfigChanged
 from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -75,6 +75,7 @@ def build(events, embedder=None, threshold=0.9, db=None):
     for e in events:
         db.events.append(e)
     index = Index(db.vectors, embedder or HashEmbedder(), threshold, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
     index.advance(db.events, len(events))
     return db, index
 
@@ -227,9 +228,7 @@ def test_knowledge_vectors_follow_the_knowledge_base():
 
 def test_ensure_current_resets_and_reembeds_knowledge():
     emb = CountingEmbedder()
-    db, index = build([ev("e1"), ev("e2", "other words")], emb)
-    assert index.ensure_current(db.knowledge) is True  # never built: meta() was None
-    index.advance(db.events, 2)
+    db, index = build([ev("e1"), ev("e2", "other words")], emb)  # built and advanced
     put_knowledge(db, index, item("k1"), item("k2", scope="personal", owner="u9", body="private note"))
     db.vectors.put_vector("knowledge", "gone", [1.0, 0.0])  # not in the knowledge base
     generation = db.vectors.generation()
@@ -465,6 +464,7 @@ def test_wrong_vector_count_raises_embedding_error(out):
     db = InMemoryDatabase()
     db.events.append(ev("e1"))
     index = Index(db.vectors, CountMismatchEmbedder(out), 0.9)
+    index.ensure_current(db.knowledge)
     with pytest.raises(EmbeddingError):
         index.advance(db.events, 1)
     assert db.vectors.indexed() == 0
@@ -579,6 +579,7 @@ def test_the_index_asks_the_store_for_similarity_instead_of_scanning():
     for e in events:
         db.events.append(e)
     index = Index(NoScanBackend(db.vectors), HashEmbedder(), 0.9)
+    index.ensure_current(db.knowledge)
     index.advance(db.events, len(events))
     put_knowledge(db, index, item("k1"))
     r = reader(db, index)
@@ -595,6 +596,7 @@ def test_a_non_finite_embedding_fails_loudly_and_writes_nothing(make):
     db.events.append(ev("e1", "a"))
     emb = TableEmbedder({"a": [float("nan"), 1.0, 0.0]})
     index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
     with pytest.raises(ValueError, match="finite"):
         index.advance(db.events, 1)
     assert (list(db.vectors.vectors("event")), db.vectors.group_of("e1"), db.vectors.indexed()) == ([], None, 0)
@@ -633,13 +635,16 @@ def opened(request, tmp_path):
             db.close()
 
 
-def spied(db, embedder=None, threshold=0.9, watch=("nearest_member", "group_of")):
+def spied(db, embedder=None, threshold=0.9, watch=("nearest_member", "group_of"), built=True):
     """An Index whose transactions, embedder and backend calls are watched."""
     spy = TxnSpy(db)
     emb = embedder or SpyEmbedder(spy)
     emb.spy = spy
     backend = SpyBackend(db.vectors, spy, watch)
-    return Index(backend, emb, threshold, transaction=spy.transaction), emb, backend, spy
+    index = Index(backend, emb, threshold, transaction=spy.transaction)
+    if built and index.stale():
+        db.vectors.reset(index.want())  # an empty index of this config, without embedding anything
+    return index, emb, backend, spy
 
 
 def appended(db, *events):
@@ -780,7 +785,9 @@ def test_advance_raises_a_conflict_it_cannot_explain(opened):
     """A backend whose position never moves (it ignores the shared cursor)
     gets the conflict raised, not an endless retry, and writes nothing."""
     db = appended(opened(), ev("e1", "one"), ev("e2", "two"))
-    Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction).advance(db.events, 2)
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    index.advance(db.events, 2)
 
     class Stuck(SpyBackend):
         def indexed(self):
@@ -869,7 +876,7 @@ def test_ensure_current_embeds_outside_the_transaction(opened):
     db = opened()
     db.knowledge.put(item("k1", body="first"))
     db.knowledge.put(item("k2", body="second"))
-    index, emb, _, _ = spied(db)
+    index, emb, _, _ = spied(db, built=False)
 
     assert index.ensure_current(db.knowledge) is True
 
@@ -902,3 +909,83 @@ def test_ensure_current_failure_changes_nothing(opened):
 
     assert fresh.stale()  # the next sync tries again
     assert state() == before
+
+
+# ── fix round 1: another config's generation, outage calls ─────────────────
+
+
+def test_advance_refuses_to_write_into_an_index_of_another_config(opened):
+    """Another process with another model rebuilds the index while this one
+    embeds: this one must not write its vectors into that generation."""
+    db_a, db_b = opened(), opened()
+    appended(db_a, ev("e1", "one"), ev("e2", "two"))
+    other = Index(db_b.vectors, HashEmbedder(dim=128), 0.9, transaction=db_b.transaction)
+
+    def meanwhile(texts, kind):
+        other.ensure_current(db_b.knowledge)
+
+    first, emb, backend, _ = spied(db_a, SpyEmbedder(None, during=meanwhile))
+
+    with pytest.raises(IndexConfigChanged):
+        first.advance(db_a.events, 2)
+
+    assert emb.calls  # it did embed, then found the other config
+    assert db_a.vectors.meta() == other.want()
+    assert list(db_a.vectors.vectors("event")) == [] and db_a.vectors.indexed() == 0
+    assert backend.log == []
+    other.advance(db_b.events, 2)
+    assert {len(v) for _, v in db_a.vectors.vectors("event")} == {128}
+
+
+def test_advance_refuses_an_index_never_built_for_it(opened):
+    db = appended(opened(), ev("e1"))
+    with pytest.raises(IndexConfigChanged):
+        Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction).advance(db.events, 1)
+    assert db.vectors.indexed() == 0
+
+
+def test_a_failing_batch_of_one_text_is_not_tried_again(opened):
+    db = appended(opened(), ev("e1", "fine"), ev("e2", "boom"))
+    index, emb, _, _ = spied(db)
+    index.advance(db.events, 1)
+    emb.fail_on.add("boom")
+
+    with pytest.raises(EmbeddingError):
+        index.advance(db.events, 2)
+
+    assert emb.batches[1:] == [["boom"]]  # one call: it is the culprit already
+
+
+def test_advance_does_not_raise_when_every_text_succeeds_on_its_own(opened):
+    db = appended(opened(), ev("e1", "one"), ev("e2", "two"), ev("e3", "three"))
+    failed = []
+
+    def flaky(texts, kind):
+        if not failed:
+            failed.append(texts)
+            raise EmbeddingError("a hiccup")
+
+    index, _, _, _ = spied(db, SpyEmbedder(None, during=flaky))
+
+    index.advance(db.events, 3)  # the batch failed once, every text then succeeded
+
+    assert failed == [["one", "two", "three"]]
+    assert db.vectors.indexed() == 3
+
+
+def test_advance_does_not_raise_when_another_process_indexed_past_the_failure(opened):
+    db_a, db_b = opened(), opened()
+    appended(db_a, ev("e1", "fine"), ev("e2", "boom"), ev("e3", "also fine"))
+    second, _, b_backend, _ = spied(db_b)
+
+    def meanwhile(texts, kind):
+        if texts == ["boom"]:
+            second.advance(db_b.events, 3)  # its embedder works
+
+    first, _, a_backend, _ = spied(db_a, SpyEmbedder(None, fail_on={"boom"}, during=meanwhile))
+
+    first.advance(db_a.events, 3)
+
+    assert db_a.vectors.indexed() == 3
+    assert a_backend.log == []  # the other process indexed every event, once
+    assert [e[-1] for e in b_backend.log] == ["e1", "e1", "e2", "e2", "e3", "e3"]

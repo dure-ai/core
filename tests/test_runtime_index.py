@@ -22,7 +22,7 @@ from cortex_mem.contract import (
     Promote,
 )
 from cortex_mem.embed import EmbeddingError, HashEmbedder
-from cortex_mem.index import Index
+from cortex_mem.index import Index, IndexConfigChanged
 from cortex_mem.runtime import INDEX_STATE_KEY, Runtime
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -330,10 +330,13 @@ def test_the_runtime_never_embeds_inside_a_write_transaction(store, tmp_path):
     rt.append(ev("e3", "deploy tags broke", kind="outcome", outcome="failure", refs=("k1",)))
     rt.tick(T0)
     # A new threshold rebuilds the index and replays the engine.
-    runtime(ProbeEngine(), db, SpyEmbedder(TxnSpy(db)), threshold=0.5).sync()
+    rebuilding = SpyEmbedder(TxnSpy(db))
+    db.knowledge.put(item("k9", ("e1",), body="only the rebuild embeds this"))
+    runtime(ProbeEngine(), db, rebuilding, threshold=0.5).sync()
     rt.sync()
 
     assert emb.calls and emb.inside == []
+    assert rebuilding.calls and rebuilding.inside == []
     assert engine.seen[:4] == ["e1", "e2", "e5", "e3"]
     assert db.vectors.vector("knowledge", "k2") is not None
 
@@ -669,3 +672,76 @@ def test_tick_and_handoff_read_up_to_the_engines_cursor():
     similar = rt._ctx(staged, rt.state.cursor()).similar
     assert similar.group("e2") is None
     assert [e.id for e, _ in similar.search("deploy uses tags", caller(), "personal")] == ["e1"]
+
+
+# ── fix round 1: another config on the store, an outage ─────────────────────
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_two_runtimes_with_different_configs_do_not_mix_vectors(store, tmp_path):
+    shared = InMemoryDatabase()
+
+    def reopen():
+        return shared if store == "memory" else SqliteDatabase(tmp_path / "core.db")
+
+    db_a, db_b = reopen(), reopen()
+    for i in range(3):
+        db_a.events.append(ev(f"e{i}", f"fact number {i}"))
+    b = runtime(ProbeEngine(), db_b, HashEmbedder(dim=128), name="b")
+    ran = []
+
+    def meanwhile(texts, kind):
+        if not ran:
+            ran.append(True)
+            b.sync()  # another model rebuilds the index while a embeds
+
+    engine = ProbeEngine()
+    a = runtime(engine, db_a, SpyEmbedder(TxnSpy(db_a), during=meanwhile), name="a")
+
+    assert a.sync() == 3  # it terminates: a rebuilt the index back and delivered
+
+    assert ran == [True]
+    assert db_a.vectors.meta() == a.index.want()
+    assert {len(v) for _, v in db_a.vectors.vectors("event")} == {256}  # only a's model
+    assert engine.seen == ["e0", "e1", "e2"]
+    assert all(g is not None for g in engine.groups.values())
+
+
+def test_a_config_that_keeps_changing_is_raised_after_three_retries():
+    db = InMemoryDatabase()
+    db.events.append(ev("e1"))
+    rt = runtime(ProbeEngine(), db)
+    rebuilds = []
+    real = rt.index.ensure_current
+
+    def ensure_then_lose(knowledge):
+        rebuilds.append(True)
+        rebuilt = real(knowledge)
+        db.vectors.reset({"model": "someone-else", "group_threshold": 0.1, "store": "memory"})
+        return rebuilt
+
+    rt.index.ensure_current = ensure_then_lose
+
+    with pytest.raises(IndexConfigChanged):
+        rt.sync()
+    assert len(rebuilds) == 4  # the first check, then three retries
+
+
+def test_an_outage_sync_makes_at_most_two_failing_calls():
+    db = InMemoryDatabase()
+    emb = SpyEmbedder(TxnSpy(db), fail_on={"t1"})
+    engine = ProbeEngine()
+    rt = runtime(engine, db, emb)
+    rt.sync()
+    for i in range(3):
+        db.events.append(ev(f"e{i}", f"t{i}"))
+
+    with pytest.raises(EmbeddingError):
+        rt.sync()
+
+    failing = [texts for texts in emb.batches if "t1" in texts]
+    assert len(failing) <= 2, emb.batches
+    assert engine.seen == ["e0"]  # the error belongs to e1: the event before it was delivered
+    assert (rt.state.cursor(), db.vectors.indexed()) == (1, 1)
+    emb.fail_on.clear()
+    assert rt.sync() == 2

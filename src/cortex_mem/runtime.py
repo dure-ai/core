@@ -28,10 +28,11 @@ from .contract import (
     Scope,
 )
 from .embed import EmbeddingError
-from .index import Index
+from .index import Index, IndexConfigChanged
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
 
 _ABSENT = object()
+MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 RESERVED_STATE_PREFIX = "_runtime/"  # the runtime's own keys in the engine's state, hidden from the engine
 INDEX_STATE_KEY = RESERVED_STATE_PREFIX + "index"  # the index version the engine's state was built on
@@ -223,12 +224,17 @@ class Runtime:
         attempts have failed; then it is skipped (see `skipped`). With an
         index, each event is indexed before its delivery transaction, and an
         EmbeddingError while indexing it (or while embedding knowledge) is
-        raised as is: the event stays undelivered and is never skipped for it."""
+        raised as is: the event stays undelivered and is never skipped for it.
+        If another process rebuilds the index with another config meanwhile,
+        it is rebuilt for this one and delivery starts again, at most
+        MAX_CONFIG_RETRIES times per event; then IndexConfigChanged is raised."""
         self._check_state_version()
         self._check_index_version()
         self._follow_knowledge()
         delivered = 0
         ahead = self.index is not None
+        outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
+        retries: dict[int, int] = {}  # seq -> rebuilds after another config took the index
         while True:
             # Read without a lock: the delivery transaction reads both again.
             cursor = self.state.cursor()
@@ -237,17 +243,31 @@ class Runtime:
                 return delivered
             seq = pending[0]
             if self.index is not None:
-                if ahead:
-                    # Index everything appended so far in a few batched embed calls.
-                    # A failure is left to the step below, so it belongs to the event
-                    # whose text failed and the events before it are still delivered.
-                    ahead = False
-                    try:
-                        self.index.advance(self.events, sys.maxsize)
-                    except EmbeddingError:
-                        pass
-                # Not the engine's failure: raised before the observe try.
-                self.index.advance(self.events, seq)
+                try:
+                    if ahead:
+                        # Index everything appended so far in a few batched embed calls.
+                        # A failure is kept for the event whose text failed: the events
+                        # before it are still delivered, and it is not embedded again.
+                        ahead = False
+                        try:
+                            self.index.advance(self.events, sys.maxsize)
+                        except EmbeddingError as exc:
+                            outage = self.index.indexed(), exc
+                    if outage is not None and seq > outage[0] and self.index.indexed() < seq:
+                        raise outage[1]
+                    # Not the engine's failure: raised before the observe try.
+                    self.index.advance(self.events, seq)
+                except IndexConfigChanged:
+                    # Another process rebuilt the index with another config. Rebuild
+                    # it for ours (that replays this engine) and try again, a few
+                    # times: two configs on one store are not supported.
+                    retries[seq] = retries.get(seq, 0) + 1
+                    if retries[seq] > MAX_CONFIG_RETRIES:
+                        raise
+                    self._check_index_version()
+                    self._follow_knowledge()
+                    ahead, outage = True, None
+                    continue
             outcome, touched = self._deliver_next(seq)
             if outcome is None:
                 return delivered
@@ -268,7 +288,7 @@ class Runtime:
                     return None, []
                 if pending[0] != seq:
                     return 0, []  # another process delivered meanwhile
-                if self.index is not None and self.index.indexed() < seq:
+                if self.index is not None and (self.index.stale() or self.index.indexed() < seq):
                     return 0, []  # another process rebuilt the index meanwhile: index again first
                 event = pending[1]
                 staged = self._staged()

@@ -38,6 +38,12 @@ _QUERY_CACHE_SIZE = 256
 WARM_BATCH = 64  # texts per embed call when filling the cache
 
 
+class IndexConfigChanged(Exception):
+    """The stored index was built for another config (model, threshold or
+    store) than this Index's, or never built: advance refuses to write into
+    it. The caller runs ensure_current and tries again."""
+
+
 def _embedded(event: Event) -> bool:
     """Only records with words of their own are embedded (spec §4)."""
     return event.kind == "record" and not event.text_redacted and event.text != ""
@@ -117,42 +123,48 @@ class Index:
         read at the start, before it writes the vector and the group. When
         another process moved the position first (CursorConflict), the
         position and generation are read again and the pass goes on from
-        there, with the cache it filled. If a batch fails, its texts are
-        embedded one at a time: the events before the first text that cannot
-        be embedded are indexed, and then its EmbeddingError is raised."""
-        position, generation = self._backend.indexed(), self._backend.generation()
-        failure: EmbeddingError | None = None
-        while upto > position:
-            try:
-                self._cache_passages(
-                    event.text for seq, event in self._pending(events, position, upto) if _embedded(event)
-                )
-            except EmbeddingError as exc:
-                # One text in the batch failed: find it, one text at a time, and
-                # index only the events before the first one that needs it.
-                found = self._first_failure(
-                    [event.text for seq, event in self._pending(events, position, upto) if _embedded(event)]
-                )
-                failure = found[1] if found is not None else exc
+        there, with the cache it filled. If a batch of several texts fails,
+        they are embedded one at a time: the events before the first text
+        that cannot be embedded are indexed, and then its EmbeddingError is
+        raised (unless another process indexed that event meanwhile).
+
+        Raises IndexConfigChanged, writing nothing more, when the stored index
+        holds another config than this Index's, at the start or after a
+        conflict: the caller runs ensure_current and tries again."""
+        generation, position = self._read_position()
+        limit = upto  # lowered to just before an event whose text cannot be embedded
+        failure: tuple[int, EmbeddingError] | None = None  # (seq of that event, its error)
+        unexplained = 0
+        while limit > position:
+            texts = [event.text for seq, event in self._pending(events, position, limit) if _embedded(event)]
+            batch = self._cache_batches(texts)
+            if batch is not None:
+                chunk, exc = batch
+                # Find the text that fails, unless the batch held only that one.
+                found = (chunk[0], exc) if len(chunk) == 1 else self._first_failure(chunk)
                 if found is not None:
-                    upto = next(
-                        seq - 1
-                        for seq, event in self._pending(events, position, upto)
+                    seq = next(
+                        seq for seq, event in self._pending(events, position, limit)
                         if _embedded(event) and event.text == found[0]
                     )
-                continue
+                    failure, limit = (seq, found[1]), seq - 1
+                continue  # every text succeeded on its own: go on with them all
             try:
-                for seq, event in self._pending(events, position, upto):
+                for seq, event in self._pending(events, position, limit):
                     self._index_event(seq, event, generation)
                     position = seq
                 break
             except CursorConflict:
-                now = self._backend.indexed(), self._backend.generation()
-                if now == (position, generation):
-                    raise  # the position did not move: nothing explains the conflict
-                position, generation = now
-        if failure is not None:
-            raise failure
+                now = self._read_position()
+                if now == (generation, position):
+                    unexplained += 1
+                    if unexplained > 1:
+                        raise  # the position did not move, twice: nothing explains the conflict
+                generation, position = now
+                if failure is not None and position >= failure[0]:
+                    failure, limit = None, upto  # another process indexed past the failure
+        if failure is not None and self._backend.indexed() < failure[0]:
+            raise failure[1]
 
     def sync_knowledge(self, knowledge: KnowledgeReader, touched: Collection[str] | None = None) -> None:
         """Make the knowledge vectors follow the knowledge base, for the ids in
@@ -162,6 +174,8 @@ class Index:
         vector. One short transaction writes them, and writes a vector only
         if the item's passage is still the one that was embedded: if another
         process changed the item meanwhile, its own sync writes the right one."""
+        # Reads every stored digest (and, in full, every vector id): O(knowledge
+        # base) per call. A per-id lookup on the port would avoid it.
         stored = self._backend.knowledge_digests()
         if touched is None:
             items = list(knowledge.all())
@@ -192,6 +206,17 @@ class Index:
 
     # ── internals ───────────────────────────────────────────────────────────
 
+    def _read_position(self) -> tuple[int, int]:
+        """(generation, position) of the stored index, the generation read
+        first: a rebuild after that read changes the generation, so a write
+        checked against it conflicts. Raises IndexConfigChanged if the index
+        holds another config than this Index's (a rebuild by another process
+        with another model or threshold): its generation is not ours to write."""
+        generation = self._backend.generation()
+        if self.stale():
+            raise IndexConfigChanged(f"the index was built for {self._backend.meta()}, not {self.want()}")
+        return generation, self._backend.indexed()
+
     def _pending(self, events: EventStore, after: int, upto: int) -> Iterable[tuple[int, Event]]:
         for seq, event in events.since(after):
             if seq > upto:
@@ -217,14 +242,25 @@ class Index:
         """Embed the passages the cache lacks, at most WARM_BATCH per embed
         call, with no transaction open, and cache each batch in its own short
         transaction. An EmbeddingError keeps the batches cached before it."""
+        failed = self._cache_batches(texts)
+        if failed is not None:
+            raise failed[1]
+
+    def _cache_batches(self, texts: Iterable[str]) -> tuple[list[str], EmbeddingError] | None:
+        """_cache_passages, but a failed batch is returned with its error
+        instead of raised: (its uncached texts, the error), else None."""
         model = self._embedder.model
         todo = [t for t in dict.fromkeys(texts) if self._backend.cached(model, text_digest(t)) is None]
         for i in range(0, len(todo), WARM_BATCH):
             chunk = todo[i : i + WARM_BATCH]
-            vectors = self._embed(chunk, "passage")
+            try:
+                vectors = self._embed(chunk, "passage")
+            except EmbeddingError as exc:
+                return chunk, exc
             with self._transaction():
                 for text, vector in zip(chunk, vectors, strict=True):
                     self._backend.cache(model, text_digest(text), vector)
+        return None
 
     def _first_failure(self, texts: list[str]) -> tuple[str, EmbeddingError] | None:
         """Embed and cache the uncached texts one at a time, in order; the first
