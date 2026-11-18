@@ -376,7 +376,7 @@ def get_service() -> Service:
                 os.environ.get("CORTEX_RECORD_SCOPE", "personal"), os.environ.get("CORTEX_REPO_SCOPES", "")
             ),
             max_failures=_max_failures(),
-            index=None if embedder is None else Index(db.vectors, embedder, threshold),
+            index=None if embedder is None else Index(db.vectors, embedder, threshold, transaction=db.transaction),
         )
     return _service
 

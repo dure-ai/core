@@ -75,7 +75,7 @@ def ev(i, text):
 
 
 def runtime(db, embedder):
-    index = Index(db.vectors, embedder, 0.9)
+    index = Index(db.vectors, embedder, 0.9, transaction=db.transaction)
     return Runtime(CountEngine(), db.events, db.knowledge, db.state("count"), db.transaction, index=index)
 
 

@@ -417,8 +417,8 @@ def test_each_delivery_runs_in_its_own_transaction():
     rt.events.append(ev("e2"))
     rt.sync()
 
-    # two deliveries, then one more transaction that finds nothing to deliver
-    assert log == ["begin", "commit", "begin", "commit", "begin", "commit"]
+    # two deliveries; finding nothing more to deliver is a read without a transaction
+    assert log == ["begin", "commit", "begin", "commit"]
 
 
 def test_event_delivered_by_another_process_is_not_applied_twice():

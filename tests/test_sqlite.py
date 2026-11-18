@@ -215,7 +215,7 @@ def test_schema_4_file_drops_its_float64_vectors_and_cache_and_reembeds(tmp_path
             return []
 
     emb = Counting()
-    index = Index(db.vectors, emb, 0.9)
+    index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
     rt = Runtime(Quiet(), db.events, db.knowledge, db.state("probe"), db.transaction, index=index)
     rt.sync()
 

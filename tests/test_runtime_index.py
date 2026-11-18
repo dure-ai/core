@@ -1,6 +1,8 @@
-"""The runtime with an embedding index: each event is indexed in the same
-transaction before it is delivered, engines read similarity through
-ctx.similar, and a changed index version replays the engine (spec §7)."""
+"""The runtime with an embedding index: each event is indexed before its
+delivery transaction (the embedder never runs inside a write transaction),
+engines read similarity through ctx.similar, knowledge vectors follow the
+knowledge base after each decision commits, and a changed index version
+replays the engine (spec §7)."""
 
 import sqlite3
 import threading
@@ -8,6 +10,7 @@ import time
 from datetime import UTC, datetime
 
 import pytest
+from spy import SpyEmbedder, TxnSpy
 
 from cortex_mem.contract import (
     Caller,
@@ -123,9 +126,11 @@ def make_db(kind, tmp_path):
 
 
 def runtime(engine, db, embedder=None, threshold=0.9, max_failures=None, with_index=True, name="probe"):
-    index = Index(db.vectors, embedder or HashEmbedder(), threshold) if with_index else None
+    transaction = getattr(embedder, "spy", None)
+    transaction = db.transaction if transaction is None else transaction.transaction
+    index = Index(db.vectors, embedder or HashEmbedder(), threshold, transaction=transaction) if with_index else None
     return Runtime(
-        engine, db.events, db.knowledge, db.state(name), db.transaction, max_failures, index=index
+        engine, db.events, db.knowledge, db.state(name), transaction, max_failures, index=index
     )
 
 
@@ -257,7 +262,7 @@ def test_embedding_failure_delivers_nothing_and_retries(store, tmp_path):
 
 
 @pytest.mark.parametrize("store", ["memory", "sqlite"])
-def test_promoted_item_embedding_failure_commits_nothing_and_retries(store, tmp_path):
+def test_promotion_commits_even_if_its_embedding_fails(store, tmp_path):
     db = make_db(store, tmp_path)
     emb = FailingEmbedder({"deploy\nboom item"})  # the promoted item's passage, not the event
     engine = ProbeEngine(
@@ -269,30 +274,68 @@ def test_promoted_item_embedding_failure_commits_nothing_and_retries(store, tmp_
     rt = runtime(engine, db, emb, max_failures=1)
     rt.append(ev("e1", "fine"))
 
-    def observed():
-        return (
-            rt.state.cursor(),
-            rt.state.get("n"),
-            [i.id for i in db.knowledge.all()],
-            list(db.vectors.vectors("knowledge")),
-            [(type(v.decision).__name__, v.accepted) for v in rt.verdicts],
-        )
-
-    before = observed()
     with pytest.raises(EmbeddingError):
         rt.append(ev("e2", "fine too"))
-    with pytest.raises(EmbeddingError):  # not counted toward max_failures
-        rt.sync()
-    assert observed() == before
-    assert rt.skipped == []
 
-    emb.fail_on.clear()
-    assert rt.sync() == 1
+    # The decision is not held back by its embedding: the event is delivered and the item promoted.
     assert (rt.state.cursor(), rt.state.get("n")) == (2, 2)
     assert [i.id for i in db.knowledge.all()] == ["k1", "k2"]
-    assert db.vectors.vector("knowledge", "k2") is not None
-    assert [v.accepted for v in rt.verdicts] == [True, True]
+    assert [(type(v.decision).__name__, v.accepted) for v in rt.verdicts] == [("Promote", True)] * 2
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1"]
+    with pytest.raises(EmbeddingError):  # still down: the pending item is tried first, and raised
+        rt.sync()
+    assert engine.seen == ["e1", "e2"]
     assert rt.skipped == []
+
+    emb.fail_on.clear()  # the embedder recovers
+    assert rt.sync() == 0
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1", "k2"]
+    assert engine.seen == ["e1", "e2"]
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_first_sync_reconciles_all_knowledge(store, tmp_path):
+    db = make_db(store, tmp_path)
+    runtime(ProbeEngine(), db).sync()  # the index is built
+    # A process promoted these and died before it embedded them.
+    db.knowledge.put(item("k1", ("e1",), body="lost one"))
+    db.knowledge.put(item("k2", ("e1",), body="lost two"))
+    db.vectors.put_vector("knowledge", "gone", [1.0] * 256, "stale")  # demoted meanwhile
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["gone"]
+
+    emb = CountingEmbedder()
+    rt = runtime(ProbeEngine(), db, emb)
+    rt.sync()
+
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1", "k2"]
+    assert sorted(t for t, _ in emb.calls) == ["deploy\nlost one", "deploy\nlost two"]
+    # Only the first sync compares everything; later ones look at what they changed.
+    db.knowledge.put(item("k3", ("e1",), body="lost three"))
+    rt.sync()
+    assert db.vectors.vector("knowledge", "k3") is None
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_the_runtime_never_embeds_inside_a_write_transaction(store, tmp_path):
+    db = make_db(store, tmp_path)
+    emb = SpyEmbedder(TxnSpy(db))
+    engine = ProbeEngine(
+        decisions={"e1": [Promote(item("k1", ("e1",)))], "e3": [Demote("k1", "failed", ("e3",))]},
+        on_tick=[Promote(item("k2", ("e2",), body="tick item"))],
+    )
+    rt = runtime(engine, db, emb)
+    rt.append(ev("e1"))
+    rt.append(ev("e2", "payments need vendor v2"))
+    db.events.append(ev("e5", "appended by another process"))
+    rt.append(ev("e3", "deploy tags broke", kind="outcome", outcome="failure", refs=("k1",)))
+    rt.tick(T0)
+    # A new threshold rebuilds the index and replays the engine.
+    runtime(ProbeEngine(), db, SpyEmbedder(TxnSpy(db)), threshold=0.5).sync()
+    rt.sync()
+
+    assert emb.calls and emb.inside == []
+    assert engine.seen[:4] == ["e1", "e2", "e5", "e3"]
+    assert db.vectors.vector("knowledge", "k2") is not None
 
 
 # ── index version ───────────────────────────────────────────────────────────
@@ -475,7 +518,7 @@ def test_another_connection_can_append_while_core_embeds(phase, tmp_path):
     assert "x1" in engine.seen
 
 
-def test_a_failing_text_in_a_warm_batch_stops_only_its_own_event():
+def test_a_failing_text_in_a_batch_stops_only_its_own_event():
     db = InMemoryDatabase()
     emb = FailingEmbedder({"boom"})  # fails any batch that contains it
     engine = ProbeEngine()

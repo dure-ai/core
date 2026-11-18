@@ -2,11 +2,18 @@
 similar records within one (scope, owner) cell, keeps knowledge vectors, and
 hands engines a read-only SimilarityReader (design: core embedding §6).
 
+Indexing is a step of its own with its own position (indexed()), run before
+an event's delivery and never inside a write transaction (design: delivery
+outside the transaction §3.2-3.3). The embedder and the similarity reads run
+with no transaction open; each write is a short transaction that first checks
+the position and the index generation it read, so two processes indexing at
+once write each event once.
+
 Determinism: the same event order, the same vectors and the same threshold
 give the same groups and the same search results. Ties go to append order
 for events and id order for knowledge. The scores themselves are computed
 by the VectorBackend (contract §5); this module embeds, caches, picks the
-group and keeps the cursor.
+group and keeps the position.
 """
 
 from collections.abc import Callable, Collection, Iterable
@@ -25,19 +32,10 @@ from .contract import (
     SimilarityReader,
 )
 from .embed import Embedder, EmbeddingError, EmbedKind, text_digest
-from .store.base import EventStore, VectorBackend
+from .store.base import CursorConflict, EventStore, VectorBackend
 
 _QUERY_CACHE_SIZE = 256
-WARM_BATCH = 64  # texts per embed call when warming the cache
-
-
-class PassageNotCached(Exception):
-    """catch_up(embed=False) or rebuild(embed=False) needed a passage that is
-    not in the cache. The caller warms `text` outside its lock and retries."""
-
-    def __init__(self, text: str) -> None:
-        super().__init__("a passage is not in the embedding cache")
-        self.text = text
+WARM_BATCH = 64  # texts per embed call when filling the cache
 
 
 def _embedded(event: Event) -> bool:
@@ -50,13 +48,25 @@ def _passage(item: Knowledge) -> str:
 
 
 class Index:
-    """Writes vectors and groups through a VectorBackend. Every call that
-    writes runs inside the runtime's transaction()."""
+    """Writes vectors and groups through a VectorBackend.
 
-    def __init__(self, backend: VectorBackend, embedder: Embedder, group_threshold: float) -> None:
+    `transaction` opens one write transaction across the stores (a durable
+    Database passes its db.transaction; the in-memory default needs none).
+    advance, sync_knowledge and ensure_current must be called with no write
+    transaction open: they embed first, with none open, and then write in
+    short transactions of their own. The embedder never runs inside one."""
+
+    def __init__(
+        self,
+        backend: VectorBackend,
+        embedder: Embedder,
+        group_threshold: float,
+        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
+    ) -> None:
         self._backend = backend
         self._embedder = embedder
         self._threshold = group_threshold
+        self._transaction = transaction
         # Query vectors live only in this process, never in the backend.
         self._queries: dict[str, list[float]] = {}
 
@@ -73,84 +83,103 @@ class Index:
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
 
-    def rebuild(self, knowledge: KnowledgeReader, embed: bool = True) -> None:
-        """Start over: drop vectors, groups and the cursor, then store every
-        knowledge item's vector again. Every vector is found first (the cache
-        makes that free for the same model), so a failure resets nothing and
-        the index stays stale. With embed=False a cache miss raises
-        PassageNotCached instead of calling the embedder."""
-        vectors = [(item.id, self._passage_vector(_passage(item), embed)) for item in knowledge.all()]
-        self._backend.reset(self.want())
-        for id, vector in vectors:
-            self._backend.put_vector("knowledge", id, vector)
+    def indexed(self) -> int:
+        """Position of the last event indexed (0 = none)."""
+        return self._backend.indexed()
 
-    def catch_up(self, events: EventStore, upto: int, embed: bool = True) -> None:
-        """Index every event after backend.indexed() up to and including upto.
-        An EmbeddingError leaves no trace of the event that failed. With
-        embed=False the embedder is never called: a passage missing from the
-        cache raises PassageNotCached, also before that event is written."""
-        for seq, event in events.since(self._backend.indexed()):
-            if seq > upto:
+    def ensure_current(self, knowledge: KnowledgeReader) -> bool:
+        """Rebuild the index when it is stale: drop vectors, groups and the
+        position, add 1 to the generation, and store every knowledge item's
+        vector again. True when this call rebuilt it; False when it was current
+        (or another process rebuilt it first). Every passage is embedded
+        before the one short write transaction (the cache makes that free for
+        the same model), so an EmbeddingError changes nothing but the cache
+        and the index stays stale."""
+        if not self.stale():
+            return False
+        items = list(knowledge.all())
+        vectors = self._knowledge_vectors(items)
+        with self._transaction():
+            if not self.stale():
+                return False  # another process rebuilt it meanwhile
+            self._backend.reset(self.want())
+            self._put_knowledge(knowledge, vectors)
+        return True
+
+    def advance(self, events: EventStore, upto: int) -> None:
+        """Index every event after indexed() up to and including upto.
+
+        The passages missing from the cache are embedded first, in batches of
+        at most WARM_BATCH, with no transaction open (an EmbeddingError is
+        raised before any event is written). Then each event in order: its
+        group is found outside any transaction, and one short transaction
+        moves the position from seq - 1 to seq, checked against the generation
+        read at the start, before it writes the vector and the group. When
+        another process moved the position first (CursorConflict), the
+        position and generation are read again and the pass goes on from
+        there, with the cache it filled. If a batch fails, its texts are
+        embedded one at a time: the events before the first text that cannot
+        be embedded are indexed, and then its EmbeddingError is raised."""
+        position, generation = self._backend.indexed(), self._backend.generation()
+        failure: EmbeddingError | None = None
+        while upto > position:
+            try:
+                self._cache_passages(
+                    event.text for seq, event in self._pending(events, position, upto) if _embedded(event)
+                )
+            except EmbeddingError as exc:
+                # One text in the batch failed: find it, one text at a time, and
+                # index only the events before the first one that needs it.
+                found = self._first_failure(
+                    [event.text for seq, event in self._pending(events, position, upto) if _embedded(event)]
+                )
+                failure = found[1] if found is not None else exc
+                if found is not None:
+                    upto = next(
+                        seq - 1
+                        for seq, event in self._pending(events, position, upto)
+                        if _embedded(event) and event.text == found[0]
+                    )
+                continue
+            try:
+                for seq, event in self._pending(events, position, upto):
+                    self._index_event(seq, event, generation)
+                    position = seq
                 break
-            if _embedded(event):
-                # Embed and group first, write after: a failure writes nothing.
-                vector = self._passage_vector(event.text, embed)
-                scope, owner = event.scope, owner_for(event)
-                group_id = self._group_for(vector, scope, owner, event.id, seq)
-                self._backend.put_vector("event", event.id, vector)
-                self._backend.put_group(event.id, group_id, scope, owner, seq)
-            self._backend.set_indexed(seq - 1, seq, self._backend.generation())
-            if seq >= upto:
-                break
+            except CursorConflict:
+                now = self._backend.indexed(), self._backend.generation()
+                if now == (position, generation):
+                    raise  # the position did not move: nothing explains the conflict
+                position, generation = now
+        if failure is not None:
+            raise failure
 
-    def pending_passages(self, events: EventStore, upto: int | None = None) -> list[str]:
-        """Distinct texts of the embeddable events after backend.indexed()
-        (up to and including upto, if given), in append order."""
-        texts: dict[str, None] = {}
-        for seq, event in events.since(self._backend.indexed()):
-            if upto is not None and seq > upto:
-                break
-            if _embedded(event):
-                texts[event.text] = None
-        return list(texts)
-
-    def warm(
-        self,
-        texts: Iterable[str],
-        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> None:
-        """Embed the passages the cache lacks, at most WARM_BATCH per embed
-        call, and cache each batch in its own short transaction(). Writes
-        nothing else, so a caller runs it without holding its write lock and
-        the locked catch_up or rebuild then reads the cache. An EmbeddingError
-        keeps the batches cached before it."""
-        model = self._embedder.model
-        todo = [t for t in dict.fromkeys(texts) if self._backend.cached(model, text_digest(t)) is None]
-        for i in range(0, len(todo), WARM_BATCH):
-            chunk = todo[i : i + WARM_BATCH]
-            vectors = self._embed(chunk, "passage")
-            with transaction():
-                for text, vector in zip(chunk, vectors, strict=True):
-                    self._backend.cache(model, text_digest(text), vector)
-
-    def warm_knowledge(
-        self,
-        items: Iterable[Knowledge],
-        transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> None:
-        """warm() for knowledge passages, ahead of a rebuild."""
-        self.warm([_passage(item) for item in items], transaction)
-
-    def prepare_knowledge(self, item: Knowledge) -> None:
-        """Embed and cache an item's passage without writing its vector, so a
-        caller can fail before any write; put_knowledge then hits the cache."""
-        self._passage_vector(_passage(item))
-
-    def put_knowledge(self, item: Knowledge) -> None:
-        self._backend.put_vector("knowledge", item.id, self._passage_vector(_passage(item)))
-
-    def remove_knowledge(self, id: str) -> None:
-        self._backend.delete_vectors("knowledge", [id])
+    def sync_knowledge(self, knowledge: KnowledgeReader, touched: Collection[str] | None = None) -> None:
+        """Make the knowledge vectors follow the knowledge base, for the ids in
+        `touched` (None: every item, and every stored vector). An item whose
+        stored digest differs from its passage's is embedded with no
+        transaction open; an id no longer in the knowledge base loses its
+        vector. One short transaction writes them, and writes a vector only
+        if the item's passage is still the one that was embedded: if another
+        process changed the item meanwhile, its own sync writes the right one."""
+        stored = self._backend.knowledge_digests()
+        if touched is None:
+            items = list(knowledge.all())
+            # Ids of every stored vector: one without a digest is removed too.
+            held = set(stored) | {id for id, _ in self._backend.vectors("knowledge")}
+            gone = held - {item.id for item in items}
+        else:
+            items = knowledge.get(list(dict.fromkeys(touched)))
+            gone = set(touched) - {item.id for item in items}
+        changed = [item for item in items if stored.get(item.id) != text_digest(_passage(item))]
+        if not changed and not gone:
+            return
+        vectors = self._knowledge_vectors(changed)
+        with self._transaction():
+            still_gone = gone - {item.id for item in knowledge.get(list(gone))} if gone else set()
+            if still_gone:
+                self._backend.delete_vectors("knowledge", sorted(still_gone))
+            self._put_knowledge(knowledge, vectors)
 
     def reader(
         self, events: EventReader, knowledge: KnowledgeReader, upto: int | None = None
@@ -163,13 +192,73 @@ class Index:
 
     # ── internals ───────────────────────────────────────────────────────────
 
-    def _passage_vector(self, text: str, embed: bool = True) -> list[float]:
+    def _pending(self, events: EventStore, after: int, upto: int) -> Iterable[tuple[int, Event]]:
+        for seq, event in events.since(after):
+            if seq > upto:
+                return
+            yield seq, event
+
+    def _index_event(self, seq: int, event: Event, generation: int) -> None:
+        if not _embedded(event):
+            with self._transaction():
+                self._backend.set_indexed(seq - 1, seq, generation)
+            return
+        # Read outside the transaction: events up to seq - 1 are grouped for
+        # good within this generation, which set_indexed checks below.
+        vector = self._passage_vector(event.text)
+        scope, owner = event.scope, owner_for(event)
+        group_id = self._group_for(vector, scope, owner, event.id, seq)
+        with self._transaction():
+            self._backend.set_indexed(seq - 1, seq, generation)  # first: a conflict writes nothing
+            self._backend.put_vector("event", event.id, vector)
+            self._backend.put_group(event.id, group_id, scope, owner, seq)
+
+    def _cache_passages(self, texts: Iterable[str]) -> None:
+        """Embed the passages the cache lacks, at most WARM_BATCH per embed
+        call, with no transaction open, and cache each batch in its own short
+        transaction. An EmbeddingError keeps the batches cached before it."""
+        model = self._embedder.model
+        todo = [t for t in dict.fromkeys(texts) if self._backend.cached(model, text_digest(t)) is None]
+        for i in range(0, len(todo), WARM_BATCH):
+            chunk = todo[i : i + WARM_BATCH]
+            vectors = self._embed(chunk, "passage")
+            with self._transaction():
+                for text, vector in zip(chunk, vectors, strict=True):
+                    self._backend.cache(model, text_digest(text), vector)
+
+    def _first_failure(self, texts: list[str]) -> tuple[str, EmbeddingError] | None:
+        """Embed and cache the uncached texts one at a time, in order; the first
+        that fails, with its error (None if every one succeeds now)."""
+        for text in dict.fromkeys(texts):
+            try:
+                self._cache_passages([text])
+            except EmbeddingError as exc:
+                return text, exc
+        return None
+
+    def _knowledge_vectors(self, items: list[Knowledge]) -> dict[str, tuple[str, list[float]]]:
+        """id -> (passage digest, vector), embedding what the cache lacks."""
+        self._cache_passages(_passage(item) for item in items)
+        return {
+            item.id: (text_digest(_passage(item)), self._passage_vector(_passage(item))) for item in items
+        }
+
+    def _put_knowledge(self, knowledge: KnowledgeReader, vectors: dict[str, tuple[str, list[float]]]) -> None:
+        """Inside a write transaction: store each vector whose item still has
+        the passage it was made from."""
+        current = {item.id: item for item in knowledge.get(list(vectors))} if vectors else {}
+        for id, (digest, vector) in vectors.items():
+            item = current.get(id)
+            if item is not None and text_digest(_passage(item)) == digest:
+                self._backend.put_vector("knowledge", id, vector, digest)
+
+    def _passage_vector(self, text: str) -> list[float]:
+        """From the cache, else embedded and cached. Never call it inside a
+        write transaction: on a miss it embeds."""
         model, digest = self._embedder.model, text_digest(text)
         found = self._backend.cached(model, digest)
         if found is not None:
             return found
-        if not embed:
-            raise PassageNotCached(text)
         vector = self._embed_one(text, "passage")
         self._backend.cache(model, digest, vector)
         return vector

@@ -116,7 +116,8 @@ class VectorBackend(Protocol):
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         """Move the position from `expected` to seq, atomically. Raises
         CursorConflict, writing nothing, if indexed() is not `expected` or
-        generation() is not `generation`."""
+        generation() is not `generation`. Raised inside a caller's transaction
+        on a durable store, the conflict rolls back that whole transaction."""
         ...
 
     # Vectors (kind: "event" | "knowledge")

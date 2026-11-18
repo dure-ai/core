@@ -7,7 +7,8 @@ a harness score describes what the server does.
 """
 
 import json
-from collections.abc import Callable, Iterator, Sequence
+import sys
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,7 +28,7 @@ from .contract import (
     Scope,
 )
 from .embed import EmbeddingError
-from .index import Index, PassageNotCached
+from .index import Index
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
 
 _ABSENT = object()
@@ -143,22 +144,28 @@ class Runtime:
     leaves it None so an engine failure is never hidden. Failures are counted
     per Runtime (per process), and skipped events are listed in `skipped`.
 
-    `index` turns on embeddings. Each event is indexed in its delivery
-    transaction before `observe`, and engines read the index through
-    `ctx.similar`. An embedding failure is raised and the event is not
-    delivered; it is retried next time and never counted toward
-    `max_failures`. None (the default) leaves `ctx.similar` None.
+    `index` turns on embeddings. Engines read the index through
+    `ctx.similar`; None (the default) leaves `ctx.similar` None. Indexing is a
+    step of its own that runs before each delivery transaction, never inside
+    one: the index embeds with no write transaction open and writes in short
+    transactions of its own, so a slow embedding API never holds a durable
+    store's write lock. An event is delivered only once the index has reached
+    it. An embedding failure is raised and the event is not delivered; it is
+    retried next time and never counted toward `max_failures`.
 
-    Event and knowledge passages are embedded before the write transaction
-    (the cache is warmed in short transactions of its own), so a slow
-    embedding API never holds a durable store's write lock; the indexing
-    inside the transaction only reads the cache. There are two exceptions,
-    both embedded inside the delivery transaction while the write lock is
-    held, each call bounded by the embedder's timeout: promoted items (they
-    come out of `observe`; one call per item), and engine queries during
-    `observe` or `tick` (`ctx.similar.search` and `ctx.similar.knowledge`
-    embed an uncached query text). Engines should prefer `group` and
-    `neighbors` in `observe`; they read only the cache and never embed.
+    Knowledge vectors follow the knowledge base after a decision commits: the
+    ids that accepted Promotes and Demotes touched are synced once the
+    delivery transaction has ended. If that embedding fails the decision
+    stands, the error is raised, and the ids are tried again first on this
+    Runtime's next sync; the first sync of each Runtime (and the one after
+    the index is rebuilt) compares every knowledge item, which catches up on
+    a process that died in between.
+
+    `observe` and `tick` still run inside the delivery transaction, so an
+    engine query there (`ctx.similar.search` and `ctx.similar.knowledge`
+    embed an uncached query text) is embedded under the write lock, each call
+    bounded by the embedder's timeout. Engines should prefer `group` and
+    `neighbors` in `observe`; they read only stored vectors and never embed.
     """
 
     def __init__(
@@ -184,6 +191,8 @@ class Runtime:
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._version_checked = False
+        self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
+        self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
 
     @property
     def rejections(self) -> list[Verdict]:
@@ -212,39 +221,56 @@ class Runtime:
         each. Returns how many this call delivered. If the engine raises, that
         event stays undelivered and is retried next time, until `max_failures`
         attempts have failed; then it is skipped (see `skipped`). With an
-        index, an EmbeddingError while indexing the event is raised as is: the
-        event stays undelivered and is never skipped for it."""
+        index, each event is indexed before its delivery transaction, and an
+        EmbeddingError while indexing it (or while embedding knowledge) is
+        raised as is: the event stays undelivered and is never skipped for it."""
         self._check_state_version()
         self._check_index_version()
-        self._warm_pending()
+        self._follow_knowledge()
         delivered = 0
+        ahead = self.index is not None
         while True:
-            try:
-                outcome = self._deliver_next()
-            except PassageNotCached as miss:
-                # Appended after the warm-up, or its batch failed: embed this one
-                # text outside the lock (an EmbeddingError is raised from here,
-                # for this event) and try the event again.
-                self.index.warm([miss.text], self.transaction)  # type: ignore[union-attr]
-                continue
+            # Read without a lock: the delivery transaction reads both again.
+            cursor = self.state.cursor()
+            pending = next(iter(self.events.since(cursor)), None)
+            if pending is None:
+                return delivered
+            seq = pending[0]
+            if self.index is not None:
+                if ahead:
+                    # Index everything appended so far in a few batched embed calls.
+                    # A failure is left to the step below, so it belongs to the event
+                    # whose text failed and the events before it are still delivered.
+                    ahead = False
+                    try:
+                        self.index.advance(self.events, sys.maxsize)
+                    except EmbeddingError:
+                        pass
+                # Not the engine's failure: raised before the observe try.
+                self.index.advance(self.events, seq)
+            outcome, touched = self._deliver_next(seq)
             if outcome is None:
                 return delivered
             delivered += outcome
+            self._sync_knowledge(touched)
 
-    def _deliver_next(self) -> int | None:
-        """Deliver the next event in one transaction: 1 if delivered, 0 if not
-        (skipped, or another process was first), None if nothing is pending."""
+    def _deliver_next(self, seq: int) -> tuple[int | None, list[str]]:
+        """Deliver the next event in one transaction, if it is the one at `seq`
+        (the one indexed for it): (1, ids its accepted decisions touched) if
+        delivered, (0, []) if not (skipped, or another process moved the
+        cursor or the index first: read again), (None, []) if nothing is
+        pending."""
         try:
             with self.transaction():
                 cursor = self.state.cursor()
                 pending = next(iter(self.events.since(cursor)), None)
                 if pending is None:
-                    return None
-                seq, event = pending
-                if self.index is not None:
-                    # Outside the observe try: an embedding failure is not the engine's.
-                    # Cache only: embedding here would hold the write lock.
-                    self.index.catch_up(self.events, seq, embed=False)
+                    return None, []
+                if pending[0] != seq:
+                    return 0, []  # another process delivered meanwhile
+                if self.index is not None and self.index.indexed() < seq:
+                    return 0, []  # another process rebuilt the index meanwhile: index again first
+                event = pending[1]
                 staged = self._staged()
                 try:
                     decisions = self.engine.observe(event, self._ctx(staged, seq))
@@ -256,14 +282,14 @@ class Runtime:
                     # after a failed statement PostgreSQL accepts nothing more in it.
                     raise _Skip(cursor, seq, event.id, attempts, exc) from exc
                 try:
-                    self._commit(decisions, staged, cursor, seq, event.at)
+                    touched = self._commit(decisions, staged, cursor, seq, event.at)
                 except CursorConflict:
-                    return 0  # another process delivered it first; read the cursor again
+                    return 0, []  # another process delivered it first; read the cursor again
                 self._failures.pop(seq, None)
         except _Skip as skip:
             self._skip(skip)
-            return 0
-        return 1
+            return 0, []
+        return 1, touched
 
     def _skip(self, skip: "_Skip") -> None:
         """Move the cursor past a given-up event in a new transaction, with none
@@ -271,13 +297,9 @@ class Runtime:
         else in the failed transaction is committed by this one. The event is
         reported in `skipped` only once this has committed; if it fails, the
         error is raised and the event is given up again on the next attempt.
-        The rollback also undid the event's indexing, so it is indexed again
-        here (from the cache, as in delivery): the index and the engine's
-        cursor move together."""
+        The index is not touched: it reached this event before delivery."""
         try:
             with self.transaction():
-                if self.index is not None:
-                    self.index.catch_up(self.events, skip.seq, embed=False)
                 self.state.commit(skip.cursor, skip.seq, {}, set())
         except CursorConflict:
             self._failures.pop(skip.seq, None)  # another process moved on first
@@ -286,17 +308,32 @@ class Runtime:
         error = f"{type(skip.error).__name__}: {skip.error}"
         self.skipped.append(Skipped(skip.seq, skip.event_id, skip.attempts, error))
 
-    def _warm_pending(self) -> None:
-        """Embed every passage the index still has to add, in batches, before
-        any delivery transaction. A failure is left to the delivery loop,
-        which embeds the missing text of the event it is on by itself, so the
-        error belongs to that event and earlier ones are still delivered."""
-        if self.index is None:
+    def _sync_knowledge(self, touched: Collection[str]) -> None:
+        """After a commit, outside its transaction: let the knowledge vectors
+        follow the ids the decisions touched. On an EmbeddingError the
+        decisions stand; the ids wait for this Runtime's next sync."""
+        if self.index is None or not touched:
             return
         try:
-            self.index.warm(self.index.pending_passages(self.events), self.transaction)
+            self.index.sync_knowledge(self.knowledge, touched)
         except EmbeddingError:
-            pass
+            self._pending_knowledge.update(touched)
+            raise
+
+    def _follow_knowledge(self) -> None:
+        """At the start of a sync: compare every knowledge item on this
+        Runtime's first sync (and after a rebuild), else retry the ids whose
+        embedding failed. An EmbeddingError is raised."""
+        if self.index is None:
+            return
+        if not self._knowledge_reconciled:
+            self.index.sync_knowledge(self.knowledge, None)
+            self._knowledge_reconciled = True
+            self._pending_knowledge.clear()
+        elif self._pending_knowledge:
+            ids = set(self._pending_knowledge)
+            self.index.sync_knowledge(self.knowledge, ids)
+            self._pending_knowledge -= ids
 
     def _give_up(self, seq: int) -> int | None:
         """Count a failed attempt; the attempt count when the event is to be
@@ -323,36 +360,27 @@ class Runtime:
         """Runs on every sync. The index version (model, threshold) is one per
         store, but each engine's state was built on the version it saw. So:
         when the stored index has another version than this Index wants (or
-        none), rebuild it; and when this engine's state was built on another
+        none), rebuild it (Index.ensure_current, outside any transaction of
+        this Runtime); and when this engine's state was built on another
         version than the current one, or the index was just rebuilt (it starts
         again at position 0, behind this engine's cursor), reset the state and
         deliver from the start, as a changed state_version does. The state
-        keeps its version: the engine's, else the stored one. Knowledge
-        passages are embedded before the transaction; the rebuild inside it
-        only reads the cache."""
+        keeps its version: the engine's, else the stored one."""
         if self.index is None:
             return
-        while True:
-            stale = self.index.stale()
-            if not stale and self.state.get(INDEX_STATE_KEY) == self.index.want():
-                return  # two reads: the common case takes no lock
-            if stale:
-                self.index.warm_knowledge(self.knowledge.all(), self.transaction)
-            try:
-                with self.transaction():
-                    rebuilt = self.index.stale()
-                    if rebuilt:
-                        self.index.rebuild(self.knowledge, embed=False)
-                    current = self.index.want()  # what the store holds now
-                    if rebuilt or self.state.get(INDEX_STATE_KEY) != current:
-                        version = getattr(self.engine, "state_version", None)
-                        if version is None:
-                            version = self.state.version()
-                        self.state.reset("" if version is None else version)
-                        self.state.commit(0, 0, {INDEX_STATE_KEY: current}, set())
-            except PassageNotCached:
-                continue  # an item promoted meanwhile; warm again
-            return
+        if not self.index.stale() and self.state.get(INDEX_STATE_KEY) == self.index.want():
+            return  # two reads: the common case takes no lock
+        rebuilt = self.index.ensure_current(self.knowledge)
+        if rebuilt:
+            self._knowledge_reconciled = False  # compare every item again on this sync
+        with self.transaction():
+            current = self.index.want()  # what the store holds now
+            if rebuilt or self.state.get(INDEX_STATE_KEY) != current:
+                version = getattr(self.engine, "state_version", None)
+                if version is None:
+                    version = self.state.version()
+                self.state.reset("" if version is None else version)
+                self.state.commit(0, 0, {INDEX_STATE_KEY: current}, set())
 
     def tick(self, now: datetime) -> None:
         self.sync()
@@ -361,9 +389,10 @@ class Runtime:
             staged = self._staged()
             decisions = self.engine.tick(now, self._ctx(staged, cursor))
             try:
-                self._commit(decisions, staged, cursor, cursor, now)
+                touched = self._commit(decisions, staged, cursor, cursor, now)
             except CursorConflict:
                 return  # events arrived meanwhile; the next tick sees them
+        self._sync_knowledge(touched)
 
     def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
         self.sync()
@@ -395,7 +424,10 @@ class Runtime:
         expected: int,
         cursor: int,
         at: datetime,
-    ) -> None:
+    ) -> list[str]:
+        """Inside the delivery transaction: check the decisions, commit the
+        engine's state and cursor, apply the accepted decisions. Returns the
+        knowledge ids they touched, for the index to follow afterwards."""
         pending: dict[str, Knowledge | None] = {}  # id -> item, or None when demoted
         accepted: list[Decision] = []
         verdicts: list[Verdict] = []
@@ -409,23 +441,14 @@ class Runtime:
                 pending[decision.item.id] = decision.item
             else:
                 pending[decision.id] = None
-        if self.index is not None:
-            # Embed before any write: an EmbeddingError then leaves nothing behind,
-            # even without rollback. Only the embedding cache may be written.
-            for decision in accepted:
-                if isinstance(decision, Promote):
-                    self.index.prepare_knowledge(decision.item)
         self.state.commit(expected, cursor, staged.writes, staged.deletes)
         self.verdicts.extend(verdicts)
         for decision in accepted:
             if isinstance(decision, Promote):
                 self.knowledge.put(decision.item)
-                if self.index is not None:
-                    self.index.put_knowledge(decision.item)
             else:
                 self.knowledge.remove(decision.id)
-                if self.index is not None:
-                    self.index.remove_knowledge(decision.id)
+        return list(pending)
 
     def _current(self, id: str, pending: dict[str, Knowledge | None]) -> Knowledge | None:
         found = pending.get(id, _ABSENT)
