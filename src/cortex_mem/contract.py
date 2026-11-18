@@ -14,7 +14,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, runtime_checkable
 
-CONTRACT_VERSION = "0.3.0"
+CONTRACT_VERSION = "0.4.0"
 
 Kind = Literal["record", "recall", "outcome", "human_confirm", "commit"]
 Signal = Literal["self", "test", "review", "human", "doc"]

@@ -58,22 +58,6 @@ class Skipped:
     error: str  # the last exception, as "Type: message"
 
 
-class _Skip(Exception):
-    """Raised out of the delivery transaction for an event given up on, so
-    that transaction ends (rolled back) before the skip commits in a new one."""
-
-    def __init__(
-        self, cursor: int, epoch: int, seq: int, event_id: str, attempts: int, error: Exception
-    ) -> None:
-        super().__init__(event_id)
-        self.cursor = cursor
-        self.epoch = epoch
-        self.seq = seq
-        self.event_id = event_id
-        self.attempts = attempts
-        self.error = error
-
-
 class _StagedState:
     """StateStore handed to the engine: writes stay here until the runtime commits.
 
@@ -126,8 +110,9 @@ class _StagedState:
 
 class Runtime:
     """`transaction` opens one write transaction across the stores. A durable
-    backend passes it so that delivering one event (cursor, engine state and
-    knowledge writes) is all or nothing and serialized across processes.
+    backend passes it so that committing one event's result (cursor, engine
+    state and knowledge writes) is all or nothing and serialized across
+    processes. The engine itself runs outside it (see below).
 
     `max_failures` is how many times `observe` may fail on one event before the
     runtime skips it and moves on. None (the default) never skips: the error is
@@ -138,8 +123,8 @@ class Runtime:
 
     `index` turns on embeddings. Engines read the index through
     `ctx.similar`; None (the default) leaves `ctx.similar` None. Indexing is a
-    step of its own that runs before each delivery transaction, never inside
-    one: the index embeds with no write transaction open and writes in short
+    step of its own that runs before each event is observed, never inside a
+    write transaction: the index embeds with no write transaction open and writes in short
     transactions of its own, so a slow embedding API never holds a durable
     store's write lock. An event is delivered only once the index has reached
     it. An embedding failure is raised and the event is not delivered; it is
@@ -147,17 +132,23 @@ class Runtime:
 
     Knowledge vectors follow the knowledge base after a decision commits: the
     ids that accepted Promotes and Demotes touched are synced once the
-    delivery transaction has ended. If that embedding fails the decision
+    commit transaction has ended. If that embedding fails the decision
     stands, the error is raised, and the ids are tried again first on this
     Runtime's next sync; the first sync of each Runtime (and the one after
     the index is rebuilt) compares every knowledge item, which catches up on
     a process that died in between.
 
-    `observe` and `tick` still run inside the delivery transaction, so an
-    engine query there (`ctx.similar.search` and `ctx.similar.knowledge`
-    embed an uncached query text) is embedded under the write lock, each call
-    bounded by the embedder's timeout. Engines should prefer `group` and
-    `neighbors` in `observe`; they read only stored vectors and never embed.
+    `observe` and `tick` run with no write transaction open (contract 0.4.0):
+    the engine reads the event log, its state and the index while nothing is
+    locked, and its result is committed in one short transaction that first
+    checks that nothing it read has moved: the engine's epoch and cursor
+    (a commit, a skip or a reset by any process moves the epoch), and with an
+    index, the index generation read before observe and an index position at
+    or past the event. When any of them moved, the result is dropped and the
+    event is read and observed again; nothing is written and no failure is
+    counted. So an engine may observe one event, or tick at one cursor, more
+    than once, even in two processes at once, and only one result lands. A
+    slow engine or embedder never holds a durable store's write lock.
     """
 
     def __init__(
@@ -184,6 +175,7 @@ class Runtime:
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
+        self._version_generation: int | None = None  # index generation the engine's version was checked at
 
     @property
     def rejections(self) -> list[Verdict]:
@@ -208,29 +200,34 @@ class Runtime:
         return event.id
 
     def sync(self) -> int:
-        """Deliver events appended since the cursor, in order, one transaction
-        each. Returns how many this call delivered. If the engine raises, that
-        event stays undelivered and is retried next time, until `max_failures`
-        attempts have failed; then it is skipped (see `skipped`). With an
-        index, each event is indexed before its delivery transaction, and an
-        EmbeddingError while indexing it (or while embedding knowledge) is
-        raised as is: the event stays undelivered and is never skipped for it.
-        If another process rebuilds the index with another config meanwhile,
-        it is rebuilt for this one and delivery starts again, at most
+        """Deliver events appended since the cursor, in order. Returns how many
+        this call delivered (see pending() for how many still wait). Each event
+        is read with no transaction open, observed with none open, and
+        committed in a short checked transaction (_deliver_next). If the
+        engine raises, that event stays undelivered and is retried next time,
+        until `max_failures` attempts have failed; then it is skipped (see
+        `skipped`). With an index, each event is indexed before it is
+        observed, and an EmbeddingError while indexing it (or while embedding
+        knowledge) is raised as is: the event stays undelivered and is never
+        skipped for it. If another process rebuilds the index meanwhile, the
+        engine's state is checked against the new index (and dropped when it
+        was built on another) and delivery starts again, at most
         MAX_CONFIG_RETRIES times per event; then IndexConfigChanged is raised."""
         self._check_versions()
         self._follow_knowledge()
         delivered = 0
         ahead = self.index is not None
         outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
-        retries: dict[int, int] = {}  # seq -> rebuilds after another config took the index
+        retries: dict[int, int] = {}  # seq -> rebuilds after another process took the index
         while True:
-            # Read without a lock: the delivery transaction reads both again.
+            # No transaction: the commit checks the epoch and cursor read here.
+            epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
             cursor = self.state.cursor()
             pending = next(iter(self.events.since(cursor)), None)
             if pending is None:
                 return delivered
-            seq = pending[0]
+            seq, event = pending
+            generation = None
             if self.index is not None:
                 try:
                     if ahead:
@@ -244,12 +241,18 @@ class Runtime:
                             outage = self.index.indexed(), exc
                     if outage is not None and seq > outage[0] and self.index.indexed() < seq:
                         raise outage[1]
-                    # Not the engine's failure: raised before the observe try.
+                    # Not the engine's failure: raised before observe runs.
                     self.index.advance(self.events, seq)
+                    generation = self.index.generation()
+                    if generation != self._version_generation:
+                        # Rebuilt (by any process) since the engine's version was
+                        # checked: its state was built on another index.
+                        raise IndexConfigChanged(f"the index moved to generation {generation}")
                 except IndexConfigChanged:
-                    # Another process rebuilt the index with another config. Rebuild
-                    # it for ours (a new generation: that replays this engine) and
-                    # try again, a few times: two configs on one store are not supported.
+                    # Another process rebuilt the index, maybe with another config.
+                    # Rebuild it for ours if needed (a new generation replays this
+                    # engine) and try again, a few times: two configs on one store
+                    # are not supported.
                     retries[seq] = retries.get(seq, 0) + 1
                     if retries[seq] > MAX_CONFIG_RETRIES:
                         raise
@@ -257,66 +260,83 @@ class Runtime:
                     self._follow_knowledge()
                     ahead, outage = True, None
                     continue
-            outcome, touched = self._deliver_next(seq)
-            if outcome is None:
-                return delivered
+            outcome, touched = self._deliver_next(epoch, cursor, seq, event, generation)
             delivered += outcome
             self._sync_knowledge(touched)
 
-    def _deliver_next(self, seq: int) -> tuple[int | None, list[str]]:
-        """Deliver the next event in one transaction, if it is the one at `seq`
-        (the one indexed for it): (1, ids its accepted decisions touched) if
-        delivered, (0, []) if not (skipped, or another process moved the
-        cursor or the index first: read again), (None, []) if nothing is
-        pending."""
+    def pending(self) -> int:
+        """How many events wait after the engine's cursor (read now, no lock)."""
+        return sum(1 for _ in self.events.since(self.state.cursor()))
+
+    def _deliver_next(
+        self, epoch: int, cursor: int, seq: int, event: Event, generation: int | None
+    ) -> tuple[int, list[str]]:
+        """Observe the event at `seq` with no write transaction open, then
+        commit the result in one short transaction: (1, ids its accepted
+        decisions touched) when it landed, (0, []) when it did not (skipped,
+        or something it read moved: the caller reads again and starts over).
+
+        `epoch` and `cursor` were read before the event, and `generation` (with
+        an index) after indexing it. The commit first checks that the epoch,
+        the cursor and the index generation are still those and that the index
+        has reached `seq`, and only then checks the decisions, commits the
+        engine's state and cursor (state.commit checks the epoch and cursor
+        once more, atomically, and is the one place that raises
+        CursorConflict) and applies the accepted decisions. A failure of the
+        engine is counted toward max_failures; nothing else is: a store error
+        while committing, an EmbeddingError or IndexConfigChanged is raised."""
+        staged = self._staged()
+        try:
+            # Materialized here: a generator would run engine code inside the commit.
+            decisions = list(self.engine.observe(event, self._ctx(staged, seq)))
+        except (EmbeddingError, IndexConfigChanged):
+            raise  # not the engine's failure: retried, never counted
+        except Exception as exc:
+            attempts = self._give_up(seq)
+            if attempts is None:
+                raise
+            self._skip(cursor, seq, epoch, event.id, attempts, exc)
+            return 0, []
         try:
             with self.transaction():
-                epoch = self.state.epoch()  # before the cursor and the state the engine reads
-                cursor = self.state.cursor()
-                pending = next(iter(self.events.since(cursor)), None)
-                if pending is None:
-                    return None, []
-                if pending[0] != seq:
-                    return 0, []  # another process delivered meanwhile
-                if self.index is not None and (self.index.stale() or self.index.indexed() < seq):
-                    return 0, []  # another process rebuilt the index meanwhile: index again first
-                event = pending[1]
-                staged = self._staged()
-                try:
-                    decisions = self.engine.observe(event, self._ctx(staged, seq))
-                except Exception as exc:
-                    attempts = self._give_up(seq)
-                    if attempts is None:
-                        raise
-                    # Leave the transaction by raising, so a durable store rolls it back:
-                    # after a failed statement PostgreSQL accepts nothing more in it.
-                    raise _Skip(cursor, epoch, seq, event.id, attempts, exc) from exc
-                try:
-                    touched = self._commit(decisions, staged, cursor, epoch, seq, event.at)
-                except CursorConflict:
-                    return 0, []  # another process delivered it first; read the cursor again
-                self._failures.pop(seq, None)
-        except _Skip as skip:
-            self._skip(skip)
-            return 0, []
+                if not self._unmoved(epoch, cursor, generation, seq):
+                    return 0, []
+                touched, verdicts = self._commit(decisions, staged, cursor, epoch, seq, event.at)
+        except CursorConflict:
+            return 0, []  # another process delivered, skipped or reset first; read again
+        self.verdicts.extend(verdicts)
+        self._failures.pop(seq, None)
         return 1, touched
 
-    def _skip(self, skip: "_Skip") -> None:
-        """Move the cursor past a given-up event in a new transaction, with none
-        of its writes: the engine's were staged and are dropped, and nothing
-        else in the failed transaction is committed by this one. The event is
-        reported in `skipped` only once this has committed; if it fails, the
-        error is raised and the event is given up again on the next attempt.
-        The index is not touched: it reached this event before delivery."""
+    def _unmoved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> bool:
+        """Inside the commit transaction, before anything is checked or written:
+        whether what the engine read is still current. The epoch and cursor
+        are checked again by state.commit; this read only spares the decision
+        checks of a result that is going to be dropped."""
+        if self.state.epoch() != epoch or self.state.cursor() != cursor:
+            return False
+        if self.index is None:
+            return True
+        return self.index.generation() == generation and self.index.indexed() >= seq
+
+    def _skip(self, cursor: int, seq: int, epoch: int, event_id: str, attempts: int, error: Exception) -> None:
+        """Move the cursor past a given-up event in one short transaction, with
+        none of its writes (the engine's were staged and are dropped). The
+        event is reported in `skipped` only once this has committed; if it
+        fails, the error is raised and the event is given up again on the next
+        attempt. The index is not touched: it reached this event before
+        observe ran."""
         try:
             with self.transaction():
-                self.state.commit(skip.cursor, skip.seq, {}, set(), epoch=skip.epoch)
+                self.state.commit(cursor, seq, {}, set(), epoch=epoch)
         except CursorConflict:
-            self._failures.pop(skip.seq, None)  # another process moved on first
+            # Another process delivered or skipped it, or the engine was reset.
+            # An epoch-only conflict (a tick or a reset, the event still pending)
+            # also starts the count again: correct, only slower to skip.
+            self._failures.pop(seq, None)
             return
-        self._failures.pop(skip.seq, None)
-        error = f"{type(skip.error).__name__}: {skip.error}"
-        self.skipped.append(Skipped(skip.seq, skip.event_id, skip.attempts, error))
+        self._failures.pop(seq, None)
+        self.skipped.append(Skipped(seq, event_id, attempts, f"{type(error).__name__}: {error}"))
 
     def _sync_knowledge(self, touched: Collection[str]) -> None:
         """After a commit, outside its transaction: let the knowledge vectors
@@ -359,13 +379,20 @@ class Runtime:
         an index it is the JSON of [state_version or None, index fingerprint]:
         the state records which index generation it was built on. Without
         one it is the engine's state_version, and None means nothing to check."""
+        return self._want()[0]
+
+    def _want(self) -> tuple[str | None, int | None]:
+        """(_want_version(), the index generation it names; None without an index)."""
         state_version = getattr(self.engine, "state_version", None)
         if self.index is None:
-            return state_version
-        return json.dumps([state_version, self.index.fingerprint()], sort_keys=True, separators=(",", ":"))
+            return state_version, None
+        fingerprint = self.index.fingerprint()
+        want = json.dumps([state_version, fingerprint], sort_keys=True, separators=(",", ":"))
+        return want, fingerprint["generation"]
 
     def _check_versions(self) -> None:
-        """Runs on every sync. With an index, first rebuild it if it is stale
+        """Runs on every sync, and again when the index generation moves during
+        one. With an index, first rebuild it if it is stale
         (Index.ensure_current, which embeds with no transaction open). Then,
         when the stored version differs from _want_version(), drop the
         engine's state and start delivery over, in one short transaction that
@@ -375,25 +402,41 @@ class Runtime:
         base is kept; replayed Promotes replace items with the same id."""
         if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
-        want = self._want_version()
+        want, generation = self._want()
         if want is None or self.state.version() == want:
+            self._version_generation = generation
             return  # the common case takes no lock
         with self.transaction():
-            want = self._want_version()
+            want, generation = self._want()
             if want is not None and self.state.version() != want:
                 self.state.reset(want)
+        self._version_generation = generation
 
     def tick(self, now: datetime) -> None:
+        """Deliver what is pending, then let time pass: engine.tick runs with
+        no write transaction open, on the state at the cursor, and its result
+        is committed in one short transaction with the checks of a delivery
+        (the cursor stays). If the epoch, the cursor or the index generation
+        moved meanwhile (another process delivered, ticked or reset, or the
+        index was rebuilt), the result is dropped; the next tick runs again."""
         self.sync()
-        with self.transaction():
-            epoch = self.state.epoch()
-            cursor = self.state.cursor()
-            staged = self._staged()
-            decisions = self.engine.tick(now, self._ctx(staged, cursor))
-            try:
-                touched = self._commit(decisions, staged, cursor, epoch, cursor, now)
-            except CursorConflict:
-                return  # events arrived meanwhile; the next tick sees them
+        epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
+        cursor = self.state.cursor()
+        generation = None
+        if self.index is not None:
+            generation = self.index.generation()
+            if generation != self._version_generation:
+                return  # rebuilt since sync checked the engine's version: the next sync replays
+        staged = self._staged()
+        decisions = list(self.engine.tick(now, self._ctx(staged, cursor)))
+        try:
+            with self.transaction():
+                if not self._unmoved(epoch, cursor, generation, cursor):
+                    return
+                touched, verdicts = self._commit(decisions, staged, cursor, epoch, cursor, now)
+        except CursorConflict:
+            return  # another process delivered, ticked or reset first
+        self.verdicts.extend(verdicts)
         self._sync_knowledge(touched)
 
     def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
@@ -427,10 +470,13 @@ class Runtime:
         epoch: int,
         cursor: int,
         at: datetime,
-    ) -> list[str]:
-        """Inside the delivery transaction: check the decisions, commit the
-        engine's state and cursor, apply the accepted decisions. Returns the
-        knowledge ids they touched, for the index to follow afterwards."""
+    ) -> tuple[list[str], list[Verdict]]:
+        """Inside the short commit transaction, after _unmoved: check the
+        decisions, commit the engine's state and cursor (state.commit raises
+        CursorConflict if the epoch or cursor moved), apply the accepted
+        decisions. Returns the knowledge ids they touched, for the index to
+        follow afterwards, and the verdicts, which the caller logs once the
+        transaction has committed."""
         pending: dict[str, Knowledge | None] = {}  # id -> item, or None when demoted
         accepted: list[Decision] = []
         verdicts: list[Verdict] = []
@@ -445,13 +491,12 @@ class Runtime:
             else:
                 pending[decision.id] = None
         self.state.commit(expected, cursor, staged.writes, staged.deletes, epoch=epoch)
-        self.verdicts.extend(verdicts)
         for decision in accepted:
             if isinstance(decision, Promote):
                 self.knowledge.put(decision.item)
             else:
                 self.knowledge.remove(decision.id)
-        return list(pending)
+        return list(pending), verdicts
 
     def _current(self, id: str, pending: dict[str, Knowledge | None]) -> Knowledge | None:
         found = pending.get(id, _ABSENT)

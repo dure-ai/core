@@ -11,7 +11,10 @@ DatabaseContract runs the runtime over a whole Database, so delivery
 Needs pytest; import it from tests only.
 """
 
+import threading
+import time
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -703,6 +706,52 @@ class _Counting:
         return []
 
 
+class _Blocking(_Counting):
+    """_Counting that, the first time it observes `block_on`, sets `entered`
+    and waits for `release`: a slow observe a test controls."""
+
+    def __init__(self, block_on, entered, release, state_version=None):
+        super().__init__([], state_version)
+        self.block_on, self.entered, self.release = block_on, entered, release
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if event.id == self.block_on and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10), "never released"
+        return decisions
+
+
+class _Ticking(_Counting):
+    """_Counting whose tick promotes "tick-<name>" from e1 and records itself
+    in state. `meanwhile`, if set, runs once inside the next tick."""
+
+    def __init__(self, name):
+        super().__init__([])
+        self.name = name
+        self.meanwhile = None
+
+    def tick(self, now, ctx):
+        meanwhile, self.meanwhile = self.meanwhile, None
+        if meanwhile is not None:
+            meanwhile()
+        ctx.state.put("ticked", self.name)
+        item = Knowledge(id=f"tick-{self.name}", kind="knowledge", title=self.name, body="tick",
+                         scope="personal", owner="u1", sources=("e1",))
+        return [Promote(item)]
+
+
+class _Dying(_Counting):
+    """Writes to its state, then the process dies in the middle of observe."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        raise SystemExit("killed")
+
+
 class DatabaseContract:
     """make(tmp_path) returns a zero-argument opener. Each call to it is one
     more process (connection) on the same storage.
@@ -830,6 +879,86 @@ class DatabaseContract:
         later = []
         self.runtime(open_db, _Counting(later, state_version="2")).sync()
         assert later == []
+
+    def test_a_slow_observe_does_not_block_other_writers(self, open_db):
+        """The engine runs with no write transaction open: while one process's
+        observe is stuck, another connection appends and delivers to its own
+        engine without waiting for a lock."""
+        entered, release = threading.Event(), threading.Event()
+        slow = self.runtime(open_db, _Blocking("e1", entered, release), name="slow")
+        slow.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(slow.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            seen = []
+            other = self.runtime(open_db, _Counting(seen), name="other")
+            started = time.monotonic()
+            other.append(ev("e2", "two"))  # appends, then delivers e1 and e2 to "other"
+            assert time.monotonic() - started < 2.0  # no lock wait
+            assert seen == ["e1", "e2"] and other.state.cursor() == 2
+            assert not worker.done()  # the slow observe is still stuck
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        assert worker.result() == 2
+        assert slow.state.cursor() == 2
+
+    def test_duplicate_ticks_apply_once(self, open_db):
+        """Two processes tick from the same cursor and epoch; both engines decide,
+        only the first commit lands (the epoch moved), the other is dropped."""
+        a = self.runtime(open_db, _Ticking("a"))
+        b = self.runtime(open_db, _Ticking("b"))
+        a.append(ev("e1", "one"))
+        a.engine.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
+        before = len(a.verdicts)  # e1's delivery
+
+        a.tick(T0)
+
+        assert [k.id for k in a.knowledge.all()] == ["k-e1", "tick-b"]
+        assert a.state.get("ticked") == "b" and a.state.cursor() == 1
+        assert [v.accepted for v in b.verdicts] == [True] and a.verdicts[before:] == []
+        a.tick(T0)  # the next tick runs again and lands
+        assert a.state.get("ticked") == "a"
+        assert [k.id for k in a.knowledge.all()] == ["k-e1", "tick-a", "tick-b"]
+
+    def test_stale_commit_after_a_reset_is_dropped(self, open_db):
+        """A process reads, then another resets the engine (a new state_version)
+        and delivers from the start; the first one's result is not stored under
+        the new version."""
+        entered, release = threading.Event(), threading.Event()
+        old = self.runtime(open_db, _Blocking("e1", entered, release, state_version="1"))
+        old.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(old.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            seen = []
+            new = self.runtime(open_db, _Counting(seen, state_version="2"))
+            assert new.sync() == 1  # resets (cursor back to 0), then delivers e1 again
+            assert seen == ["e1"]
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        assert worker.result() == 0  # its commit was refused; nothing left to deliver
+        state = open_db().state("engine")
+        assert state.version() == "2" and state.cursor() == 1
+        assert [k for k, _ in state.scan()] == ["2/e1"]  # nothing the old engine wrote
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1"]
+
+    def test_process_dying_during_observe_leaves_no_trace(self, open_db):
+        dying = self.runtime(open_db, _Dying())
+        dying.events.append(ev("e1", "one"))
+        with pytest.raises(SystemExit):
+            dying.sync()
+
+        db = open_db()
+        state = db.state("engine")
+        assert (state.cursor(), state.epoch(), list(state.scan()), db.knowledge.all()) == (0, 0, [], [])
+        seen = []
+        assert self.runtime(open_db, _Counting(seen)).sync() == 1
+        assert seen == ["e1"]
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1"]
 
     def test_vector_writes_roll_back_with_the_transaction(self, open_db):
         if not self.rolls_back:

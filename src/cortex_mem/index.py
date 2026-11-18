@@ -82,7 +82,7 @@ class Index:
         another store rebuilds the index."""
         return {
             "model": self._embedder.model,
-            "group_threshold": self._threshold,
+            "group_threshold": float(self._threshold),  # 1 and 1.0 name the same index
             "store": self._backend.kind,
         }
 
@@ -95,6 +95,10 @@ class Index:
 
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
+
+    def generation(self) -> int:
+        """The stored index's generation: one more after every rebuild."""
+        return self._backend.generation()
 
     def indexed(self) -> int:
         """Position of the last event indexed (0 = none)."""

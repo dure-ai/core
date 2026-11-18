@@ -1,5 +1,5 @@
-"""The runtime with an embedding index: each event is indexed before its
-delivery transaction (the embedder never runs inside a write transaction),
+"""The runtime with an embedding index: each event is indexed before it is
+observed (the embedder and the engine never run inside a write transaction),
 engines read similarity through ctx.similar, knowledge vectors follow the
 knowledge base after each decision commits, and a changed index version
 replays the engine (spec §7)."""
@@ -8,6 +8,7 @@ import json
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -973,3 +974,156 @@ def test_an_outage_sync_makes_at_most_two_failing_calls():
     assert (rt.state.cursor(), db.vectors.indexed()) == (1, 1)
     emb.fail_on.clear()
     assert rt.sync() == 2
+
+
+# ── delivery outside the write transaction ──────────────────────────────────
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_observe_never_runs_inside_a_write_transaction(store, tmp_path, request):
+    from spy import SpyEngine
+
+    db = reopener(store, tmp_path, request)()
+    spy = TxnSpy(db)
+    for with_index in (True, False):
+        engine = SpyEngine(spy, on_tick=[Promote(item("t1", ("e1",)))])
+        index = Index(db.vectors, SpyEmbedder(spy), 0.9, transaction=spy.transaction) if with_index else None
+        rt = Runtime(engine, db.events, db.knowledge, db.state(f"spy-{with_index}"), spy.transaction,
+                     max_failures=3, index=index)
+        if with_index:
+            rt.append(ev("e1"))
+            rt.append(ev("e2", "payments need vendor v2"))
+        else:
+            rt.sync()  # another engine on the same store, without an index
+        rt.tick(T0)
+        rt.handoff("deploy", caller(), "personal")
+
+        assert [m for m, _ in engine.calls] == ["observe", "observe", "tick", "handoff"]
+        assert engine.inside == []
+        assert rt.state.cursor() == 2 and {"k-e1", "k-e2", "t1"} <= {k.id for k in db.knowledge.all()}
+
+
+class Switchable(CountingEmbedder):
+    """HashEmbedder that fails every call while `down`, or only queries when `queries_down`."""
+
+    def __init__(self):
+        super().__init__()
+        self.down = False
+        self.queries_down = False
+
+    def embed(self, texts, kind):
+        if self.down or (self.queries_down and kind == "query"):
+            raise EmbeddingError("embedding backend is down")
+        return super().embed(texts, kind)
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_embedding_outage_does_not_block_appends(store, tmp_path, request):
+    db = reopener(store, tmp_path, request)()
+    emb = Switchable()
+    engine = ProbeEngine(decisions={"e1": [Promote(item("k1", ("e1",)))]})
+    rt = runtime(engine, db, emb, max_failures=1)
+    rt.sync()
+    emb.down = True
+
+    with pytest.raises(EmbeddingError):
+        rt.append(ev("e1"))
+    with pytest.raises(EmbeddingError):  # another try is not counted toward max_failures
+        rt.sync()
+
+    assert [e.id for _, e in db.events.since(0)] == ["e1"]  # the record is stored
+    assert (engine.seen, rt.state.cursor(), rt.pending(), rt.skipped, rt._failures) == ([], 0, 1, [], {})
+
+    emb.down = False
+    assert rt.sync() == 1
+    assert rt.sync() == 0  # exactly once
+    assert (engine.seen, rt.state.cursor(), rt.pending(), rt.skipped) == (["e1"], 1, 0, [])
+    assert [k.id for k in db.knowledge.all()] == ["k1"]
+
+
+def test_an_embedding_error_raised_inside_observe_is_not_counted_as_an_engine_failure():
+    db = InMemoryDatabase()
+    emb = Switchable()
+    engine = ProbeEngine(ask_knowledge=True)  # observe embeds its event's text as a query
+    rt = runtime(engine, db, emb, max_failures=1)
+    emb.queries_down = True
+
+    with pytest.raises(EmbeddingError):
+        rt.append(ev("e1"))
+
+    assert (rt.state.cursor(), rt.skipped, rt._failures) == (0, [], {})
+    emb.queries_down = False
+    assert rt.sync() == 1
+    assert engine.seen == ["e1", "e1"]
+
+
+def test_failures_stay_empty_after_an_index_config_change():
+    db = InMemoryDatabase()
+    db.events.append(ev("e1"))
+    rt = runtime(ProbeEngine(), db, max_failures=1)
+    real = rt.index.ensure_current
+
+    def ensure_then_lose(knowledge):
+        rebuilt = real(knowledge)
+        db.vectors.reset({"model": "someone-else", "group_threshold": 0.1, "store": "memory"})
+        return rebuilt
+
+    rt.index.ensure_current = ensure_then_lose
+    with pytest.raises(IndexConfigChanged):
+        rt.sync()
+    assert (rt._failures, rt.skipped, rt.state.cursor()) == ({}, [], 0)
+
+
+class BlockingProbe(ProbeEngine):
+    """ProbeEngine whose first observe of `block_on` signals `entered` and
+    waits for `release`."""
+
+    def __init__(self, block_on, **kw):
+        super().__init__(**kw)
+        self.block_on = block_on
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if event.id == self.block_on and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10), "never released"
+        return decisions
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_commit_is_refused_when_the_index_generation_changed_during_observe(store, tmp_path, request):
+    open_db = reopener(store, tmp_path, request)
+    db = open_db()
+    engine = BlockingProbe("e1", decisions={"e1": [Promote(item("k1", ("e1",)))]})
+    rt = runtime(engine, db)
+    rt.sync()  # builds the index
+    db.events.append(ev("e1"))
+    generation = db.vectors.generation()
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    worker = pool.submit(rt.sync)
+    try:
+        assert engine.entered.wait(10), "observe never started"
+        other = open_db()  # another process, another threshold: rebuilds the index
+        Index(other.vectors, HashEmbedder(), 0.5, transaction=other.transaction).ensure_current(other.knowledge)
+        assert other.vectors.generation() == generation + 1
+    finally:
+        engine.release.set()
+        pool.shutdown(wait=True)
+
+    assert worker.result() == 1
+    assert engine.seen == ["e1", "e1"]  # the first result was refused; delivered again on our index
+    assert rt.state.cursor() == 1 and rt.state.get("n") == 1  # replayed from a reset, applied once
+    assert db.vectors.meta() == rt.index.want() and db.vectors.generation() == generation + 2
+    assert json.loads(rt.state.version())[1]["generation"] == generation + 2
+    assert [k.id for k in db.knowledge.all()] == ["k1"]
+    assert db.vectors.indexed() >= rt.state.cursor()
+
+
+def test_group_threshold_one_and_one_point_zero_give_the_same_version():
+    db = InMemoryDatabase()
+    a = Index(db.vectors, HashEmbedder(), 1)
+    b = Index(db.vectors, HashEmbedder(), 1.0)
+    assert json.dumps(a.fingerprint()) == json.dumps(b.fingerprint())
+    assert json.dumps(a.want()) == json.dumps(b.want())

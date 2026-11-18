@@ -807,8 +807,14 @@ class TestPgDatabase(DatabaseContract):
 
         return opener
 
-    def test_max_failures_skips_an_event_that_fails_with_a_db_error(self, open_db):
+    def test_poison_event_with_a_db_error_is_skipped(self, open_db):
+        """observe runs outside the write transaction, so a failed statement
+        aborts no transaction: the event is counted, skipped after max_failures
+        without being indexed again, and the next event is delivered."""
         import psycopg
+
+        from cortex_mem.embed import HashEmbedder
+        from cortex_mem.index import Index
 
         db = open_db()
 
@@ -820,7 +826,7 @@ class TestPgDatabase(DatabaseContract):
                 self.seen.append(event.id)
                 ctx.state.put(event.id, True)
                 if event.id == "e1":
-                    db.query("SELECT 1/0")  # PostgreSQL aborts the delivery transaction
+                    db.query("SELECT 1/0")
                 return []
 
             def tick(self, now, ctx):
@@ -830,7 +836,9 @@ class TestPgDatabase(DatabaseContract):
                 return []
 
         engine = Poison()
-        rt = Runtime(engine, db.events, db.knowledge, db.state("poison"), db.transaction, max_failures=2)
+        index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+        rt = Runtime(engine, db.events, db.knowledge, db.state("poison"), db.transaction, max_failures=2,
+                     index=index)
 
         with pytest.raises(psycopg.errors.DivisionByZero):
             rt.append(ev("e1", "x"))
@@ -839,11 +847,14 @@ class TestPgDatabase(DatabaseContract):
         assert engine.seen == ["e1", "e1", "e2"]
         assert [(s.seq, s.event_id, s.attempts) for s in rt.skipped] == [(1, "e1", 2)]
         assert rt.skipped[0].error.startswith("DivisionByZero")
-        assert rt.state.cursor() == 2
+        assert rt.state.cursor() == 2 and rt.pending() == 0
         assert [k for k, _ in rt.state.scan()] == ["e2"]
+        assert db.vectors.indexed() >= rt.state.cursor()
+        assert rt._failures == {}
 
         later = Poison()
         other = open_db()
         Runtime(later, other.events, other.knowledge, other.state("poison"), other.transaction,
-                max_failures=2).sync()
+                max_failures=2, index=Index(other.vectors, HashEmbedder(), 0.9,
+                                            transaction=other.transaction)).sync()
         assert later.seen == []

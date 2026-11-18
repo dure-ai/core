@@ -68,6 +68,39 @@ class SpyEmbedder:
         return [c for c in self.calls if c[2]]
 
 
+class SpyEngine:
+    """Promotes each event and records, for observe, tick and handoff, whether
+    a write transaction was open while the engine ran. `on_tick` decisions are
+    returned by tick."""
+
+    def __init__(self, spy, on_tick=()):
+        self.spy = spy
+        self.on_tick = list(on_tick)
+        self.calls = []  # (method, transaction open)
+
+    def observe(self, event, ctx):
+        from cortex_mem.contract import Knowledge, Promote
+
+        self.calls.append(("observe", self.spy.open))
+        ctx.state.put(event.id, True)
+        item = Knowledge(id=f"k-{event.id}", kind="knowledge", title=event.id, body=event.text,
+                         scope=event.scope, owner=event.user, sources=(event.id,))
+        return [Promote(item)]
+
+    def tick(self, now, ctx):
+        self.calls.append(("tick", self.spy.open))
+        return list(self.on_tick)
+
+    def handoff(self, query, caller, scope, ctx, k=6):
+        self.calls.append(("handoff", self.spy.open))
+        return []
+
+    @property
+    def inside(self):
+        """The engine calls made while a write transaction was open (should be none)."""
+        return [c for c in self.calls if c[1]]
+
+
 class SpyBackend:
     """Delegates to a VectorBackend and records, for the methods named in
     `watch`, each call with whether a write transaction was open, plus a log of
