@@ -60,11 +60,26 @@ class EngineStateBackend(Protocol):
         """Position of the last event delivered to the engine (0 = none)."""
         ...
 
+    def epoch(self) -> int:
+        """Counts every commit and every reset of this engine (0 = neither yet).
+        Read it before reading what a commit is based on, and pass it to commit()."""
+        ...
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
         """Apply writes and deletes and move the cursor to `cursor`, all or
-        nothing. Raises CursorConflict if the cursor is no longer `expected`."""
+        nothing, and move the epoch on to `epoch` + 1. Raises CursorConflict,
+        writing nothing, if the cursor is no longer `expected` or the epoch is
+        no longer `epoch`: the cursor alone cannot tell two commits from the
+        same cursor apart (a tick keeps it) or a commit from before a reset
+        (which puts it back to 0)."""
         ...
 
     def version(self) -> str | None:
@@ -72,7 +87,8 @@ class EngineStateBackend(Protocol):
         ...
 
     def reset(self, version: str) -> None:
-        """Drop every key, move the cursor back to 0 and record `version`."""
+        """Drop every key, move the cursor back to 0, record `version` and
+        add 1 to the epoch."""
         ...
 
 

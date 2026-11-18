@@ -108,7 +108,8 @@ class SqliteDatabase:
                 "PRIMARY KEY (engine, key))"
             )
             self.con.execute(
-                "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
+                "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0)"
             )
             self.con.execute(
                 "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, digest TEXT, "
@@ -312,14 +313,27 @@ class SqliteStateBackend:
         rows = self.db.query("SELECT cursor FROM engine_cursor WHERE engine = ?", (self.engine,))
         return rows[0][0] if rows else 0
 
+    def epoch(self) -> int:
+        rows = self.db.query("SELECT epoch FROM engine_cursor WHERE engine = ?", (self.engine,))
+        return rows[0][0] if rows else 0
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
         encoded = {key: json.dumps(value) for key, value in writes.items()}
         with self.db.transaction():
-            current = self.cursor()
-            if current != expected:
-                raise CursorConflict(f"cursor is {current}, expected {expected}")
+            rows = self.db.query("SELECT cursor, epoch FROM engine_cursor WHERE engine = ?", (self.engine,))
+            current, current_epoch = rows[0] if rows else (0, 0)
+            if current != expected or current_epoch != epoch:
+                raise CursorConflict(
+                    f"cursor is {current} at epoch {current_epoch}, expected {expected} at epoch {epoch}"
+                )
             self.db.con.executemany(
                 "DELETE FROM engine_state WHERE engine = ? AND key = ?", [(self.engine, k) for k in deletes]
             )
@@ -329,9 +343,9 @@ class SqliteStateBackend:
                 [(self.engine, k, v) for k, v in encoded.items()],
             )
             self.db.con.execute(
-                "INSERT INTO engine_cursor (engine, cursor) VALUES (?, ?) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = excluded.cursor",
-                (self.engine, cursor),
+                "INSERT INTO engine_cursor (engine, cursor, epoch) VALUES (?, ?, ?) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = excluded.cursor, epoch = excluded.epoch",
+                (self.engine, cursor, epoch + 1),
             )
 
     def version(self) -> str | None:
@@ -342,8 +356,9 @@ class SqliteStateBackend:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM engine_state WHERE engine = ?", (self.engine,))
             self.db.con.execute(
-                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (?, 0, ?) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version",
+                "INSERT INTO engine_cursor (engine, cursor, version, epoch) VALUES (?, 0, ?, 1) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = excluded.version, "
+                "epoch = engine_cursor.epoch + 1",
                 (self.engine, version),
             )
 

@@ -133,6 +133,7 @@ class InMemoryStateBackend:
     def __init__(self) -> None:
         self._data: dict[str, str] = {}  # stored as JSON text, like a durable store
         self._cursor = 0
+        self._epoch = 0
         self._version: str | None = None
 
     def get(self, key: str) -> Any | None:
@@ -147,16 +148,28 @@ class InMemoryStateBackend:
     def cursor(self) -> int:
         return self._cursor
 
+    def epoch(self) -> int:
+        return self._epoch
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: Set[str],
+        *,
+        epoch: int,
     ) -> None:
-        if self._cursor != expected:
-            raise CursorConflict(f"cursor is {self._cursor}, expected {expected}")
+        if self._cursor != expected or self._epoch != epoch:
+            raise CursorConflict(
+                f"cursor is {self._cursor} at epoch {self._epoch}, expected {expected} at epoch {epoch}"
+            )
         encoded = {key: json.dumps(_copy(value)) for key, value in writes.items()}
         for key in deletes:
             self._data.pop(key, None)
         self._data.update(encoded)
         self._cursor = cursor
+        self._epoch += 1
 
     def version(self) -> str | None:
         return self._version
@@ -164,6 +177,7 @@ class InMemoryStateBackend:
     def reset(self, version: str) -> None:
         self._data.clear()
         self._cursor = 0
+        self._epoch += 1
         self._version = version
 
 

@@ -207,8 +207,8 @@ class EngineStateBackendContract(_Contract):
         return self.make()
 
     def test_state_commit_applies_writes_deletes_and_cursor(self, state):
-        state.commit(0, 3, {"a": 1, "b": {"x": [1, 2]}}, set())
-        state.commit(3, 5, {"c": "z"}, {"a"})
+        state.commit(0, 3, {"a": 1, "b": {"x": [1, 2]}}, set(), epoch=state.epoch())
+        state.commit(3, 5, {"c": "z"}, {"a"}, epoch=state.epoch())
 
         assert state.cursor() == 5
         assert state.get("a") is None
@@ -216,36 +216,90 @@ class EngineStateBackendContract(_Contract):
         assert list(state.scan()) == [("b", {"x": [1, 2]}), ("c", "z")]
 
     def test_state_commit_rejects_stale_cursor(self, state):
-        state.commit(0, 1, {"a": 1}, set())
+        state.commit(0, 1, {"a": 1}, set(), epoch=state.epoch())
 
         with pytest.raises(CursorConflict):
-            state.commit(0, 2, {"a": 2}, set())
+            state.commit(0, 2, {"a": 2}, set(), epoch=state.epoch())
         assert state.get("a") == 1 and state.cursor() == 1
 
     def test_state_values_are_copied(self, state):
         value = {"n": [1]}
-        state.commit(0, 0, {"k": value}, set())
+        state.commit(0, 0, {"k": value}, set(), epoch=state.epoch())
         value["n"].append(2)
         state.get("k")["n"].append(3)
 
         assert state.get("k") == {"n": [1]}
 
     def test_state_scan_filters_by_prefix(self, state):
-        state.commit(0, 0, {"cand/a": 1, "cand/b": 2, "seen/a": 3}, set())
+        state.commit(0, 0, {"cand/a": 1, "cand/b": 2, "seen/a": 3}, set(), epoch=state.epoch())
 
         assert [k for k, _ in state.scan("cand/")] == ["cand/a", "cand/b"]
 
     def test_state_rejects_non_json_values(self, state):
         with pytest.raises(TypeError):
-            state.commit(0, 0, {"k": object()}, set())
+            state.commit(0, 0, {"k": object()}, set(), epoch=state.epoch())
 
     def test_state_reset_drops_keys_and_cursor_and_records_version(self, state):
         assert state.version() is None
-        state.commit(0, 4, {"a": 1}, set())
+        state.commit(0, 4, {"a": 1}, set(), epoch=state.epoch())
 
         state.reset("2")
 
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
+
+    def test_epoch_starts_at_zero_and_commit_bumps_it(self, state):
+        assert state.epoch() == 0
+
+        state.commit(0, 1, {"a": 1}, set(), epoch=0)
+        assert state.epoch() == 1
+        state.commit(1, 1, {}, set(), epoch=1)  # a tick: the cursor stays, the epoch moves
+        assert state.epoch() == 2
+
+    def test_reset_bumps_the_epoch(self, state):
+        state.reset("1")  # no row yet: created at epoch 1
+        assert state.epoch() == 1
+
+        state.commit(0, 1, {"a": 1}, set(), epoch=1)
+        state.reset("2")
+        assert state.epoch() == 3
+
+    def test_two_commits_with_the_same_cursor_and_epoch_only_one_wins(self, state):
+        state.commit(0, 2, {"seed": 1}, set(), epoch=state.epoch())
+        cursor, epoch = state.cursor(), state.epoch()  # both ticks read this
+
+        state.commit(cursor, cursor, {"decided": "first"}, set(), epoch=epoch)
+        with pytest.raises(CursorConflict):
+            state.commit(cursor, cursor, {"decided": "second", "extra": 1}, {"seed"}, epoch=epoch)
+
+        assert state.get("decided") == "first"
+        assert state.get("extra") is None and state.get("seed") == 1
+        assert state.cursor() == cursor and state.epoch() == epoch + 1
+
+    def test_a_commit_after_a_reset_is_refused_even_if_the_cursor_matches(self, state):
+        state.reset("1")
+        cursor, epoch = state.cursor(), state.epoch()
+        assert cursor == 0
+
+        state.reset("2")  # another handle resets the engine: the cursor is 0 again
+        assert state.cursor() == cursor
+
+        with pytest.raises(CursorConflict):
+            state.commit(0, 1, {"a": 1}, set(), epoch=epoch)
+
+        assert state.get("a") is None and state.cursor() == 0
+        assert state.version() == "2" and state.epoch() == epoch + 1
+
+    def test_a_refused_commit_writes_nothing(self, state):
+        state.reset("v")
+        state.commit(0, 3, {"keep": 1, "gone": 2}, set(), epoch=state.epoch())
+        before = (list(state.scan()), state.cursor(), state.version(), state.epoch())
+
+        with pytest.raises(CursorConflict):  # wrong cursor
+            state.commit(0, 9, {"new": 1, "keep": 5}, {"gone"}, epoch=state.epoch())
+        with pytest.raises(CursorConflict):  # wrong epoch
+            state.commit(3, 9, {"new": 1, "keep": 5}, {"gone"}, epoch=state.epoch() - 1)
+
+        assert (list(state.scan()), state.cursor(), state.version(), state.epoch()) == before
 
 
 def f32(values):
@@ -671,6 +725,19 @@ class DatabaseContract:
     def runtime(open_db, engine, name="engine", max_failures=None):
         db = open_db()
         return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction, max_failures)
+
+    def test_epoch_survives_reopening(self, open_db):
+        first = open_db().state("engine")
+        first.reset("v")
+        first.commit(0, 2, {"a": 1}, set(), epoch=first.epoch())
+
+        again = open_db().state("engine")
+
+        assert (again.epoch(), again.cursor(), again.get("a")) == (2, 2, 1)
+        with pytest.raises(CursorConflict):
+            again.commit(2, 3, {}, set(), epoch=1)
+        again.commit(2, 3, {}, set(), epoch=2)
+        assert open_db().state("engine").epoch() == 3
 
     def test_two_processes_deliver_each_event_once(self, open_db):
         seen = []

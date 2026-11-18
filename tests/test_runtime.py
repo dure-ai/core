@@ -213,7 +213,7 @@ def test_skip_lost_to_another_process_is_not_reported():
 
     def first(expected, *args, **kw):
         state.commit = real_commit
-        real_commit(expected, 1, {}, set())  # another process moves past e1 first
+        real_commit(expected, 1, {}, set(), epoch=kw["epoch"])  # another process moves past e1 first
         return real_commit(expected, *args, **kw)
 
     state.commit = first
@@ -451,7 +451,7 @@ def test_runtime_looking_keys_are_ordinary_without_an_index():
             return []
 
     state = InMemoryStateBackend()
-    state.commit(0, 0, {"_runtime/index": "theirs", "_runtime/other": 2}, set())
+    state.commit(0, 0, {"_runtime/index": "theirs", "_runtime/other": 2}, set(), epoch=state.epoch())
     engine = Peeks()
     rt = runtime(engine, state=state)
     rt.append(ev("e1"))

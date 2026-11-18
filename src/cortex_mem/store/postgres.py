@@ -71,7 +71,10 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS knowledge_terms (id text, term text, tf int, PRIMARY KEY (term, id))",
     "CREATE TABLE IF NOT EXISTS knowledge_stats (id text PRIMARY KEY, len int)",
     "CREATE TABLE IF NOT EXISTS engine_state (engine text, key text, value text, PRIMARY KEY (engine, key))",
-    "CREATE TABLE IF NOT EXISTS engine_cursor (engine text PRIMARY KEY, cursor bigint, version text)",
+    (
+        "CREATE TABLE IF NOT EXISTS engine_cursor (engine text PRIMARY KEY, cursor bigint, version text, "
+        "epoch bigint NOT NULL DEFAULT 0)"
+    ),
     "CREATE TABLE IF NOT EXISTS event_vectors (event_id text PRIMARY KEY, ord bigint, emb vector)",
     (
         "CREATE TABLE IF NOT EXISTS vector_groups (event_id text PRIMARY KEY, group_id text, "
@@ -580,15 +583,28 @@ class PgStateBackend:
         rows = self.db.query("SELECT cursor FROM engine_cursor WHERE engine = %s", (self.engine,))
         return rows[0][0] if rows else 0
 
+    def epoch(self) -> int:
+        rows = self.db.query("SELECT epoch FROM engine_cursor WHERE engine = %s", (self.engine,))
+        return rows[0][0] if rows else 0
+
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
+        self,
+        expected: int,
+        cursor: int,
+        writes: Mapping[str, Any],
+        deletes: AbstractSet[str],
+        *,
+        epoch: int,
     ) -> None:
         # Serialize before any write, so a value that is not JSON leaves nothing half-written.
         encoded = [(self.engine, key, json.dumps(value)) for key, value in writes.items()]
         with self.db.transaction():
-            current = self.cursor()
-            if current != expected:
-                raise CursorConflict(f"cursor is {current}, expected {expected}")
+            rows = self.db.query("SELECT cursor, epoch FROM engine_cursor WHERE engine = %s", (self.engine,))
+            current, current_epoch = rows[0] if rows else (0, 0)
+            if current != expected or current_epoch != epoch:
+                raise CursorConflict(
+                    f"cursor is {current} at epoch {current_epoch}, expected {expected} at epoch {epoch}"
+                )
             con = self.db.con
             with con.cursor() as cur:
                 cur.executemany(
@@ -601,9 +617,9 @@ class PgStateBackend:
                     encoded,
                 )
             con.execute(
-                "INSERT INTO engine_cursor (engine, cursor) VALUES (%s, %s) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = EXCLUDED.cursor",
-                (self.engine, cursor),
+                "INSERT INTO engine_cursor (engine, cursor, epoch) VALUES (%s, %s, %s) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = EXCLUDED.cursor, epoch = EXCLUDED.epoch",
+                (self.engine, cursor, epoch + 1),
             )
 
     def version(self) -> str | None:
@@ -615,8 +631,9 @@ class PgStateBackend:
             con = self.db.con
             con.execute("DELETE FROM engine_state WHERE engine = %s", (self.engine,))
             con.execute(
-                "INSERT INTO engine_cursor (engine, cursor, version) VALUES (%s, 0, %s) "
-                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version",
+                "INSERT INTO engine_cursor (engine, cursor, version, epoch) VALUES (%s, 0, %s, 1) "
+                "ON CONFLICT (engine) DO UPDATE SET cursor = 0, version = EXCLUDED.version, "
+                "epoch = engine_cursor.epoch + 1",
                 (self.engine, version),
             )
 

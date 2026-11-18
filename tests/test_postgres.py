@@ -538,7 +538,7 @@ class TestPgState(EngineStateBackendContract):
 
     def test_values_keep_key_order(self):
         state = self.make()
-        state.commit(0, 1, {"k": {"b": 1, "a": 2}}, set())
+        state.commit(0, 1, {"k": {"b": 1, "a": 2}}, set(), epoch=state.epoch())
 
         assert list(state.get("k")) == ["b", "a"]
         (_, value), = state.scan()
@@ -547,8 +547,8 @@ class TestPgState(EngineStateBackendContract):
     def test_two_engines_do_not_share_state(self):
         db = self.open()
         a, b = db.state("a"), db.state("b")
-        a.commit(0, 2, {"k": "from a", "only-a": 1}, set())
-        b.commit(0, 5, {"k": "from b"}, set())
+        a.commit(0, 2, {"k": "from a", "only-a": 1}, set(), epoch=a.epoch())
+        b.commit(0, 5, {"k": "from b"}, set(), epoch=b.epoch())
 
         assert (a.get("k"), a.cursor()) == ("from a", 2)
         assert (b.get("k"), b.cursor()) == ("from b", 5)

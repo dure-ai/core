@@ -62,9 +62,12 @@ class _Skip(Exception):
     """Raised out of the delivery transaction for an event given up on, so
     that transaction ends (rolled back) before the skip commits in a new one."""
 
-    def __init__(self, cursor: int, seq: int, event_id: str, attempts: int, error: Exception) -> None:
+    def __init__(
+        self, cursor: int, epoch: int, seq: int, event_id: str, attempts: int, error: Exception
+    ) -> None:
         super().__init__(event_id)
         self.cursor = cursor
+        self.epoch = epoch
         self.seq = seq
         self.event_id = event_id
         self.attempts = attempts
@@ -268,6 +271,7 @@ class Runtime:
         pending."""
         try:
             with self.transaction():
+                epoch = self.state.epoch()  # before the cursor and the state the engine reads
                 cursor = self.state.cursor()
                 pending = next(iter(self.events.since(cursor)), None)
                 if pending is None:
@@ -286,9 +290,9 @@ class Runtime:
                         raise
                     # Leave the transaction by raising, so a durable store rolls it back:
                     # after a failed statement PostgreSQL accepts nothing more in it.
-                    raise _Skip(cursor, seq, event.id, attempts, exc) from exc
+                    raise _Skip(cursor, epoch, seq, event.id, attempts, exc) from exc
                 try:
-                    touched = self._commit(decisions, staged, cursor, seq, event.at)
+                    touched = self._commit(decisions, staged, cursor, epoch, seq, event.at)
                 except CursorConflict:
                     return 0, []  # another process delivered it first; read the cursor again
                 self._failures.pop(seq, None)
@@ -306,7 +310,7 @@ class Runtime:
         The index is not touched: it reached this event before delivery."""
         try:
             with self.transaction():
-                self.state.commit(skip.cursor, skip.seq, {}, set())
+                self.state.commit(skip.cursor, skip.seq, {}, set(), epoch=skip.epoch)
         except CursorConflict:
             self._failures.pop(skip.seq, None)  # another process moved on first
             return
@@ -382,11 +386,12 @@ class Runtime:
     def tick(self, now: datetime) -> None:
         self.sync()
         with self.transaction():
+            epoch = self.state.epoch()
             cursor = self.state.cursor()
             staged = self._staged()
             decisions = self.engine.tick(now, self._ctx(staged, cursor))
             try:
-                touched = self._commit(decisions, staged, cursor, cursor, now)
+                touched = self._commit(decisions, staged, cursor, epoch, cursor, now)
             except CursorConflict:
                 return  # events arrived meanwhile; the next tick sees them
         self._sync_knowledge(touched)
@@ -419,6 +424,7 @@ class Runtime:
         decisions: Sequence[Decision],
         staged: _StagedState,
         expected: int,
+        epoch: int,
         cursor: int,
         at: datetime,
     ) -> list[str]:
@@ -438,7 +444,7 @@ class Runtime:
                 pending[decision.item.id] = decision.item
             else:
                 pending[decision.id] = None
-        self.state.commit(expected, cursor, staged.writes, staged.deletes)
+        self.state.commit(expected, cursor, staged.writes, staged.deletes, epoch=epoch)
         self.verdicts.extend(verdicts)
         for decision in accepted:
             if isinstance(decision, Promote):
