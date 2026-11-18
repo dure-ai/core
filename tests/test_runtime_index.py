@@ -1127,3 +1127,69 @@ def test_group_threshold_one_and_one_point_zero_give_the_same_version():
     b = Index(db.vectors, HashEmbedder(), 1.0)
     assert json.dumps(a.fingerprint()) == json.dumps(b.fingerprint())
     assert json.dumps(a.want()) == json.dumps(b.want())
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_commit_is_refused_when_the_index_generation_moved_twice_during_observe(store, tmp_path, request):
+    """During observe another config rebuilds (g+1), ours rebuilds back (g+2)
+    and indexes past e1, and no runtime of this engine resets it: the index
+    looks as it did, only its generation says it is another. The result
+    built at g must not commit; the engine is replayed on g+2."""
+    open_db = reopener(store, tmp_path, request)
+    db = open_db()
+    engine = BlockingProbe("e1")
+    rt = runtime(engine, db)
+    rt.sync()
+    db.events.append(ev("e1"))
+    g = db.vectors.generation()
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    worker = pool.submit(rt.sync)
+    try:
+        assert engine.entered.wait(10), "observe never started"
+        other = open_db()
+        Index(other.vectors, HashEmbedder(), 0.5, transaction=other.transaction).ensure_current(other.knowledge)
+        ours = Index(other.vectors, HashEmbedder(), 0.9, transaction=other.transaction)
+        ours.ensure_current(other.knowledge)
+        ours.advance(other.events, 1)
+        assert (other.vectors.generation(), other.vectors.indexed()) == (g + 2, 1)
+    finally:
+        engine.release.set()
+        pool.shutdown(wait=True)
+
+    assert worker.result() == 1
+    assert json.loads(rt.state.version())[1]["generation"] == g + 2  # built on the current index
+    assert rt.state.cursor() == 1 and rt.state.get("n") == 1  # replayed from a reset, applied once
+    assert len(engine.seen) >= 2
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_commit_is_refused_when_the_index_fell_behind_during_observe(store, tmp_path, request):
+    """The generation stays, but another process moves the index position
+    back before e1 while it is observed: the commit is refused, e1 is
+    indexed again and observed again, and the index ends at or past the
+    engine's cursor."""
+    open_db = reopener(store, tmp_path, request)
+    db = open_db()
+    engine = BlockingProbe("e1")
+    rt = runtime(engine, db)
+    rt.sync()
+    db.events.append(ev("e1"))
+    g = db.vectors.generation()
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    worker = pool.submit(rt.sync)
+    try:
+        assert engine.entered.wait(10), "observe never started"
+        other = open_db()
+        with other.transaction():
+            other.vectors.set_indexed(1, 0, g)  # held back, same generation
+    finally:
+        engine.release.set()
+        pool.shutdown(wait=True)
+
+    assert worker.result() == 1
+    assert engine.seen == ["e1", "e1"]
+    assert db.vectors.generation() == g
+    assert db.vectors.indexed() >= rt.state.cursor() == 1
+    assert rt.state.get("n") == 1

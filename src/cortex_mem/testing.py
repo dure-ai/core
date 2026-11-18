@@ -741,6 +741,35 @@ class _Ticking(_Counting):
         return [Promote(item)]
 
 
+class _ResetWhileFailing(_Counting):
+    """state_version "1". Its first observe resets the engine through another
+    connection (same version) and then fails; later ones succeed."""
+
+    def __init__(self, open_db):
+        super().__init__([], state_version="1")
+        self.open_db = open_db
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if len(self.seen) == 1:
+            self.open_db().state("engine").reset("1")
+            raise RuntimeError("boom")
+        return decisions
+
+
+class _PerAttempt(_Counting):
+    """Promotes "k-attempt<n>" on its n-th observe."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        item = Knowledge(id=f"k-attempt{len(self.seen)}", kind="knowledge", title=event.id, body=event.text,
+                         scope="personal", owner=event.user, sources=(event.id,))
+        return [Promote(item)]
+
+
 class _Dying(_Counting):
     """Writes to its state, then the process dies in the middle of observe."""
 
@@ -945,6 +974,71 @@ class DatabaseContract:
         assert state.version() == "2" and state.cursor() == 1
         assert [k for k, _ in state.scan()] == ["2/e1"]  # nothing the old engine wrote
         assert [k.id for k in open_db().knowledge.all()] == ["k-e1"]
+
+    def test_a_restarted_delivery_does_not_commit_an_older_engine_versions_output(self, open_db):
+        """A ("1") is observing when B ("2") resets the engine's state (B's own
+        observe then fails, so B delivers nothing). A's commit is refused
+        (epoch); on its restart A must not commit its "1" output onto state
+        named "2": it checks its version again (resetting to "1") first.
+        Asserted: every stored key was written by the version the state is
+        named after, whichever version holds it."""
+        entered, release = threading.Event(), threading.Event()
+        old = self.runtime(open_db, _Blocking("e1", entered, release, state_version="1"))
+        old.events.append(ev("e1", "one"))
+        pool = ThreadPoolExecutor(max_workers=1)
+        worker = pool.submit(old.sync)
+        try:
+            assert entered.wait(10), "observe never started"
+            new = self.runtime(open_db, _Counting([], state_version="2", fail=True))
+            with pytest.raises(RuntimeError, match="boom"):
+                new.sync()  # resets the state to "2", then its observe fails
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+        worker.result()
+
+        def consistent():
+            state = open_db().state("engine")
+            keys = [k for k, _ in state.scan()]
+            assert all(k.startswith(f"{state.version()}/") for k in keys), (state.version(), keys)
+            return state.version(), keys
+
+        assert consistent() == ("1", ["1/e1"])  # A re-checked its version and delivered on its own
+        new.engine.fail = False
+        assert new.sync() == 1  # B resets again and replays
+        assert consistent() == ("2", ["2/e1"])
+
+    def test_a_skip_with_a_stale_epoch_records_nothing(self, open_db):
+        """The engine is reset (same version) between the read and the skip:
+        the skip commit is refused, nothing is reported skipped, and the
+        event is observed again from the new start and delivered."""
+        engine = _ResetWhileFailing(open_db)
+        rt = self.runtime(open_db, engine, max_failures=1)
+        rt.events.append(ev("e1", "one"))
+
+        assert rt.sync() == 1
+
+        assert engine.seen == ["e1", "e1"]
+        assert rt.skipped == [] and rt._failures == {}
+        assert rt.state.cursor() == 1 and [k for k, _ in rt.state.scan()] == ["1/e1"]
+
+    def test_a_refused_commit_leaves_no_knowledge(self, open_db):
+        """Decisions valid, then state.commit refuses once (another process
+        moved first): nothing that attempt decided reaches the knowledge base
+        or the verdict log; the next attempt's decisions do."""
+        rt = self.runtime(open_db, _PerAttempt())
+        rt.events.append(ev("e1", "one"))
+        real = rt.state.commit
+
+        def lose(*args, **kw):
+            rt.state.commit = real
+            raise CursorConflict("another process moved first")
+
+        rt.state.commit = lose
+        assert rt.sync() == 1
+
+        assert [k.id for k in open_db().knowledge.all()] == ["k-attempt2"]
+        assert [v.decision.item.id for v in rt.verdicts] == ["k-attempt2"]
 
     def test_process_dying_during_observe_leaves_no_trace(self, open_db):
         dying = self.runtime(open_db, _Dying())

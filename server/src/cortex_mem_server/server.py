@@ -167,13 +167,13 @@ class Service:
         self._log_skipped()
         return caller
 
-    def _append(self, caller: Caller, **fields) -> tuple[str, bool, int]:
+    def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
         """Append an event; returns its id, whether the engine has seen
         everything (pending() == 0 after the call: false while an earlier
         event, an embedding outage or a failing engine holds delivery back)
-        and how many events still wait. Once stored, the event is not lost if
-        delivery fails: it is retried later, so the agent must not record it
-        again."""
+        and how many events still wait (None when that could not be read).
+        Once stored, the event is not lost if delivery fails: it is retried
+        later, so the agent must not record it again."""
         event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
                       session=caller.session, agent=caller.agent, **fields)
         try:
@@ -184,7 +184,13 @@ class Service:
             log.exception("event %s stored, but the engine failed to take it in", event.id)
         finally:
             self._log_skipped()
-        pending = self.runtime.pending()
+        try:
+            pending: int | None = self.runtime.pending()
+        except Exception:
+            # The event is stored: answer delivered false, never an error the
+            # agent would answer by recording it again.
+            log.exception("event %s stored, but its delivery could not be checked", event.id)
+            return event.id, False, None
         return event.id, pending == 0, pending
 
     def _log_skipped(self) -> None:

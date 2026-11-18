@@ -457,3 +457,34 @@ def test_runtime_looking_keys_are_ordinary_without_an_index():
     rt.append(ev("e1"))
     assert engine.keys == ["_runtime/index", "_runtime/other"] and engine.value == "theirs"
     assert dict(rt.state.scan()) == {"_runtime/index": "mine", "n": 1}
+
+
+def test_a_tick_with_nothing_to_commit_does_not_move_the_epoch():
+    rt = runtime(Scripted())
+    rt.append(ev("e1"))
+    epoch = rt.state.epoch()
+
+    rt.tick(T0)
+    assert rt.state.epoch() == epoch  # no decisions, no state writes: no commit
+
+    class Writes(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.put("ticked", True)
+            return []
+
+    writer = runtime(Writes(), rt.events, rt.knowledge, rt.state)
+    writer.tick(T0)
+    assert rt.state.epoch() == epoch + 1 and rt.state.get("ticked") is True
+
+
+def test_failure_counts_for_events_delivered_elsewhere_are_dropped():
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    flaky = Runtime(_FailsOn("e1"), events, kb, state, max_failures=3)
+    with pytest.raises(RuntimeError):
+        flaky.append(ev("e1"))
+    assert flaky._failures == {1: 1}
+
+    runtime(Scripted(), events, kb, state).sync()  # another process delivers e1
+    flaky.sync()
+
+    assert flaky._failures == {}

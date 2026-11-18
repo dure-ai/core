@@ -359,6 +359,20 @@ def test_delivered_responses_say_how_many_events_wait():
     assert out["delivered"] is True and out["pending"] == 0
 
 
+def test_a_failing_pending_count_still_reports_the_event_as_stored(caplog):
+    m = service(SqliteDatabase())
+
+    def down():
+        raise OSError("store is down")
+
+    m.runtime.pending = down
+    out = m.record("deploy uses release tags")
+
+    assert out["delivered"] is False and out["pending"] is None
+    assert m.db.events.get([out["id"]])  # stored: the agent must not record it again
+    assert "deploy uses release tags" not in caplog.text
+
+
 def test_refused_event_is_still_an_error():
     m = Service(SqliteDatabase(), f"{__name__}:FailsOnBoom", user="u1", team="t1", session="s1",
                 clock=lambda: T0, max_failures=3)

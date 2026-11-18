@@ -36,6 +36,17 @@ MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild o
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 
 
+class StateVersionChanged(Exception):
+    """Another process kept resetting this engine's state to another version
+    while this one delivered (two versions of one engine on one store, which
+    is not supported): raised after MAX_CONFIG_RETRIES restarts of one event."""
+
+
+class _VersionMoved(Exception):
+    """A commit found the engine's state under another version than the one
+    this Runtime builds: check the versions again and start the event over."""
+
+
 @dataclass(frozen=True)
 class Verdict:
     """What the runtime did with one decision: the decision log. The harness
@@ -175,7 +186,6 @@ class Runtime:
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
-        self._version_generation: int | None = None  # index generation the engine's version was checked at
 
     @property
     def rejections(self) -> list[Verdict]:
@@ -215,10 +225,12 @@ class Runtime:
         MAX_CONFIG_RETRIES times per event; then IndexConfigChanged is raised."""
         self._check_versions()
         self._follow_knowledge()
+        done = self.state.cursor()  # delivered or skipped, here or by another process
+        self._failures = {seq: n for seq, n in self._failures.items() if seq > done}
         delivered = 0
         ahead = self.index is not None
         outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
-        retries: dict[int, int] = {}  # seq -> rebuilds after another process took the index
+        retries: dict[int, int] = {}  # seq -> restarts after the index or the engine's version moved
         while True:
             # No transaction: the commit checks the epoch and cursor read here.
             epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
@@ -228,8 +240,8 @@ class Runtime:
                 return delivered
             seq, event = pending
             generation = None
-            if self.index is not None:
-                try:
+            try:
+                if self.index is not None:
                     if ahead:
                         # Index everything appended so far in a few batched embed calls.
                         # A failure is kept for the event whose text failed: the events
@@ -244,23 +256,24 @@ class Runtime:
                     # Not the engine's failure: raised before observe runs.
                     self.index.advance(self.events, seq)
                     generation = self.index.generation()
-                    if generation != self._version_generation:
-                        # Rebuilt (by any process) since the engine's version was
-                        # checked: its state was built on another index.
-                        raise IndexConfigChanged(f"the index moved to generation {generation}")
-                except IndexConfigChanged:
-                    # Another process rebuilt the index, maybe with another config.
-                    # Rebuild it for ours if needed (a new generation replays this
-                    # engine) and try again, a few times: two configs on one store
-                    # are not supported.
-                    retries[seq] = retries.get(seq, 0) + 1
-                    if retries[seq] > MAX_CONFIG_RETRIES:
-                        raise
-                    self._check_versions()
-                    self._follow_knowledge()
-                    ahead, outage = True, None
-                    continue
-            outcome, touched = self._deliver_next(epoch, cursor, seq, event, generation)
+                outcome, touched = self._deliver_next(epoch, cursor, seq, event, generation)
+            except (IndexConfigChanged, _VersionMoved) as exc:
+                # Another process rebuilt the index (maybe with another config) or
+                # reset this engine under another version. Rebuild the index for
+                # ours if needed, check the engine's version again (a reset replays
+                # it) and start the event over, a few times: two configs or two
+                # engine versions on one store are not supported.
+                retries[seq] = retries.get(seq, 0) + 1
+                if retries[seq] > MAX_CONFIG_RETRIES:
+                    if isinstance(exc, _VersionMoved):
+                        raise StateVersionChanged(
+                            f"the state of this engine keeps moving to another version: {self.state.version()!r}"
+                        ) from None
+                    raise
+                self._check_versions()
+                self._follow_knowledge()
+                ahead, outage = self.index is not None, None
+                continue
             delivered += outcome
             self._sync_knowledge(touched)
 
@@ -278,8 +291,11 @@ class Runtime:
 
         `epoch` and `cursor` were read before the event, and `generation` (with
         an index) after indexing it. The commit first checks that the epoch,
-        the cursor and the index generation are still those and that the index
-        has reached `seq`, and only then checks the decisions, commits the
+        the cursor and the index generation are still those, that the index
+        has reached `seq`, and that the engine's state is still under the
+        version this Runtime builds on that generation (else _VersionMoved is
+        raised: the caller checks the versions again), and only then checks
+        the decisions, commits the
         engine's state and cursor (state.commit checks the epoch and cursor
         once more, atomically, and is the one place that raises
         CursorConflict) and applies the accepted decisions. A failure of the
@@ -299,25 +315,37 @@ class Runtime:
             return 0, []
         try:
             with self.transaction():
-                if not self._unmoved(epoch, cursor, generation, seq):
-                    return 0, []
-                touched, verdicts = self._commit(decisions, staged, cursor, epoch, seq, event.at)
+                moved = self._moved(epoch, cursor, generation, seq)
+                if moved is None:
+                    touched, verdicts = self._commit(decisions, staged, cursor, epoch, seq, event.at)
         except CursorConflict:
             return 0, []  # another process delivered, skipped or reset first; read again
+        if moved == "version":
+            raise _VersionMoved(seq)
+        if moved is not None:
+            return 0, []
         self.verdicts.extend(verdicts)
         self._failures.pop(seq, None)
         return 1, touched
 
-    def _unmoved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> bool:
+    def _moved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> str | None:
         """Inside the commit transaction, before anything is checked or written:
-        whether what the engine read is still current. The epoch and cursor
-        are checked again by state.commit; this read only spares the decision
-        checks of a result that is going to be dropped."""
+        None when what the engine read is still current; "read" when the
+        epoch, the cursor, the index generation or the index position moved
+        (read again and start over); "version" when the engine's state is not
+        under the version this Runtime builds on `generation`, such as after a
+        reset by another version of the engine, or a rebuild of the index
+        since the version was checked (check the versions again first). The
+        epoch and cursor are checked again by state.commit; this read spares
+        the decision checks of a result that is going to be dropped."""
         if self.state.epoch() != epoch or self.state.cursor() != cursor:
-            return False
-        if self.index is None:
-            return True
-        return self.index.generation() == generation and self.index.indexed() >= seq
+            return "read"
+        if self.index is not None and (self.index.generation() != generation or self.index.indexed() < seq):
+            return "read"
+        want = self._want(generation)
+        if want is not None and self.state.version() != want:
+            return "version"
+        return None
 
     def _skip(self, cursor: int, seq: int, epoch: int, event_id: str, attempts: int, error: Exception) -> None:
         """Move the cursor past a given-up event in one short transaction, with
@@ -379,59 +407,58 @@ class Runtime:
         an index it is the JSON of [state_version or None, index fingerprint]:
         the state records which index generation it was built on. Without
         one it is the engine's state_version, and None means nothing to check."""
-        return self._want()[0]
+        return self._want(None if self.index is None else self.index.generation())
 
-    def _want(self) -> tuple[str | None, int | None]:
-        """(_want_version(), the index generation it names; None without an index)."""
+    def _want(self, generation: int | None) -> str | None:
+        """_want_version() for the given index generation (read by the caller)."""
         state_version = getattr(self.engine, "state_version", None)
         if self.index is None:
-            return state_version, None
-        fingerprint = self.index.fingerprint()
-        want = json.dumps([state_version, fingerprint], sort_keys=True, separators=(",", ":"))
-        return want, fingerprint["generation"]
+            return state_version
+        fingerprint = {**self.index.want(), "generation": generation}
+        return json.dumps([state_version, fingerprint], sort_keys=True, separators=(",", ":"))
 
     def _check_versions(self) -> None:
-        """Runs on every sync, and again when the index generation moves during
-        one. With an index, first rebuild it if it is stale
-        (Index.ensure_current, which embeds with no transaction open). Then,
-        when the stored version differs from _want_version(), drop the
-        engine's state and start delivery over, in one short transaction that
-        computes the version again (the index may have been rebuilt
-        meanwhile). A rebuild by any process adds 1 to the index generation,
-        so it changes the version of every engine on the store. The knowledge
-        base is kept; replayed Promotes replace items with the same id."""
+        """Runs on every sync, and again when a commit finds the index rebuilt
+        or the engine's state under another version. With an index, first
+        rebuild it if it is stale (Index.ensure_current, which embeds with no
+        transaction open). Then, when the stored version differs from
+        _want_version(), drop the engine's state and start delivery over, in
+        one short transaction that computes the version again (the index may
+        have been rebuilt meanwhile). A rebuild by any process adds 1 to the
+        index generation, so it changes the version of every engine on the
+        store. The knowledge base is kept; replayed Promotes replace items
+        with the same id."""
         if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
-        want, generation = self._want()
+        want = self._want_version()
         if want is None or self.state.version() == want:
-            self._version_generation = generation
             return  # the common case takes no lock
         with self.transaction():
-            want, generation = self._want()
+            want = self._want_version()
             if want is not None and self.state.version() != want:
                 self.state.reset(want)
-        self._version_generation = generation
 
     def tick(self, now: datetime) -> None:
         """Deliver what is pending, then let time pass: engine.tick runs with
         no write transaction open, on the state at the cursor, and its result
         is committed in one short transaction with the checks of a delivery
-        (the cursor stays). If the epoch, the cursor or the index generation
-        moved meanwhile (another process delivered, ticked or reset, or the
-        index was rebuilt), the result is dropped; the next tick runs again."""
+        (the cursor stays). If the epoch, the cursor, the index generation or
+        the engine's version moved meanwhile (another process delivered,
+        ticked or reset, or the index was rebuilt), the result is dropped; the
+        next tick runs again. A tick that decides nothing and writes no state
+        commits nothing: it takes no write lock and leaves the epoch alone,
+        so it never refuses another process's observe."""
         self.sync()
         epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
         cursor = self.state.cursor()
-        generation = None
-        if self.index is not None:
-            generation = self.index.generation()
-            if generation != self._version_generation:
-                return  # rebuilt since sync checked the engine's version: the next sync replays
+        generation = None if self.index is None else self.index.generation()
         staged = self._staged()
         decisions = list(self.engine.tick(now, self._ctx(staged, cursor)))
+        if not decisions and not staged.writes and not staged.deletes:
+            return
         try:
             with self.transaction():
-                if not self._unmoved(epoch, cursor, generation, cursor):
+                if self._moved(epoch, cursor, generation, cursor) is not None:
                     return
                 touched, verdicts = self._commit(decisions, staged, cursor, epoch, cursor, now)
         except CursorConflict:
@@ -471,7 +498,7 @@ class Runtime:
         cursor: int,
         at: datetime,
     ) -> tuple[list[str], list[Verdict]]:
-        """Inside the short commit transaction, after _unmoved: check the
+        """Inside the short commit transaction, after _moved: check the
         decisions, commit the engine's state and cursor (state.commit raises
         CursorConflict if the epoch or cursor moved), apply the accepted
         decisions. Returns the knowledge ids they touched, for the index to
