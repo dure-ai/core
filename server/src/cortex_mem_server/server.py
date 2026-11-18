@@ -63,11 +63,13 @@ ENGINE_ALIASES = {
 }
 _WIDTH = {"personal": 0, "team": 1, "org": 2}
 log = logging.getLogger("cortex_mem_server")
-# Two things are embedded while SQLite's write lock is held: a promoted item
-# (one call per item) and an engine's query text in ctx.similar.search or
-# .knowledge during observe/tick (engines should prefer group/neighbors there).
-# Every other passage is embedded outside it. Below the busy timeout, so
-# another session's write still gets in after a stalled call.
+# Nothing is embedded while a write transaction is open: passages, promoted
+# items and an engine's query text (ctx.similar.search or .knowledge during
+# observe/tick) are all embedded with no write lock held, so a slow or failing
+# Upstage call never blocks another session's write. This bound is how long a
+# tool call waits on one stalled request (per socket operation, so a response
+# that trickles in can take longer) before the delivery fails with an
+# EmbeddingError and is retried on the next call.
 UPSTAGE_TIMEOUT_S = 4.0
 
 
@@ -409,7 +411,9 @@ def record_episode(
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, delivered and
     pending: delivered false (pending > 0 events wait) means it is stored and
-    will reach memory later, so do not record it again."""
+    will reach memory later, so do not record it again. pending is an integer,
+    or null when it could not be read (delivered is then false; the record is
+    still stored)."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)
 
 
@@ -447,7 +451,8 @@ def report_outcome(
     only narrow that. If that is wider than this repo's policy, text is not
     stored (text_redacted: true). Returns the id, the scope actually used,
     text_redacted, delivered and pending (delivered false: stored, reaches
-    memory later, pending events wait; do not report it again)."""
+    memory later, pending events wait; do not report it again). pending is an
+    integer, or null when it could not be read (delivered is then false)."""
     try:
         return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed

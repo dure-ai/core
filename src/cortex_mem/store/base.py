@@ -111,7 +111,8 @@ class VectorBackend(Protocol):
 
     # Index state
     def meta(self) -> dict | None:
-        """{"model": str, "group_threshold": float}, None until reset() is called."""
+        """{"model": str, "group_threshold": float, "store": str} (Index.want()),
+        None until reset() is called."""
         ...
 
     def reset(self, meta: dict) -> None:
