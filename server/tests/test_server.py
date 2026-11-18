@@ -304,7 +304,7 @@ def test_engine_failure_does_not_block_tools_and_the_bad_event_is_skipped(caplog
 
     good = m.record("deploy uses release tags")  # attempts 2 and 3 on "boom", then skipped
 
-    assert good["delivered"] is True
+    assert good["delivered"] is True and good["pending"] == 0
     assert [h["content"] for h in m.recall("deploy tags")] == ["deploy uses release tags"]
     assert [s.event_id for s in m.runtime.skipped] == [bad["id"]]
     assert f"skipped event {bad['id']} after 3 failed deliveries" in caplog.text
@@ -318,7 +318,45 @@ def test_without_max_failures_the_service_keeps_retrying():
     later = m.record("deploy uses release tags")
 
     assert later["delivered"] is False and m.runtime.skipped == []
+    assert later["pending"] == 2  # both records wait behind the one the engine fails on
     assert m.runtime.state.cursor() == 0
+
+
+def test_record_during_an_embedding_outage_is_recorded_but_pending():
+    from cortex_mem.embed import EmbeddingError, HashEmbedder
+
+    class Flaky(HashEmbedder):
+        down = False
+
+        def embed(self, texts, kind):
+            if self.down:
+                raise EmbeddingError("embedding backend is down")
+            return super().embed(texts, kind)
+
+    db = SqliteDatabase()
+    emb = Flaky()
+    m = Service(db, "promote_all", user="u1", team="t1", session="s1", clock=lambda: T0, max_failures=3,
+                index=Index(db.vectors, emb, 0.9, transaction=db.transaction))
+    emb.down = True
+
+    stored = m.record("deploy uses release tags")
+
+    assert stored["delivered"] is False and stored["pending"] >= 1
+    assert db.events.get([stored["id"]])  # recorded, not lost
+    assert m.runtime.skipped == []
+
+    emb.down = False
+    later = m.record("payments need vendor v2")
+    assert later["delivered"] is True and later["pending"] == 0
+    assert m.runtime.state.cursor() == 2 and m.runtime.skipped == []
+
+
+def test_delivered_responses_say_how_many_events_wait():
+    m = service(SqliteDatabase())
+    recorded = m.record("x")
+    assert recorded == {"id": recorded["id"], "scope": "personal", "delivered": True, "pending": 0}
+    out = m.report_outcome("success", [recorded["id"]])
+    assert out["delivered"] is True and out["pending"] == 0
 
 
 def test_refused_event_is_still_an_error():
