@@ -128,7 +128,18 @@ class SqliteDatabase:
                 "PRIMARY KEY (model, digest))"
             )
             self.con.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT)")
+            # Columns added without a version bump: main's schema-3 files have no
+            # engine_cursor.epoch, feat/core-embedding's schema-5 files no
+            # vectors.digest. CREATE IF NOT EXISTS keeps an old table as it is.
+            self._add_column("engine_cursor", "epoch", "INTEGER NOT NULL DEFAULT 0")
+            self._add_column("vectors", "digest", "TEXT")
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _add_column(self, table: str, column: str, definition: str) -> None:
+        """Inside the schema transaction: add the column if the table lacks it."""
+        columns = {row[1] for row in self.con.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def state(self, engine: str) -> "SqliteStateBackend":
         return SqliteStateBackend(self, engine)

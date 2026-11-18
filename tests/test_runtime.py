@@ -488,3 +488,19 @@ def test_failure_counts_for_events_delivered_elsewhere_are_dropped():
     flaky.sync()
 
     assert flaky._failures == {}
+
+
+def test_a_tick_that_only_deletes_state_commits():
+    class Forgets(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.delete("old")
+            return []
+
+    state = InMemoryStateBackend()
+    state.commit(0, 0, {"old": 1}, set(), epoch=state.epoch())
+    rt = runtime(Forgets(), state=state)
+    epoch = state.epoch()
+
+    rt.tick(T0)
+
+    assert state.get("old") is None and state.epoch() == epoch + 1

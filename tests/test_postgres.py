@@ -105,6 +105,24 @@ def test_unknown_schema_version_refuses_to_start(pg_schema):
         PostgresDatabase(pg_schema)
 
 
+@pytest.mark.parametrize(
+    "table",
+    [
+        "CREATE TABLE engine_cursor (engine text PRIMARY KEY, cursor bigint, version text)",
+        "CREATE TABLE knowledge_vectors (id text PRIMARY KEY, emb vector)",
+    ],
+)
+def test_a_schema_from_before_the_epoch_and_digest_columns_is_refused(pg_schema, table):
+    import psycopg
+
+    with psycopg.connect(pg_schema, autocommit=True) as con:
+        con.execute(table)
+
+    with pytest.raises(RuntimeError, match="drop") as raised:
+        PostgresDatabase(pg_schema)
+    assert "postgresql://" not in str(raised.value) and "cortex@" not in str(raised.value)
+
+
 def test_missing_vector_extension_is_reported(pg_schema):
     import psycopg
 

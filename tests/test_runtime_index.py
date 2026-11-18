@@ -1193,3 +1193,141 @@ def test_commit_is_refused_when_the_index_fell_behind_during_observe(store, tmp_
     assert db.vectors.generation() == g
     assert db.vectors.indexed() >= rt.state.cursor() == 1
     assert rt.state.get("n") == 1
+
+
+# ── knowledge vectors and rebuilds by other processes ───────────────────────
+
+
+class RacingEmbedder(HashEmbedder):
+    """HashEmbedder that runs `meanwhile` once, after its next embed call: another
+    process acts between this one's embedding and its write."""
+
+    def __init__(self, dim=256):
+        super().__init__(dim)
+        self.meanwhile = None
+
+    def embed(self, texts, kind):
+        out = super().embed(texts, kind)
+        meanwhile, self.meanwhile = self.meanwhile, None
+        if meanwhile is not None:
+            meanwhile()
+        return out
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_a_knowledge_vector_never_lands_in_an_index_built_for_another_model(store, tmp_path, request):
+    open_db = reopener(store, tmp_path, request)
+    db_a, db_b = open_db(), open_db()
+    emb = RacingEmbedder(256)
+    a = Index(db_a.vectors, emb, 0.9, transaction=db_a.transaction)
+    b = Index(db_b.vectors, HashEmbedder(64), 0.9, transaction=db_b.transaction)
+    a.ensure_current(db_a.knowledge)
+    db_a.knowledge.put(item("k1", ("e1",), body="hello world"))
+    emb.meanwhile = lambda: b.ensure_current(db_b.knowledge)  # another model takes the index
+
+    a.sync_knowledge(db_a.knowledge, ["k1"])
+
+    assert db_b.vectors.meta() == b.want()
+    assert len(db_b.vectors.vector("knowledge", "k1")) == 64  # B's own vector, not A's
+    b.sync_knowledge(db_b.knowledge, None)
+    hits = b.reader(db_b.events, db_b.knowledge).knowledge("hello", caller(), "personal")
+    assert [k.id for k, _ in hits] == ["k1"]
+
+
+@pytest.mark.parametrize("store", ["memory", "sqlite"])
+def test_a_re_promoted_id_keeps_its_vector(store, tmp_path):
+    """An id is demoted, then promoted again with the same text between the
+    sync's read and its write: its vector is not deleted."""
+    db = make_db(store, tmp_path)
+    emb = RacingEmbedder(256)
+    index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    k1 = item("k1", ("e1",), body="hello world")
+    db.knowledge.put(k1)
+    index.sync_knowledge(db.knowledge, ["k1"])
+    db.knowledge.remove("k1")
+    db.knowledge.put(item("k2", ("e1",), body="something new"))  # gives the sync something to embed
+    emb.meanwhile = lambda: db.knowledge.put(k1)
+
+    index.sync_knowledge(db.knowledge, ["k1", "k2"])
+
+    assert db.vectors.vector("knowledge", "k1") is not None
+    assert db.vectors.vector("knowledge", "k2") is not None
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_two_rebuilds_back_to_back_cost_one_generation(store, tmp_path, request):
+    open_db = reopener(store, tmp_path, request)
+    db_a, db_b = open_db(), open_db()
+    db_a.knowledge.put(item("k1", ("e1",), body="hello world"))
+    emb = RacingEmbedder(256)
+    a = Index(db_a.vectors, emb, 0.9, transaction=db_a.transaction)
+    b = Index(db_b.vectors, HashEmbedder(256), 0.9, transaction=db_b.transaction)
+    g = db_a.vectors.generation()
+    emb.meanwhile = lambda: b.ensure_current(db_b.knowledge)  # B rebuilds while A embeds
+
+    assert a.ensure_current(db_a.knowledge) is False  # B rebuilt it first
+
+    assert db_a.vectors.generation() == g + 1
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_items_promoted_during_our_own_rebuild_get_vectors(store, tmp_path, request):
+    """This Runtime rebuilds the index (another config had it) after it had
+    already reconciled once; an item promoted after the rebuild's snapshot
+    gets its vector from the full compare that follows the rebuild."""
+    open_db = reopener(store, tmp_path, request)
+    db = open_db()
+    db.knowledge.put(item("k1", ("e1",), body="hello world"))
+    rt = runtime(ProbeEngine(), db)
+    rt.sync()  # reconciled once
+    other = open_db()
+    Index(other.vectors, HashEmbedder(64), 0.9, transaction=other.transaction).ensure_current(other.knowledge)
+    real = rt.index._knowledge_vectors
+
+    def snapshot_then_promote(items):
+        vectors = real(items)
+        if not db.knowledge.get(["k2"]):
+            open_db().knowledge.put(item("k2", ("e1",), body="promoted meanwhile"))
+        return vectors
+
+    rt.index._knowledge_vectors = snapshot_then_promote
+    rt.sync()
+
+    assert db.vectors.meta() == rt.index.want()
+    assert db.vectors.vector("knowledge", "k2") is not None
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_a_tick_over_an_index_rebuilt_twice_is_dropped(store, tmp_path, request):
+    """While the engine ticks, another config rebuilds the index and ours
+    rebuilds it back: the cursor and epoch did not move, but the tick was
+    made on another index generation, so it is dropped."""
+    open_db = reopener(store, tmp_path, request)
+    db = open_db()
+
+    class Rebuilding(ProbeEngine):
+        meanwhile = None
+
+        def tick(self, now, ctx):
+            if self.meanwhile is not None:
+                meanwhile, self.meanwhile = self.meanwhile, None
+                meanwhile()
+            ctx.state.put("ticked", True)
+            return [Promote(item("t1", ("e1",)))]
+
+    engine = Rebuilding()
+    rt = runtime(engine, db)
+    rt.append(ev("e1"))
+    other = open_db()
+
+    def rebuild_twice():
+        Index(other.vectors, HashEmbedder(), 0.5, transaction=other.transaction).ensure_current(other.knowledge)
+        Index(other.vectors, HashEmbedder(), 0.9, transaction=other.transaction).ensure_current(other.knowledge)
+
+    engine.meanwhile = rebuild_twice
+    epoch = rt.state.epoch()
+    rt.tick(T0)
+
+    assert rt.state.get("ticked") is None and db.knowledge.get(["t1"]) == []
+    assert rt.state.epoch() == epoch

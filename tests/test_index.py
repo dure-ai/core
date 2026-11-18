@@ -8,7 +8,7 @@ from spy import SpyBackend, SpyEmbedder, TxnSpy
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
 from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, float32, text_digest
-from cortex_mem.index import WARM_BATCH, Index, IndexConfigChanged
+from cortex_mem.index import EMBED_BATCH, Index, IndexConfigChanged
 from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -81,7 +81,9 @@ def build(events, embedder=None, threshold=0.9, db=None):
 
 
 def put_knowledge(db, index, *items):
-    """Put items in the knowledge base and let the index follow them."""
+    """Put items in the knowledge base and let the index follow them (built
+    first if it never was: sync_knowledge writes nothing into a stale index)."""
+    index.ensure_current(db.knowledge)
     for k in items:
         db.knowledge.put(k)
     index.sync_knowledge(db.knowledge, [k.id for k in items])
@@ -743,7 +745,7 @@ def test_advance_batches_embedder_calls(opened):
 
     index.advance(db.events, 132)
 
-    assert [len(b) for b in emb.batches] == [WARM_BATCH, WARM_BATCH, 2]  # missing, distinct, in order
+    assert [len(b) for b in emb.batches] == [EMBED_BATCH, EMBED_BATCH, 2]  # missing, distinct, in order
     assert emb.batches[0][0] == "text 0"
     assert emb.inside == []
     assert db.vectors.indexed() == 132

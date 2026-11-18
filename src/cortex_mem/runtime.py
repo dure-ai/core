@@ -216,13 +216,20 @@ class Runtime:
         committed in a short checked transaction (_deliver_next). If the
         engine raises, that event stays undelivered and is retried next time,
         until `max_failures` attempts have failed; then it is skipped (see
-        `skipped`). With an index, each event is indexed before it is
-        observed, and an EmbeddingError while indexing it (or while embedding
-        knowledge) is raised as is: the event stays undelivered and is never
-        skipped for it. If another process rebuilds the index meanwhile, the
-        engine's state is checked against the new index (and dropped when it
-        was built on another) and delivery starts again, at most
-        MAX_CONFIG_RETRIES times per event; then IndexConfigChanged is raised."""
+        `skipped`). A failure is counted only if the engine's epoch did not
+        move while it observed. With an index, each event is indexed before
+        it is observed, and an EmbeddingError while indexing it (or while
+        embedding knowledge, or raised inside observe) is raised as is: the
+        event stays undelivered and is never skipped for it.
+
+        If another process rebuilds the index, or resets this engine under
+        another state version, the versions are checked again (rebuilding the
+        index for this config and dropping the engine's state when it was
+        built on another) and the event starts over. An IndexConfigChanged
+        raised inside observe takes the same path. After MAX_CONFIG_RETRIES
+        such restarts of one event, IndexConfigChanged (index) or
+        StateVersionChanged (engine version) is raised; neither is counted
+        toward max_failures."""
         self._check_versions()
         self._follow_knowledge()
         done = self.state.cursor()  # delivered or skipped, here or by another process
@@ -308,6 +315,8 @@ class Runtime:
         except (EmbeddingError, IndexConfigChanged):
             raise  # not the engine's failure: retried, never counted
         except Exception as exc:
+            if self.state.epoch() != epoch:
+                return 0, []  # reset or moved on meanwhile: not a failure on this state; read again
             attempts = self._give_up(seq)
             if attempts is None:
                 raise
@@ -407,14 +416,15 @@ class Runtime:
         an index it is the JSON of [state_version or None, index fingerprint]:
         the state records which index generation it was built on. Without
         one it is the engine's state_version, and None means nothing to check."""
-        return self._want(None if self.index is None else self.index.generation())
+        return self._want(None)
 
     def _want(self, generation: int | None) -> str | None:
-        """_want_version() for the given index generation (read by the caller)."""
+        """_want_version() for an index generation the caller has read (None:
+        read it now)."""
         state_version = getattr(self.engine, "state_version", None)
         if self.index is None:
             return state_version
-        fingerprint = {**self.index.want(), "generation": generation}
+        fingerprint = self.index.fingerprint(generation)
         return json.dumps([state_version, fingerprint], sort_keys=True, separators=(",", ":"))
 
     def _check_versions(self) -> None:

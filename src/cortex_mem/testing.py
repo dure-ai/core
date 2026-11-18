@@ -22,7 +22,7 @@ import pytest
 
 from .access import owner_for
 from .contract import Caller, Event, Knowledge, Promote
-from .runtime import Runtime
+from .runtime import Runtime, StateVersionChanged
 from .store.base import CursorConflict
 
 T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
@@ -743,7 +743,27 @@ class _Ticking(_Counting):
 
 class _ResetWhileFailing(_Counting):
     """state_version "1". Its first observe resets the engine through another
-    connection (same version) and then fails; later ones succeed."""
+    connection (same version) and then fails; later ones succeed, or fail
+    too when `always`."""
+
+    def __init__(self, open_db, always=False):
+        super().__init__([], state_version="1")
+        self.open_db = open_db
+        self.always = always
+
+    def observe(self, event, ctx):
+        decisions = super().observe(event, ctx)
+        if len(self.seen) == 1:
+            self.open_db().state("engine").reset("1")
+            raise RuntimeError("boom")
+        if self.always:
+            raise RuntimeError("boom")
+        return decisions
+
+
+class _OtherVersionResets(_Counting):
+    """state_version "1". Whenever it observes on state under "1", another
+    process (version "2") resets the state meanwhile."""
 
     def __init__(self, open_db):
         super().__init__([], state_version="1")
@@ -751,9 +771,9 @@ class _ResetWhileFailing(_Counting):
 
     def observe(self, event, ctx):
         decisions = super().observe(event, ctx)
-        if len(self.seen) == 1:
-            self.open_db().state("engine").reset("1")
-            raise RuntimeError("boom")
+        other = self.open_db().state("engine")
+        if other.version() == "1":
+            other.reset("2")
         return decisions
 
 
@@ -1039,6 +1059,36 @@ class DatabaseContract:
 
         assert [k.id for k in open_db().knowledge.all()] == ["k-attempt2"]
         assert [v.decision.item.id for v in rt.verdicts] == ["k-attempt2"]
+
+    def test_two_engine_versions_resetting_each_other_end_in_state_version_changed(self, open_db):
+        """Another version of the engine resets the state each time this one
+        observes on its own version. After MAX_CONFIG_RETRIES restarts of the
+        event, sync raises StateVersionChanged; nothing is counted as an
+        engine failure and nothing is skipped."""
+        engine = _OtherVersionResets(open_db)
+        rt = self.runtime(open_db, engine, max_failures=1)
+        rt.events.append(ev("e1", "one"))
+
+        with pytest.raises(StateVersionChanged):
+            rt.sync()
+
+        assert rt._failures == {} and rt.skipped == []
+        assert open_db().state("engine").cursor() == 0
+
+    def test_a_failure_while_the_engine_was_reset_is_not_counted(self, open_db):
+        """observe fails while another process resets the engine: the result
+        was read from a state that no longer exists, so the failure is not
+        counted; the next one (on the new state) is."""
+        engine = _ResetWhileFailing(open_db, always=True)
+        rt = self.runtime(open_db, engine, max_failures=2)
+        rt.events.append(ev("e1", "one"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            rt.sync()
+
+        assert engine.seen == ["e1", "e1"]
+        assert rt._failures == {1: 1} and rt.skipped == []
+        assert rt.state.cursor() == 0
 
     def test_process_dying_during_observe_leaves_no_trace(self, open_db):
         dying = self.runtime(open_db, _Dying())

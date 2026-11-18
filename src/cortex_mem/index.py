@@ -35,7 +35,7 @@ from .embed import Embedder, EmbeddingError, EmbedKind, text_digest
 from .store.base import CursorConflict, EventStore, VectorBackend
 
 _QUERY_CACHE_SIZE = 256
-WARM_BATCH = 64  # texts per embed call when filling the cache
+EMBED_BATCH = 64  # texts per embed call when filling the cache
 
 
 class IndexConfigChanged(Exception):
@@ -86,12 +86,15 @@ class Index:
             "store": self._backend.kind,
         }
 
-    def fingerprint(self) -> dict:
-        """want() plus the stored index's generation (one read): what an
-        engine's state built on this index depends on. A rebuild, by any
-        process and with any config, adds 1 to the generation, so it changes
-        the fingerprint even when the config ends up the same."""
-        return {**self.want(), "generation": self._backend.generation()}
+    def fingerprint(self, generation: int | None = None) -> dict:
+        """want() plus the stored index's generation: what an engine's state
+        built on this index depends on. `generation` is one the caller has
+        read already; None reads it now. A rebuild, by any process and with
+        any config, adds 1 to the generation, so it changes the fingerprint
+        even when the config ends up the same."""
+        if generation is None:
+            generation = self._backend.generation()
+        return {**self.want(), "generation": generation}
 
     def stale(self) -> bool:
         return self._backend.meta() != self.want()
@@ -127,7 +130,7 @@ class Index:
         """Index every event after indexed() up to and including upto.
 
         The passages missing from the cache are embedded first, in batches of
-        at most WARM_BATCH, with no transaction open (an EmbeddingError is
+        at most EMBED_BATCH, with no transaction open (an EmbeddingError is
         raised before any event is written). Then each event in order: its
         group is found outside any transaction, and one short transaction
         moves the position from seq - 1 to seq, checked against the generation
@@ -184,7 +187,18 @@ class Index:
         transaction open; an id no longer in the knowledge base loses its
         vector. One short transaction writes them, and writes a vector only
         if the item's passage is still the one that was embedded: if another
-        process changed the item meanwhile, its own sync writes the right one."""
+        process changed the item meanwhile, its own sync writes the right one.
+
+        The generation and the config are checked before anything is read and
+        again inside the write transaction: if the index is stale, or another
+        process rebuilt it meanwhile, nothing is written and the call returns
+        quietly. The rebuilder stores every knowledge vector of its snapshot,
+        and a Runtime that rebuilds compares every item again afterwards, so
+        nothing is lost; raising instead would only make the caller retry
+        against the same rebuild."""
+        generation = self._backend.generation()  # first: a rebuild after this read changes it
+        if self.stale():
+            return
         # Reads every stored digest (and, in full, every vector id): O(knowledge
         # base) per call. A per-id lookup on the port would avoid it.
         stored = self._backend.knowledge_digests()
@@ -201,6 +215,8 @@ class Index:
             return
         vectors = self._knowledge_vectors(changed)
         with self._transaction():
+            if self._backend.generation() != generation or self.stale():
+                return  # rebuilt meanwhile, maybe for another model: not ours to write into
             still_gone = gone - {item.id for item in knowledge.get(list(gone))} if gone else set()
             if still_gone:
                 self._backend.delete_vectors("knowledge", sorted(still_gone))
@@ -250,7 +266,7 @@ class Index:
             self._backend.put_group(event.id, group_id, scope, owner, seq)
 
     def _cache_passages(self, texts: Iterable[str]) -> None:
-        """Embed the passages the cache lacks, at most WARM_BATCH per embed
+        """Embed the passages the cache lacks, at most EMBED_BATCH per embed
         call, with no transaction open, and cache each batch in its own short
         transaction. An EmbeddingError keeps the batches cached before it."""
         failed = self._cache_batches(texts)
@@ -262,8 +278,8 @@ class Index:
         instead of raised: (its uncached texts, the error), else None."""
         model = self._embedder.model
         todo = [t for t in dict.fromkeys(texts) if self._backend.cached(model, text_digest(t)) is None]
-        for i in range(0, len(todo), WARM_BATCH):
-            chunk = todo[i : i + WARM_BATCH]
+        for i in range(0, len(todo), EMBED_BATCH):
+            chunk = todo[i : i + EMBED_BATCH]
             try:
                 vectors = self._embed(chunk, "passage")
             except EmbeddingError as exc:

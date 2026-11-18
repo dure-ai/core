@@ -229,6 +229,22 @@ class PostgresDatabase:
                 )
             for statement in _SCHEMA:
                 self.con.execute(statement)
+            # Columns added on this branch without a version bump. PostgreSQL is
+            # only in development until it ships, so an older schema is not migrated.
+            missing = [
+                f"{table}.{column}"
+                for table, column in (("engine_cursor", "epoch"), ("knowledge_vectors", "digest"))
+                if not self.con.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                    (table, column),
+                ).fetchone()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"the cortex schema in this database predates {', '.join(missing)}; "
+                    "drop that schema (or use a new one) and start again"
+                )
             if row is None:
                 self.con.execute(
                     "INSERT INTO cortex_meta (key, value) VALUES ('schema_version', %s)",

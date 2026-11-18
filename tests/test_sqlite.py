@@ -284,3 +284,74 @@ def test_writes_roll_back_with_the_transaction():
 def test_vectors_is_the_same_object_on_each_access():
     db = SqliteDatabase()
     assert db.vectors is db.vectors
+
+
+def _schema_3_file(path):
+    """A file as main (schema 3) leaves it: no epoch, no vector tables."""
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    cols = (
+        "id, kind, at, user, team, session, scope, text, agent, signal, outcome, "
+        "conditions, refs, repo, rev, text_redacted"
+    )
+    con.execute(f"CREATE TABLE events (seq INTEGER PRIMARY KEY, {cols}, UNIQUE (id))")
+    con.execute("CREATE VIRTUAL TABLE events_fts USING fts5(words, grams)")
+    con.execute("CREATE TABLE knowledge (id TEXT PRIMARY KEY, kind, title, body, scope, owner, sources, conditions)")
+    con.execute("CREATE VIRTUAL TABLE knowledge_fts USING fts5(words, grams)")
+    con.execute("CREATE TABLE engine_state (engine TEXT, key TEXT, value TEXT, PRIMARY KEY (engine, key))")
+    con.execute("CREATE TABLE engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)")
+    for seq, id in ((1, "e1"), (2, "e2")):
+        con.execute(
+            f"INSERT INTO events (seq, {cols}) VALUES (?, ?, 'record', ?, 'u1', 't1', 's1', 'personal', 'hello', "
+            "NULL, NULL, NULL, '{}', '[]', NULL, NULL, 0)",
+            (seq, id, T0.isoformat()),
+        )
+    con.execute("INSERT INTO engine_state VALUES ('promote_all', 'seen', '1')")
+    con.execute("INSERT INTO engine_cursor VALUES ('promote_all', 1, NULL)")  # e1 delivered on main
+    con.execute("PRAGMA user_version = 3")
+    con.commit()
+    con.close()
+
+
+def test_a_schema_3_file_from_main_opens_and_delivers(tmp_path):
+    from cortex_mem.engines.baseline import PromoteAllEngine
+    from cortex_mem.runtime import Runtime
+
+    path = tmp_path / "main.db"
+    _schema_3_file(path)
+
+    for _ in range(2):  # opening twice is fine
+        db = SqliteDatabase(path)
+        state = db.state("promote_all")
+        assert (state.cursor(), state.get("seen")) == (1, 1)  # kept
+        db.con.close()
+
+    db = SqliteDatabase(path)
+    rt = Runtime(PromoteAllEngine(), db.events, db.knowledge, db.state("promote_all"), db.transaction)
+    assert rt.sync() == 1  # e2 only: e1 was delivered before
+    assert rt.state.cursor() == 2 and rt.state.get("seen") == 1
+    assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
+
+
+def test_a_schema_5_file_without_knowledge_digests_opens(tmp_path):
+    """Schema 5 files from feat/core-embedding have vectors without a digest column."""
+    import sqlite3
+
+    path = tmp_path / "v5.db"
+    SqliteDatabase(path).con.close()
+    con = sqlite3.connect(path)
+    con.execute("DROP TABLE vectors")
+    con.execute("CREATE TABLE vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, PRIMARY KEY (kind, id))")
+    con.commit()
+    con.close()
+    db = SqliteDatabase(path)
+    db.vectors.put_vector("event", "e1", [1.0])
+    db.con.close()
+
+    for _ in range(2):
+        db = SqliteDatabase(path)
+        assert db.vectors.vector("event", "e1") == [1.0]  # kept
+        db.vectors.put_vector("knowledge", "k1", [0.5], digest="d1")
+        assert db.vectors.knowledge_digests() == {"k1": "d1"}
+        db.con.close()
