@@ -99,7 +99,7 @@ class Index:
                 group_id = self._group_for(vector, scope, owner, event.id, seq)
                 self._backend.put_vector("event", event.id, vector)
                 self._backend.put_group(event.id, group_id, scope, owner, seq)
-            self._backend.set_indexed(seq)
+            self._backend.set_indexed(seq - 1, seq, self._backend.generation())
             if seq >= upto:
                 break
 

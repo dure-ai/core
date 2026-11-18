@@ -515,7 +515,7 @@ class VectorBackendContract(_Contract):
         vb.put_vector("knowledge", "k1", [1.0])
         vb.put_group("e1", "g1", "team", "t1", 1)
         vb.cache("m1", "d1", [0.5])
-        vb.set_indexed(7)
+        vb.set_indexed(0, 7, vb.generation())
 
         vb.reset({"model": "m2", "group_threshold": 0.9})
 
@@ -554,10 +554,73 @@ class VectorBackendContract(_Contract):
             list(vb.vectors("knowledge", upto=20))
 
     def test_set_indexed_moves_the_cursor(self, vb):
-        vb.set_indexed(5)
+        g = vb.generation()
+        vb.set_indexed(0, 5, g)
         assert vb.indexed() == 5
-        vb.set_indexed(9)
+        vb.set_indexed(5, 9, g)
         assert vb.indexed() == 9
+
+    def test_generation_starts_at_zero_and_reset_bumps_it(self, vb):
+        assert vb.generation() == 0
+        meta = {"model": "m1", "group_threshold": 0.8}
+        vb.reset(meta)
+        assert vb.generation() == 1
+        assert vb.meta() == meta  # the generation is not part of meta
+        vb.reset({"model": "m2", "group_threshold": 0.9})
+        assert vb.generation() == 2
+
+    def test_set_indexed_checks_position_and_generation(self, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        g = vb.generation()
+        vb.set_indexed(0, 3, g)
+        assert vb.indexed() == 3
+
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(2, 4, g)  # the position is 3, not 2
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(3, 4, g + 1)  # another generation
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(3, 4, g - 1)
+        assert vb.indexed() == 3
+        assert vb.generation() == g
+
+        vb.set_indexed(3, 4, g)
+        assert vb.indexed() == 4
+        vb.reset({"model": "m1", "group_threshold": 0.8})  # a reset moves the generation on
+        with pytest.raises(CursorConflict):
+            vb.set_indexed(0, 1, g)
+        assert vb.indexed() == 0
+        vb.set_indexed(0, 1, vb.generation())
+        assert vb.indexed() == 1
+
+    def test_knowledge_vectors_keep_their_digest(self, vb):
+        assert vb.knowledge_digests() == {}
+        vb.put_vector("knowledge", "k1", [1.0, 0.0], digest="d1")
+        vb.put_vector("knowledge", "k2", [0.0, 1.0], digest="d2")
+        vb.put_vector("knowledge", "k3", [1.0, 1.0])  # no digest: not listed
+        assert vb.knowledge_digests() == {"k1": "d1", "k2": "d2"}
+        assert vb.vector("knowledge", "k3") == f32([1.0, 1.0])
+
+        vb.put_vector("knowledge", "k1", [0.5, 0.5], digest="d1b")  # replaced with its digest
+        assert vb.knowledge_digests() == {"k1": "d1b", "k2": "d2"}
+        assert vb.vector("knowledge", "k1") == f32([0.5, 0.5])
+        vb.put_vector("knowledge", "k2", [0.5, 0.5])  # replaced without one: the old digest goes
+        assert vb.knowledge_digests() == {"k1": "d1b"}
+
+        vb.put_vector("event", "e1", [1.0, 0.0], digest="ignored")
+        assert vb.knowledge_digests() == {"k1": "d1b"}
+        assert vb.vector("event", "e1") == f32([1.0, 0.0])
+
+        vb.put_vector("knowledge", "k2", [0.0, 1.0], digest="d2")
+        vb.delete_vectors("knowledge", ["k1", "nope"])
+        assert vb.knowledge_digests() == {"k2": "d2"}
+        vb.put_vector("knowledge", "k1", [1.0, 0.0])  # a new vector under a deleted id has no old digest
+        assert vb.knowledge_digests() == {"k2": "d2"}
+
+        vb.cache("m1", "d1", [0.5])
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        assert vb.knowledge_digests() == {}
+        assert vb.cached("m1", "d1") == [0.5]
 
 
 class _Counting:
@@ -709,24 +772,25 @@ class DatabaseContract:
         vb.reset({"model": "m1", "group_threshold": 0.9})
         vb.put_vector("event", "e1", [1.0, 0.0])
         vb.put_group("e1", "e1", "team", "t1", 1)
-        vb.put_vector("knowledge", "k1", [0.0, 1.0])
+        vb.put_vector("knowledge", "k1", [0.0, 1.0], digest="dk")
         vb.cache("m1", "d1", [0.5, 0.5])
-        vb.set_indexed(1)
+        vb.set_indexed(0, 1, vb.generation())
 
         def snapshot(v):
             return (
                 v.meta(), v.indexed(), list(v.vectors("event")), list(v.vectors("knowledge")),
                 v.members("e1"), v.group_of("e2"), v.cached("m1", "d1"), v.cached("m1", "d2"),
+                v.generation(), v.knowledge_digests(),
             )
 
         before = snapshot(vb)
         with pytest.raises(RuntimeError, match="boom"), db.transaction():
             vb.put_vector("event", "e2", [0.0, 1.0])
             vb.put_group("e2", "e1", "team", "t1", 2)
-            vb.put_vector("knowledge", "k1", [9.0, 9.0])
+            vb.put_vector("knowledge", "k1", [9.0, 9.0], digest="other")
             vb.delete_vectors("event", ["e1"])
             vb.cache("m1", "d2", [0.1, 0.2])
-            vb.set_indexed(2)
+            vb.set_indexed(1, 2, vb.generation())
             vb.reset({"model": "m2", "group_threshold": 0.5})
             raise RuntimeError("boom")
 

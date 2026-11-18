@@ -185,8 +185,10 @@ class InMemoryVectorBackend:
         # grouping each new event does not sort every group again.
         self._cells: dict[tuple[Scope, str], list[tuple[int, str]]] = {}
         self._cache: dict[tuple[str, str], list[float]] = {}
+        self._digests: dict[str, str] = {}
         self._meta: dict | None = None
         self._indexed = 0
+        self._generation = 0
 
     def meta(self) -> dict | None:
         return None if self._meta is None else dict(self._meta)
@@ -196,18 +198,38 @@ class InMemoryVectorBackend:
             table.clear()
         self._groups.clear()
         self._cells.clear()
+        self._digests.clear()
         self._indexed = 0
         self._meta = dict(meta)
+        self._generation += 1
+
+    def generation(self) -> int:
+        return self._generation
 
     def indexed(self) -> int:
         return self._indexed
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
+        if self._indexed != expected or self._generation != generation:
+            raise CursorConflict(
+                f"index at {self._indexed} (generation {self._generation}), "
+                f"not {expected} (generation {generation})"
+            )
         self._indexed = seq
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
         # Assigning to an existing dict key keeps its original position.
         self._vectors[kind][id] = float32(vector)
+        if kind == "knowledge":
+            if digest is None:
+                self._digests.pop(id, None)
+            else:
+                self._digests[id] = digest
+
+    def knowledge_digests(self) -> dict[str, str]:
+        return dict(self._digests)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         found = self._vectors[kind].get(id)
@@ -226,6 +248,8 @@ class InMemoryVectorBackend:
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
         for id in ids:
             self._vectors[kind].pop(id, None)
+            if kind == "knowledge":
+                self._digests.pop(id, None)
 
     def put_group(
         self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int

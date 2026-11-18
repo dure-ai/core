@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from cortex_mem.contract import Caller, Event, Knowledge
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.sqlite import SqliteDatabase
 from cortex_mem.testing import (
     DatabaseContract,
@@ -178,7 +179,7 @@ def test_schema_4_file_drops_its_float64_vectors_and_cache_and_reembeds(tmp_path
     con.execute("INSERT INTO events_fts (rowid, words, grams) VALUES (1, 'deploy uses tags', '')")
     blob = array("d", old).tobytes()
     con.execute("INSERT INTO embed_cache VALUES ('hash-256', ?, ?)", (text_digest(text), blob))
-    con.execute("INSERT INTO vectors VALUES ('event', 'e1', 1, ?)", (blob,))
+    con.execute("INSERT INTO vectors (kind, id, seq, vec) VALUES ('event', 'e1', 1, ?)", (blob,))
     con.execute("INSERT INTO vector_groups VALUES ('e1', 'e1', 'personal', 'u1', 1)")
     con.execute("""INSERT INTO vector_meta VALUES ('meta', '{"model": "hash-256", "group_threshold": 0.9}')""")
     con.execute("INSERT INTO vector_meta VALUES ('indexed', '1')")
@@ -231,9 +232,9 @@ def test_vectors_groups_and_cursor_survive_reopening(tmp_path):
     v = db.vectors
     v.reset({"model": "m", "group_threshold": 0.5})
     v.put_vector("event", "e1", [0.1, 0.2])
-    v.put_vector("knowledge", "k1", [0.3])
+    v.put_vector("knowledge", "k1", [0.3], digest="dk")
     v.put_group("e1", "g1", "personal", "u1", 1)
-    v.set_indexed(7)
+    v.set_indexed(0, 7, v.generation())
     v.cache("m", "d", [0.5, 1 / 3])
     db.con.close()
 
@@ -245,7 +246,26 @@ def test_vectors_groups_and_cursor_survive_reopening(tmp_path):
     assert v.group_of("e1") == "g1"
     assert v.partition("personal", "u1") == ["e1"]
     assert v.indexed() == 7
+    assert v.generation() == 1
+    assert v.knowledge_digests() == {"k1": "dk"}
     assert v.cached("m", "d") == f32([0.5, 1 / 3])
+
+
+def test_generation_survives_reopening(tmp_path):
+    path = tmp_path / "g.db"
+    db = SqliteDatabase(path)
+    assert db.vectors.generation() == 0
+    db.vectors.reset({"model": "m", "group_threshold": 0.5})
+    db.vectors.reset({"model": "m", "group_threshold": 0.5})
+    db.con.close()
+
+    db = SqliteDatabase(path)
+    assert db.vectors.generation() == 2
+    assert db.vectors.meta() == {"model": "m", "group_threshold": 0.5}
+    with pytest.raises(CursorConflict):
+        db.vectors.set_indexed(0, 1, 1)
+    db.vectors.set_indexed(0, 1, 2)
+    assert SqliteDatabase(path).vectors.indexed() == 1
 
 
 def test_writes_roll_back_with_the_transaction():
@@ -253,7 +273,7 @@ def test_writes_roll_back_with_the_transaction():
     with pytest.raises(RuntimeError), db.transaction():
         db.vectors.put_vector("event", "e1", [1.0])
         db.vectors.put_group("e1", "g1", "personal", "u1", 1)
-        db.vectors.set_indexed(3)
+        db.vectors.set_indexed(0, 3, db.vectors.generation())
         raise RuntimeError("boom")
 
     assert db.vectors.vector("event", "e1") is None

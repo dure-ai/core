@@ -111,7 +111,7 @@ class SqliteDatabase:
                 "CREATE TABLE IF NOT EXISTS engine_cursor (engine TEXT PRIMARY KEY, cursor INTEGER, version TEXT)"
             )
             self.con.execute(
-                "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, "
+                "CREATE TABLE IF NOT EXISTS vectors (kind TEXT, id TEXT, seq INTEGER, vec BLOB, digest TEXT, "
                 "PRIMARY KEY (kind, id))"
             )
             self.con.execute(
@@ -385,28 +385,51 @@ class SqliteVectorBackend:
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (json.dumps(meta),),
             )
+            self.db.con.execute(
+                "INSERT INTO vector_meta (key, value) VALUES ('generation', '1') "
+                "ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+            )
+
+    def generation(self) -> int:
+        rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'generation'")
+        return int(rows[0][0]) if rows else 0
 
     def indexed(self) -> int:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
         return int(rows[0][0]) if rows else 0
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():
+            current, now = self.indexed(), self.generation()
+            if current != expected or now != generation:
+                raise CursorConflict(
+                    f"index at {current} (generation {now}), not {expected} (generation {generation})"
+                )
             self.db.con.execute(
                 "INSERT INTO vector_meta (key, value) VALUES ('indexed', ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (str(seq),),
             )
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
+        if kind != "knowledge":
+            digest = None
         with self.db.transaction():
             # seq is assigned on first insert; replacing keeps it (and the position).
             self.db.con.execute(
-                "INSERT INTO vectors (kind, id, seq, vec) VALUES "
-                "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM vectors WHERE kind = ?), ?) "
-                "ON CONFLICT (kind, id) DO UPDATE SET vec = excluded.vec",
-                (kind, id, kind, _pack(vector)),
+                "INSERT INTO vectors (kind, id, seq, vec, digest) VALUES "
+                "(?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM vectors WHERE kind = ?), ?, ?) "
+                "ON CONFLICT (kind, id) DO UPDATE SET vec = excluded.vec, digest = excluded.digest",
+                (kind, id, kind, _pack(vector), digest),
             )
+
+    def knowledge_digests(self) -> dict[str, str]:
+        rows = self.db.query(
+            "SELECT id, digest FROM vectors WHERE kind = 'knowledge' AND digest IS NOT NULL"
+        )
+        return dict(rows)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         rows = self.db.query("SELECT vec FROM vectors WHERE kind = ? AND id = ?", (kind, id))

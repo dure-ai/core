@@ -16,6 +16,7 @@ import pytest
 from cortex_mem.contract import Event, Knowledge
 from cortex_mem.embed import cosine
 from cortex_mem.runtime import Runtime
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.postgres import (
     SCHEMA_VERSION,
     PostgresDatabase,
@@ -77,6 +78,24 @@ def test_fresh_schema_is_created_and_versioned(pg_schema):
         assert db.query("SELECT count(*) FROM cortex_meta") == [(1,)]
     with pytest.raises(ValueError, match="vector_index"):
         PostgresDatabase(pg_schema, vector_index="ivfflat")
+
+
+def test_generation_survives_reopening(pg_schema):
+    meta = {"model": "m", "group_threshold": 0.5}
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.generation() == 0
+        db.vectors.reset(meta)
+        db.vectors.reset(meta)
+        db.vectors.put_vector("knowledge", "k1", [1.0, 0.0], digest="dk")
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.generation() == 2
+        assert db.vectors.meta() == meta
+        assert db.vectors.knowledge_digests() == {"k1": "dk"}
+        with pytest.raises(CursorConflict):
+            db.vectors.set_indexed(0, 1, 1)
+        db.vectors.set_indexed(0, 1, 2)
+    with closing(PostgresDatabase(pg_schema)) as db:
+        assert db.vectors.indexed() == 1
 
 
 def test_unknown_schema_version_refuses_to_start(pg_schema):
@@ -652,7 +671,7 @@ class TestPgVectors(VectorBackendContract):
         vb.put_vector("event", "e1", [1.0, 0.0])
         vb.put_vector("knowledge", "k1", [1.0, 0.0])
         vb.put_group("e1", "g1", "team", "t1", 1)
-        vb.set_indexed(3)
+        vb.set_indexed(0, 3, vb.generation())
         assert _hnsw_indexes(db) == {"event_vectors_hnsw_d2", "knowledge_vectors_hnsw_d2"}
 
         vb.reset({"model": "m2", "group_threshold": 0.9})

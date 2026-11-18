@@ -12,6 +12,7 @@ from cortex_mem.embed import HashEmbedder
 from cortex_mem.engines.evidence import EvidenceEngine
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
+from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -260,9 +261,9 @@ class RecordingBackend:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def put_vector(self, kind, id, vector):
+    def put_vector(self, kind, id, vector, digest=None):
         self.log.append(("put_vector", kind, id))
-        self._inner.put_vector(kind, id, vector)
+        self._inner.put_vector(kind, id, vector, digest)
 
     def put_group(self, event_id, *args, **kw):
         self.log.append(("put_group", event_id))
@@ -341,12 +342,16 @@ def test_two_runtimes_on_one_store_index_each_event_once(texts, kind, where):
 @pytest.mark.parametrize("kind", ["sqlite", "pg"])
 def test_the_write_log_catches_a_runtime_that_ignores_the_shared_cursor(kind, where):
     """Control for the test above: runtime b told its cursor is always 0
-    re-indexes events a already indexed, and the log shows it."""
+    re-indexes events a already indexed, and the log shows it. The checked
+    set_indexed may refuse b's stale position first (CursorConflict), but only
+    after b's writes, which the log still has."""
     log = []
-    with pytest.raises(AssertionError, match="wrote an event twice"):
+    with pytest.raises((AssertionError, CursorConflict)):
         run_two_runtimes(
             where(kind, "shared.db"), events(), CountingEmbedder(), log, b_cursor=lambda: 0, kind=kind
         )
+    got = writes(log, "put_group")
+    assert len(got) != len(set(got)), "the log shows no event written twice"
 
 
 def evidence_scenario(with_index):

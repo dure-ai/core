@@ -79,7 +79,7 @@ _SCHEMA = (
     ),
     "CREATE INDEX IF NOT EXISTS vector_groups_partition ON vector_groups (scope, owner, seq)",
     "CREATE INDEX IF NOT EXISTS vector_groups_group ON vector_groups (group_id, seq)",
-    "CREATE TABLE IF NOT EXISTS knowledge_vectors (id text PRIMARY KEY, emb vector)",
+    "CREATE TABLE IF NOT EXISTS knowledge_vectors (id text PRIMARY KEY, emb vector, digest text)",
     (
         "CREATE TABLE IF NOT EXISTS embed_cache (model text, digest text, emb vector, "
         "PRIMARY KEY (model, digest))"
@@ -723,14 +723,24 @@ class PgVectorBackend:
                 con.execute(f"DELETE FROM {table}")
             con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
             self._set_meta("meta", encoded)
+            self._set_meta("generation", str(self.generation() + 1))
             self._hnsw_for = None
+
+    def generation(self) -> int:
+        value = self._get_meta("generation")
+        return int(value) if value is not None else 0
 
     def indexed(self) -> int:
         value = self._get_meta("indexed")
         return int(value) if value is not None else 0
 
-    def set_indexed(self, seq: int) -> None:
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():
+            current, now = self.indexed(), self.generation()
+            if current != expected or now != generation:
+                raise CursorConflict(
+                    f"index at {current} (generation {now}), not {expected} (generation {generation})"
+                )
             self._set_meta("indexed", str(seq))
 
     # Dimension and the HNSW index
@@ -812,7 +822,9 @@ class PgVectorBackend:
 
     # Vectors
 
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
         table = _KINDS[kind]
         values = float32(vector)
         self._check_halfvec(values)  # before any write, so the transaction stays usable
@@ -833,10 +845,14 @@ class PgVectorBackend:
                 )
             else:
                 self.db.con.execute(
-                    f"INSERT INTO {table} (id, emb) VALUES (%s, %s::vector) "
-                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb",
-                    (id, _literal(values)),
+                    f"INSERT INTO {table} (id, emb, digest) VALUES (%s, %s::vector, %s) "
+                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb, digest = EXCLUDED.digest",
+                    (id, _literal(values), digest),
                 )
+
+    def knowledge_digests(self) -> dict[str, str]:
+        rows = self.db.query("SELECT id, digest FROM knowledge_vectors WHERE digest IS NOT NULL")
+        return dict(rows)
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         key = "event_id" if kind == "event" else "id"

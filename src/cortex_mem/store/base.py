@@ -99,19 +99,38 @@ class VectorBackend(Protocol):
         ...
 
     def reset(self, meta: dict) -> None:
-        """Drop every vector and group, move the cursor to 0 and record meta.
-        The embedding cache stays."""
+        """Drop every vector (and the knowledge digests) and group, move the cursor
+        to 0, record meta and add 1 to generation(), all in one step. The embedding
+        cache stays."""
+        ...
+
+    def generation(self) -> int:
+        """Which index this is: 0 until the first reset(), then one more for each
+        reset(). Not part of meta(). Durable stores keep it across reopening."""
         ...
 
     def indexed(self) -> int:
         """Position of the last event indexed (0 = none)."""
         ...
 
-    def set_indexed(self, seq: int) -> None: ...
+    def set_indexed(self, expected: int, seq: int, generation: int) -> None:
+        """Move the position from `expected` to seq, atomically. Raises
+        CursorConflict, writing nothing, if indexed() is not `expected` or
+        generation() is not `generation`."""
+        ...
 
     # Vectors (kind: "event" | "knowledge")
-    def put_vector(self, kind: str, id: str, vector: Sequence[float]) -> None:
-        """Store or replace. Replacing keeps the id's original position."""
+    def put_vector(
+        self, kind: str, id: str, vector: Sequence[float], digest: str | None = None
+    ) -> None:
+        """Store or replace. Replacing keeps the id's original position. For
+        "knowledge", digest (of the text the vector was made from) is stored with
+        it, and replacing replaces it (None leaves the id without one); for
+        "event" it is ignored."""
+        ...
+
+    def knowledge_digests(self) -> dict[str, str]:
+        """id -> digest of the knowledge vectors that have one."""
         ...
 
     def vector(self, kind: str, id: str) -> list[float] | None: ...
@@ -123,7 +142,7 @@ class VectorBackend(Protocol):
         ...
 
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
-        """Remove vectors only (not groups); unknown ids are ignored."""
+        """Remove vectors (and knowledge digests) only, not groups; unknown ids are ignored."""
         ...
 
     # Groups
