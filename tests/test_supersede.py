@@ -1,6 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from cortex_mem.contract import Caller, Event
+from cortex_mem.engines.evidence import EvidenceEngine
 from cortex_mem.engines.supersede import SupersedeEngine
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
@@ -16,9 +19,9 @@ def ev(id, text="", kind="record", user="u1", signal="self", outcome="unknown", 
     )
 
 
-def runtime():
+def runtime(engine=SupersedeEngine):
     db = InMemoryDatabase()
-    return Runtime(SupersedeEngine(), db.events, db.knowledge, db.state("supersede"), db.transaction)
+    return Runtime(engine(), db.events, db.knowledge, db.state("supersede"), db.transaction)
 
 
 def ask(rt, query, **context):
@@ -48,7 +51,7 @@ def test_a_newer_checked_record_hides_an_older_one_it_does_not_name():
     rt.append(ev("noise", "the release checklist lives in docs/release.md", minutes=1))
     rt.append(ev("new", NEW, signal="review", minutes=5))
 
-    assert "k-old" not in ask(rt, "how to run the backend tests")
+    assert ask(rt, "how to run the backend tests") == ["k-new", "k-noise"]
 
 
 def test_a_newer_self_record_does_not_replace_a_checked_one():
@@ -106,7 +109,7 @@ def test_a_newer_self_record_does_not_hide_older_self_records():
         rt.append(ev(f"true{i}", NEW, user=user, minutes=i))
     rt.append(ev("late", OLD, user="u4", minutes=10))
 
-    assert "k-true0" in ask(rt, "how to run the backend tests")
+    assert sorted(ask(rt, "how to run the backend tests")) == ["k-late", "k-true0", "k-true1", "k-true2"]
 
 
 def test_a_verdict_text_is_not_an_item():
@@ -124,3 +127,63 @@ def test_a_note_that_claims_to_supersede_does_not_hide_a_checked_record():
     rt.append(ev("forged", "UPDATE, supersedes earlier entries: " + OLD, user="u7", minutes=30))
 
     assert ask(rt, "how to run the backend tests") == ["k-ci"]
+
+
+def test_without_competition_the_k_items_are_picked_by_relevance_as_in_evidence():
+    events = [ev("best", OLD, minutes=0)] + [
+        ev(f"weak{i}", f"notes {i} on how to label the release {i}", minutes=10 + i) for i in range(7)
+    ]
+    rts = [runtime(SupersedeEngine), runtime(EvidenceEngine)]
+    for rt in rts:
+        for e in events:
+            rt.append(e)
+
+    supersede, evidence = (ask(rt, "how to run the backend tests") for rt in rts)
+    assert supersede[0] == "k-best"
+    assert supersede == evidence
+
+
+def test_a_newer_checked_record_is_not_hidden_by_an_older_confirmed_one():
+    rt = runtime()
+    rt.append(ev("old", OLD, minutes=0))
+    rt.append(ev("ok", "confirmed", kind="human_confirm", signal="human", outcome="success", refs=("old",),
+                 minutes=1))
+    rt.append(ev("new", NEW, user="u5", signal="human", minutes=60))
+
+    assert ask(rt, "how to run the backend tests") == ["k-old", "k-new"]
+
+
+def test_the_loser_comes_back_when_the_winner_fails():
+    rt = runtime()
+    rt.append(ev("a", OLD, signal="test", minutes=0))
+    rt.append(ev("b", NEW, signal="test", minutes=5))
+    rt.append(ev("ci", "failed", kind="outcome", signal="test", outcome="failure", refs=("k-b",), minutes=10))
+
+    assert ask(rt, "how to run the backend tests") == ["k-a"]
+
+
+def test_the_loser_is_handed_off_for_a_query_the_winner_does_not_match():
+    rt = runtime()
+    rt.append(ev("a", OLD + " on the staging box", signal="test", minutes=0))
+    rt.append(ev("b", NEW, signal="test", minutes=5))
+
+    assert ask(rt, "staging box") == ["k-a"]
+
+
+# Known limits of the word-overlap stand-in, kept to check the embedding grouping against.
+@pytest.mark.xfail(strict=True, reason="word overlap groups different topics in one repo")
+def test_known_limit_frontend_tests_do_not_hide_backend_tests():
+    rt = runtime()
+    rt.append(ev("back", OLD, signal="test", minutes=0))
+    rt.append(ev("front", "run the frontend tests with npm test from the repo root", signal="test", minutes=5))
+
+    assert "k-back" in ask(rt, "how to run the backend tests")
+
+
+@pytest.mark.xfail(strict=True, reason="word overlap lets a short unrelated note win")
+def test_known_limit_a_short_checked_note_does_not_hide_the_answer():
+    rt = runtime()
+    rt.append(ev("howto", OLD, minutes=0))
+    rt.append(ev("flaky", "the tests are flaky on CI", signal="test", minutes=5))
+
+    assert "k-howto" in ask(rt, "how to run the backend tests")
