@@ -180,3 +180,33 @@ def test_tick_order_is_stable_by_claim_id():
     assert [d.id for d in demotes] == ["c-e10", "c-e2", "c-e3"]
     assert all(d.why == "stale" for d in demotes)
     assert knowledge_ids(db) == []
+
+
+def test_tick_leaves_claims_that_are_not_established_alone():
+    rt, db = runtime(LedgerEngine(REVIEW_90))
+    rt.append(ev("a1", ALPHA, user="u1"))  # candidate
+    rt.append(ev("b1", BETA, user="u1", minutes=1))
+    rt.append(ev("bx", "", kind="outcome", user="u3", signal="self", outcome="failure",
+                 refs=("b1",), minutes=2))
+    rt.append(ev("b2", BETA_NEAR, user="u2", minutes=3))  # provisional: too contested
+    two_observers(rt)
+    rt.append(judgment("e3", "u3", signal="self", outcome="failure", minutes=4))
+    rt.append(judgment("e4", "u4", signal="self", outcome="failure", minutes=5))  # disputed
+    rt.append(ev("g1", GAMMA, user="u1", minutes=6))
+    rt.append(ev("g2", GAMMA_NEAR, user="u2", minutes=7))
+    rt.append(ev("gx", "", kind="outcome", user="u3", signal="test", outcome="failure",
+                 refs=("g1",), minutes=8))  # deprecated
+    before = [c.to_json() for c in state(db).claims()]
+    assert [(c["id"], c["status"]) for c in before] == [
+        ("c-a1", "candidate"),
+        ("c-b1", "provisional"),
+        ("c-e1", "disputed"),
+        ("c-g1", "deprecated"),
+    ]
+    verdicts = len(rt.verdicts)
+
+    rt.tick(T0 + timedelta(days=400))
+
+    assert len(rt.verdicts) == verdicts
+    assert [c.to_json() for c in state(db).claims()] == before
+    assert knowledge_ids(db) == ["c-e1"]  # disputed knowledge stays

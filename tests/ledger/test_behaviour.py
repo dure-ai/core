@@ -13,7 +13,7 @@ from cortex_mem.engines.ledger import LedgerEngine
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.postgres import PostgresDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
-from tests.ledger.helpers import T0, ev, knowledge_ids, runtime, state
+from tests.ledger.helpers import T0, edit_state, ev, knowledge_ids, runtime, state
 
 FACT = "the deploy script must run migrations before restarting the api server every time"
 # Jaccard with FACT is 11/13: the same claim on the lexical path, not a copy.
@@ -202,11 +202,17 @@ def test_another_state_version_rebuilds_the_same_knowledge_base(db, port):
     claims = [(c.id, c.status) for c in state(db).claims()]
     assert before
 
+    edit_state(db, lambda st: st.skip("sentinel"))  # must not survive the reset
+    assert "sentinel" in state(db).skipped()
+
     class Next(LedgerEngine):
         state_version = "2"
 
     rt2, _ = runtime(engine=Next(), db=db, groups=groups)
     rt2.sync()
+    # The reset happened: the old state is gone and the replay decided again.
+    assert "sentinel" not in state(db).skipped()
+    assert [d.item.id for d in decisions_of(rt2, Promote)] == ["c-e1"]
     after = sorted((k.id, k.title, k.body, k.sources) for k in db.knowledge.all())
     assert after == before
     assert [(c.id, c.status) for c in state(db).claims()] == claims
