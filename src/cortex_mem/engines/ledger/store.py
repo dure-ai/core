@@ -13,36 +13,45 @@ from cortex_mem.engines.ledger.model import Claim, Evidence, Memory
 _SKIPPED = "ledger:skipped"
 
 
+def _enc(component: str) -> str:
+    """Percent-encode '%' and ':' so no component holds the raw separator."""
+    return component.replace("%", "%25").replace(":", "%3A")
+
+
+def _dec(component: str) -> str:
+    return component.replace("%3A", ":").replace("%25", "%")
+
+
 def _k_mem(event_id: str) -> str:
-    return f"mem:{event_id}"
+    return f"mem:{_enc(event_id)}"
 
 
 def _k_claim(claim_id: str) -> str:
-    return f"claim:{claim_id}"
+    return f"claim:{_enc(claim_id)}"
 
 
 def _k_ev(claim_id: str, event_id: str) -> str:
-    return f"ev:{claim_id}:{event_id}"
+    return f"ev:{_enc(claim_id)}:{_enc(event_id)}"
 
 
 def _p_ev(claim_id: str) -> str:
-    return f"ev:{claim_id}:"  # trailing colon: c-1 must not match c-10
+    return f"ev:{_enc(claim_id)}:"  # trailing colon: c-1 must not match c-10
 
 
 def _k_seen(session: str, claim_id: str) -> str:
-    return f"seen:{session}:{claim_id}"
+    return f"seen:{_enc(session)}:{_enc(claim_id)}"
 
 
 def _k_grp(group_id: str, claim_id: str) -> str:
-    return f"grp:{group_id}:{claim_id}"
+    return f"grp:{_enc(group_id)}:{_enc(claim_id)}"
 
 
 def _p_grp(group_id: str) -> str:
-    return f"grp:{group_id}:"
+    return f"grp:{_enc(group_id)}:"
 
 
 def _k_sig(scope: Scope, owner: str, signature: str) -> str:
-    return f"sig:{scope}:{owner}:{signature}"
+    return f"sig:{_enc(scope)}:{_enc(owner)}:{_enc(signature)}"
 
 
 class LedgerStore:
@@ -85,7 +94,7 @@ class LedgerStore:
 
     def claims_in_group(self, group_id: str) -> list[str]:
         prefix = _p_grp(group_id)
-        return sorted(key[len(prefix) :] for key, _ in self._s.scan(prefix))
+        return sorted(_dec(key[len(prefix) :]) for key, _ in self._s.scan(prefix))
 
     def add_to_group(self, group_id: str, claim_id: str) -> None:
         key = _k_grp(group_id, claim_id)

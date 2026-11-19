@@ -161,3 +161,53 @@ def test_key_rules() -> None:
     }
     assert st.data["grp:g:c-e1"] is True
     assert st.data["sig:team:t:sg"] == "c-e1"
+
+
+def test_colon_in_claim_id_does_not_collide_evidence() -> None:
+    s = LedgerStore(FakeState())
+    s.put_evidence(ev("c-a", "e1"))
+    s.put_evidence(ev("c-a:b", "e2"))
+    assert [e.event_id for e in s.evidence("c-a")] == ["e1"]
+    assert [e.event_id for e in s.evidence("c-a:b")] == ["e2"]
+
+
+def test_group_ids_with_special_chars() -> None:
+    s = LedgerStore(FakeState())
+    s.add_to_group("g", "c-1")
+    s.add_to_group("g:x", "c-2")
+    s.add_to_group("g", "c:y")
+    s.add_to_group("g", "c%z")
+    s.add_to_group("g", "c%3Ay")
+    assert s.claims_in_group("g") == sorted(["c-1", "c:y", "c%z", "c%3Ay"])
+    assert s.claims_in_group("g:x") == ["c-2"]
+
+
+def test_seen_components_stay_distinct() -> None:
+    s = LedgerStore(FakeState())
+    s.mark_seen("s", "c:1", T0)
+    assert s.seen("s:c", "1") is None
+    assert s.seen("s", "c:1") == T0
+    s.mark_seen("s:c", "1", T0 + timedelta(hours=1))
+    assert s.seen("s", "c:1") == T0
+    assert s.seen("s:c", "1") == T0 + timedelta(hours=1)
+
+
+def test_signature_components_stay_distinct() -> None:
+    s = LedgerStore(FakeState())
+    s.index_signature("team", "t1:x", "sig", "c-1")
+    assert s.claim_by_signature("team", "t1", "x:sig") is None
+    s.index_signature("team", "t1", "x:sig", "c-2")
+    assert s.claim_by_signature("team", "t1:x", "sig") == "c-1"
+    assert s.claim_by_signature("team", "t1", "x:sig") == "c-2"
+
+
+def test_percent_ids_roundtrip() -> None:
+    s = LedgerStore(FakeState())
+    c = claim("c-%41")
+    s.put_claim(c)
+    s.put_evidence(ev("c-%41", "e%3A1"))
+    s.put_memory(Memory("e%1", "c-%41", "u", "t", "s", T0, None))
+    assert s.claim("c-%41") == c
+    assert [x.event_id for x in s.evidence("c-%41")] == ["e%3A1"]
+    assert s.memory("e%1") is not None
+    assert [x.id for x in s.claims()] == ["c-%41"]
