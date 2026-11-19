@@ -102,6 +102,46 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 이벤트(위치 그대로)·지식·엔진 상태와 커서·임베딩 캐시를 옮기고, 벡터와 묶음은 옮기지 않는다. 옮긴 뒤 첫 `sync`가 색인을 다시 만들고 엔진을 처음부터 다시 전달한다(임베딩은 캐시에서 오므로 API를 다시 부르지 않는다). 대상이 비어 있지 않으면 종료 코드 2로 멈춘다. 원본이 스키마 4이면 임베딩 캐시를 쓸 수 없어 다시 임베딩해야 한다는 경고를 stderr에 낸다. 옮기기가 끝나면 원본과 대상의 표별 행 수를 비교한 표를 출력한다.
 
+## LedgerEngine (증거 원장 엔진)
+
+기록을 주장(claim)으로 묶고, 주장마다 독립 출처별 증거를 쌓고, 게이트를 넘은 주장만 지식으로 올리고, 검증된 실패가 오면 근거와 함께 내린다. 독립 출처는 사람(팀 범위) 또는 세션(개인 범위) 단위로 세므로 한 사람의 반복은 한 표다. 건네받은 기억을 다시 말한 기록과 다른 사람의 글을 그대로 옮긴 기록은 표로 세지 않는다. 지식을 받아서 한 일이 성공한 것은 쓸모의 기록일 뿐 참의 표가 아니다. 판정 기록은 `ctx.state`에 두고, 같은 이벤트 순서와 같은 core 묶음이면 같은 결과가 나온다.
+
+엔진 경로는 `cortex_mem.engines.ledger:LedgerEngine`이다. 생성자는 `Mapping[str, str]` 설정만 받고(없으면 기본값), 키가 틀리거나 값이 범위를 벗어나면 `ValueError`로 멈춘다. 서버의 `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`은 팩토리를 빈 설정(`{}`)으로 부르므로 기본값만 쓰인다. 설정을 바꾸려면 코드에서 `LedgerEngine({...})`로 만든다.
+
+`ctx.similar`(임베딩을 켰을 때)가 있으면 core 묶음으로 같은 주장을 찾고, 없으면 글자 비교(토큰 자카드)로 대신한다.
+
+설정 키(값은 모두 문자열이다. 기본값은 `config.py`와 같다):
+
+| 키 | 기본값 | 뜻 |
+|---|---|---|
+| `similar.same_threshold` | `0.0` | core 묶음 안에서 같은 주장으로 보는 이웃 점수(0~1). 0이면 묶음을 그대로 믿는다 |
+| `same_threshold` | `0.8` | 글자 비교 대체 경로에서 같은 주장으로 보는 토큰 자카드(0 초과 1 이하) |
+| `copy_threshold` | `0.9` | 글자를 옮긴 것으로 보는 토큰 자카드. `same_threshold` 이상 1 이하 |
+| `match_pool` | `10` | 같은 주장을 찾을 때 보는 이웃·후보 수(1 이상) |
+| `pool` | `50` | `handoff` 후보 수. 후보 목록마다(1 이상) |
+| `gate.<scope>.min_sources` | `2` | 지지하는 독립 출처 수. `<scope>`는 `personal`·`team` |
+| `gate.<scope>.alt_verified` | `1` | 출처가 모자랄 때 대신 채우는 검증된 지지 출처 수 |
+| `gate.<scope>.require_verified` | `false` | 검증된 지지가 반드시 있어야 하는가(`true`·`false`만) |
+| `gate.<scope>.min_span_days` | `0` | 첫 지지와 마지막 지지의 최소 간격(일) |
+| `gate.<scope>.max_contra_ratio` | `0.20`(personal), `0.15`(team) | 반박 점수 비율 C/(S+C)의 상한(0~1) |
+| `weight.<channel>` | observation `1.0`, review `1.5`, test `2.0`, doc `2.0`, human `3.0` | 채널별 증거 가중. `<channel>`은 `observation`·`review`·`test`·`doc`·`human` |
+| `trust.observation` | `0.7` | 에이전트 자기 보고(`observation`)의 신뢰 |
+| `alpha`, `beta` | `1.0`, `1.0` | 신뢰도 `(S+α)/(S+C+α+β)`의 사전값 |
+| `status_weight.<status>` | candidate `0.5`, provisional `0.6`, established `1.0`, disputed `0.4` | 건넬 때 순위에 곱하는 상태 가중 |
+| `own_candidate_weight` | `0.7` | 호출자 본인의 candidate 가중 |
+| `review_after_days` | `0` | 이 기간 지지가 없는 established를 보관 처리한다. 0이면 끈다 |
+| `half_life_days` | `0` | 건넬 때 최신성 가중의 반감기. 0이면 끈다 |
+| `high_risk_terms` | 빈 값 | 쉼표로 나눈 단어(공백 제거, 소문자). 본문에 들어 있으면 사람 확인이 필요하다 |
+
+가중, 신뢰, `alpha`, `beta`, 상태 가중, `own_candidate_weight`, `*_days`, `min_sources`, `alt_verified`는 0 이상이어야 한다.
+
+한계:
+
+- core 묶음은 경쟁하는 사실도 묶을 수 있다. 조건이 다른 기록과 내려간 주장에 붙는 기록만 나눈다. 묶음 안의 모순 판정은 작은 LLM 판정이 들어온 뒤에 한다.
+- 임베딩이 없으면 서로 다른 사람의 기록을 글자만으로는 거의 묶지 못한다.
+- v0.1 범위는 personal·team이고 org 범위 기록은 주장을 만들지 않는다.
+- 고위험 단어가 든 본문은 그 본문이 대표가 된 뒤의 사람 확인이 있어야 지식이 된다.
+
 ## 임베딩
 
 core는 `record` 이벤트와 지식 항목을 임베딩해 저장하고, 같은 (범위, 소유자) 안에서 비슷한 기록을 묶음(group)으로 묶는다. 엔진은 `ctx.similar`로 이 색인을 읽는다. 임베딩을 켜지 않으면 `ctx.similar`는 `None`이고 동작은 이전과 같다. 이벤트는 엔진에 전달되기 전에 색인된다(색인은 전달 앞의 별도 단계다). PostgreSQL이 기준 저장소이고, 인메모리·SQLite는 PostgreSQL과 같은 묶음을 만들며 점수는 약 1e-6 이내에서 같다(차원이 커질수록 오차가 커진다. 4096차원에서 8e-7까지 측정).
