@@ -211,3 +211,15 @@ def test_percent_ids_roundtrip() -> None:
     assert [x.event_id for x in s.evidence("c-%41")] == ["e%3A1"]
     assert s.memory("e%1") is not None
     assert [x.id for x in s.claims()] == ["c-%41"]
+
+
+def test_judged_round_trip_and_components_do_not_collide():
+    st = LedgerStore(FakeState())
+    assert not st.judged("c-1", "e1")
+    st.mark_judged("c-1", "e1")
+    assert st.judged("c-1", "e1")
+    assert not st.judged("c-1", "e2") and not st.judged("c-2", "e1")
+    st.mark_judged("a:b", "c")
+    assert not st.judged("a", "b:c")
+    st.mark_judged("a%3Ab", "d")
+    assert not st.judged("a:b", "d")

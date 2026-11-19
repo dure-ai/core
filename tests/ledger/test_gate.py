@@ -159,3 +159,14 @@ def test_promoted_claims_still_deprecate_on_strong_contradiction():
     t = tl(S=1.4, C=2.0, keys=2, contra_keys=1, vc=True)
     assert evaluate(claim("established"), t, "t", CFG).decision == "deprecated"
     assert evaluate(claim("disputed"), t, "t", CFG).decision == "deprecated"
+
+
+def test_high_risk_needs_fresh_human_support_not_just_any():
+    t = tl(S=3.0, keys=2, verified=1, by={"human": 1, "observation": 1})
+    risky = replace(CFG, high_risk_terms=("password",))
+    stale = evaluate(claim(), t, "the password", risky, human_fresh=False)
+    assert stale.checks["high_risk"] is False and stale.decision != "established"
+    fresh = evaluate(claim(), t, "the password", risky, human_fresh=True)
+    assert fresh.checks["high_risk"] is True and fresh.decision == "established"
+    benign = evaluate(claim(), t, "all fine", risky, human_fresh=False)
+    assert benign.checks["high_risk"] is True

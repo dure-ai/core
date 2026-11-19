@@ -42,6 +42,10 @@ def _k_seen(session: str, claim_id: str) -> str:
     return f"seen:{_enc(session)}:{_enc(claim_id)}"
 
 
+def _k_judged(claim_id: str, event_id: str) -> str:
+    return f"judged:{_enc(claim_id)}:{_enc(event_id)}"
+
+
 def _k_grp(group_id: str, claim_id: str) -> str:
     return f"grp:{_enc(group_id)}:{_enc(claim_id)}"
 
@@ -91,6 +95,12 @@ class LedgerStore:
         key = _k_seen(session, claim_id)
         if self._s.get(key) is None:
             self._s.put(key, at.isoformat())
+
+    def judged(self, claim_id: str, event_id: str) -> bool:
+        return self._s.get(_k_judged(claim_id, event_id)) is not None
+
+    def mark_judged(self, claim_id: str, event_id: str) -> None:
+        self._s.put(_k_judged(claim_id, event_id), True)
 
     def claims_in_group(self, group_id: str) -> list[str]:
         prefix = _p_grp(group_id)

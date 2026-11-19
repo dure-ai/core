@@ -32,8 +32,21 @@ class GateReport:
         }
 
 
-def evaluate(claim: Claim, t: Tally, text: str, cfg: LedgerConfig) -> GateReport:
-    """Run the gate checks for a claim and decide its next status."""
+def evaluate(
+    claim: Claim,
+    t: Tally,
+    text: str,
+    cfg: LedgerConfig,
+    *,
+    human_fresh: bool | None = None,
+) -> GateReport:
+    """Run the gate checks for a claim and decide its next status.
+
+    `human_fresh`: whether non-derived human support exists at or after the
+    canonical record's time (spec 9, high-risk topics). None falls back to
+    any human support in the tally."""
+    if human_fresh is None:
+        human_fresh = t.by_channel.get("human", 0) > 0
     rule = cfg.gates.get(claim.scope)
     if rule is None:
         raise ValueError(f"no gate rule for scope: {claim.scope!r}")
@@ -52,7 +65,7 @@ def evaluate(claim: Claim, t: Tally, text: str, cfg: LedgerConfig) -> GateReport
     lowered = text.lower()
     high_risk = (
         not any(term in lowered for term in cfg.high_risk_terms)
-        or t.by_channel.get("human", 0) > 0
+        or human_fresh
     )
     checks = {
         "sources": sources,

@@ -241,7 +241,7 @@ RISK_CFG = {"high_risk_terms": "password"}
 
 def risky_setup():
     rt, db = runtime(
-        engine=LedgerEngine(RISK_CFG), groups={"e1": "g", "e2": "g", "e3": "g"}
+        engine=LedgerEngine(RISK_CFG), groups={"e1": "g", "e2": "g", "e3": "g", "e5": "g"}
     )
     rt.append(ev("e1", FACT, user="u1"))
     rt.append(ev("e2", NEAR, user="u2", minutes=1))
@@ -273,4 +273,33 @@ def test_a_sticky_established_claim_without_a_canonical_change_does_not_promote_
     rt, db = risky_setup()
     rt.append(judgment("e3", "u3", signal="review", minutes=2))
     assert state(db).claim("c-e1").status == "established"
+    assert len(decisions_of(rt, Promote)) == 1
+
+
+def test_human_support_given_before_a_riskier_canonical_does_not_cover_it():
+    rt, db = runtime(
+        engine=LedgerEngine(RISK_CFG), groups={"e1": "g", "e3": "g", "e4": "g"}
+    )
+    rt.append(ev("e1", FACT, user="u1"))
+    rt.append(judgment("e2", "u2", kind="human_confirm", signal=None, minutes=1))
+    assert len(decisions_of(rt, Promote)) == 1
+
+    rt.append(ev("e3", RISKY, user="u3", signal="test", minutes=2))
+    assert len(decisions_of(rt, Promote)) == 1
+    assert state(db).claim("c-e1").canonical == "e1"
+    assert "password" not in db.knowledge.all()[0].body
+
+    rt.append(judgment("e4", "u4", kind="human_confirm", signal=None, minutes=3))
+    assert len(decisions_of(rt, Promote)) == 2
+    assert state(db).claim("c-e1").canonical == "e3"
+    assert "password" in db.knowledge.all()[0].body
+
+
+def test_a_disputed_claim_does_not_take_a_high_risk_canonical_either():
+    rt, db = risky_setup()
+    rt.append(judgment("e3", "u3", signal="self", outcome="failure", minutes=2))
+    rt.append(judgment("e4", "u4", signal="self", outcome="failure", minutes=3))
+    assert state(db).claim("c-e1").status == "disputed"
+    rt.append(ev("e5", RISKY, user="u5", signal="test", minutes=4))
+    assert state(db).claim("c-e1").canonical == "e1"
     assert len(decisions_of(rt, Promote)) == 1

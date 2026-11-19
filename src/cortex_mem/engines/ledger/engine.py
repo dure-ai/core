@@ -164,12 +164,9 @@ class LedgerEngine:
             if not in_scope(event, claim):
                 store.skip("out_of_scope_evidence")
                 continue
-            marker = f"judged:{claim_id.replace('%', '%25').replace(':', '%3A')}:" + (
-                event.id.replace("%", "%25").replace(":", "%3A")
-            )
-            if ctx.state.get(marker) is not None:
+            if store.judged(claim_id, event.id):
                 continue  # delivered again: this judgment is already counted
-            ctx.state.put(marker, True)
+            store.mark_judged(claim_id, event.id)
             out += self._judge_claim(claim, event, ctx, store)
         return out
 
@@ -226,6 +223,22 @@ class LedgerEngine:
         seen = store.seen(event.session, claim_id)
         return seen is not None and seen < event.at
 
+    @staticmethod
+    def _human_fresh(
+        evidence: Sequence[Evidence], canonical: str, store: LedgerStore
+    ) -> bool:
+        """Human support (not derived) at or after the canonical record's time."""
+        memory = store.memory(canonical)
+        if memory is None:
+            return False
+        return any(
+            e.channel == "human"
+            and e.stance == "support"
+            and e.derived is None
+            and e.at >= memory.at
+            for e in evidence
+        )
+
     def _reevaluate(
         self, claim: Claim, trigger: Event, ctx: EngineContext, store: LedgerStore
     ) -> list[Decision]:
@@ -246,9 +259,15 @@ class LedgerEngine:
         text = found[0].text if found else ""
 
         counted = tally(evidence, self._cfg)
-        report = evaluate(claim, counted, text, self._cfg)
+        report = evaluate(
+            claim,
+            counted,
+            text,
+            self._cfg,
+            human_fresh=self._human_fresh(evidence, canonical, store),
+        )
         if (
-            before == "established"
+            before in ("established", "disputed")
             and canonical != canonical_before
             and not all(report.checks.values())
         ):
@@ -257,7 +276,13 @@ class LedgerEngine:
             canonical = canonical_before
             found = ctx.events.get([canonical])
             text = found[0].text if found else ""
-            report = evaluate(claim, counted, text, self._cfg)
+            report = evaluate(
+                claim,
+                counted,
+                text,
+                self._cfg,
+                human_fresh=self._human_fresh(evidence, canonical, store),
+            )
         claim.status = report.decision
         claim.report = report.to_json()
         claim.canonical = canonical
