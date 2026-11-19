@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cortex_mem.engines.ledger.config import LedgerConfig
-from cortex_mem.engines.ledger.evidence import Tally
+from cortex_mem.engines.ledger.evidence import Tally, tally
 from cortex_mem.engines.ledger.gate import GateReport, evaluate
-from cortex_mem.engines.ledger.model import Claim
+from cortex_mem.engines.ledger.model import Claim, Evidence
 
 KST = timezone(timedelta(hours=9))
 T0 = datetime(2026, 11, 19, 10, 0, tzinfo=KST)
@@ -175,3 +175,45 @@ def test_high_risk_needs_fresh_human_support_not_just_any():
 def test_human_fresh_must_be_given():
     with pytest.raises(TypeError, match="human_fresh"):
         evaluate(claim(), tl(), "t", CFG)  # type: ignore[call-arg]
+
+
+def _evidence(stance: str, counts: dict[str, int], tag: str) -> list[Evidence]:
+    # Keys sort observation first, then review, test, human: the order tally adds them in.
+    order = ("observation", "review", "test", "human")
+    rows = []
+    for rank, channel in enumerate(order):
+        for i in range(counts.get(channel, 0)):
+            key = f"u:{tag}{rank}{channel}{i}"
+            rows.append(Evidence(claim_id="c1", event_id=f"{key}-{stance}", stance=stance,
+                                 channel=channel, key=key, user=key, at=T0, derived=None))
+    return rows
+
+
+def test_a_contradiction_ratio_exactly_at_the_limit_passes():
+    # S = 4*0.7 + 1.5 + 2.0 + 3*3.0 = 15.3, C = 0.7 + 2.0 = 2.7; C/(S+C) = 0.15 exactly,
+    # which a plain float division puts just above the team limit of 0.15.
+    rows = _evidence("support", {"observation": 4, "review": 1, "test": 1, "human": 3}, "s")
+    rows += _evidence("contradict", {"observation": 1, "test": 1}, "c")
+    r = evaluate(claim(), tally(rows, CFG), "text", CFG, human_fresh=False)
+    assert r.checks["contradiction"] is True
+    assert r.decision == "established"
+
+
+def _in_key_order(stance: str, channels: str, tag: str) -> list[Evidence]:
+    names = {"o": "observation", "r": "review", "t": "test", "h": "human"}
+    rows = []
+    for i, c in enumerate(channels):
+        key = f"u:{tag}{i:02d}"
+        rows.append(Evidence(claim_id="c1", event_id=f"{key}-{stance}", stance=stance,
+                             channel=names[c], key=key, user=key, at=T0, derived=None))
+    return rows
+
+
+def test_verified_contradiction_equal_to_support_deprecates():
+    # S = 0.7 + 1.5 + 0.7 = 2.9 and C = 0.7 + 0.7 + 1.5 = 2.9 exactly. Added in key order
+    # the float S is 2.9000000000000004, so a plain C >= S misses the tie.
+    rows = _in_key_order("support", "oro", "s") + _in_key_order("contradict", "oor", "c")
+    t = tally(rows, CFG)
+    assert t.C < t.S  # the float sums really do miss the tie
+    r = evaluate(claim(status="established"), t, "text", CFG, human_fresh=False)
+    assert r.decision == "deprecated"

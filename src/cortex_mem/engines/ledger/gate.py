@@ -13,6 +13,10 @@ from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.evidence import Tally
 from cortex_mem.engines.ledger.model import Claim, ClaimStatus
 
+# S and C are float sums of decimal weights (0.7 has no exact binary form), so a tie that is
+# exact in decimals can land a few ulps either side. Ties at a gate limit count as reached.
+_TIE = 1e-9
+
 
 @dataclass(frozen=True)
 class GateReport:
@@ -59,7 +63,7 @@ def evaluate(
         and t.last_support - t.first_support >= rule.min_span
     )
     total = t.S + t.C
-    contradiction = total == 0 or t.C / total <= rule.max_contra_ratio
+    contradiction = total == 0 or t.C / total <= rule.max_contra_ratio + _TIE
     lowered = text.lower()
     high_risk = (
         not any(term in lowered for term in cfg.high_risk_terms)
@@ -74,7 +78,7 @@ def evaluate(
     }
 
     decision: ClaimStatus
-    if t.verified_contra and t.C >= t.S:
+    if t.verified_contra and t.C >= t.S - _TIE * max(1.0, t.S):
         decision = "deprecated"
     elif all(checks.values()):
         decision = "established"
