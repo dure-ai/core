@@ -1,0 +1,28 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+# The job only reads the title from the event payload; it needs no token access.
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # We squash-merge, so the PR title becomes the commit subject on main.
+      - name: Check the title follows Conventional Commits
+        env:
+          # Passed through the environment so the title is never interpolated into the script.
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|docs|test|refactor|perf|ci|build|chore|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*$'
+          if printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "OK: $TITLE"
+          else
+            echo "::error::PR title must look like 'type(scope): description', for example 'fix(server): reject an empty team'."
+            echo "Allowed types: feat, fix, docs, test, refactor, perf, ci, build, chore, revert. The scope is optional."
+            echo "Got: $TITLE"
+            exit 1
+          fi
