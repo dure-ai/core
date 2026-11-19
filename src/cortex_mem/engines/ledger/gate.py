@@ -67,11 +67,7 @@ def evaluate(claim: Claim, t: Tally, text: str, cfg: LedgerConfig) -> GateReport
         decision = "deprecated"
     elif all(checks.values()):
         decision = "established"
-    elif (
-        not contradiction
-        and all(v for k, v in checks.items() if k != "contradiction")
-        and claim.status in ("established", "disputed")
-    ):
+    elif not contradiction and claim.status in ("established", "disputed"):
         decision = "disputed"
     elif sources:
         decision = "provisional"

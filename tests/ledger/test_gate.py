@@ -114,3 +114,20 @@ def test_report_json_is_plain():
     assert isinstance(j["S"], float) and isinstance(j["confidence"], float)
     import json
     json.dumps(j)
+
+
+def test_established_disputed_even_when_span_fails():
+    c = cfg(min_span=timedelta(days=3))
+    t = tl(S=1.4, C=1.0, keys=2, contra_keys=1, span_days=0)
+    assert evaluate(claim("established"), t, "t", c).decision == "disputed"
+
+
+def test_established_disputed_even_when_sources_fail():
+    t = tl(S=0.7, C=0.7, keys=1, contra_keys=1)
+    assert evaluate(claim("established"), t, "t", CFG).decision == "disputed"
+
+
+def test_disputed_stays_disputed_when_verified_fails():
+    t = tl(S=1.4, C=1.0, keys=2, contra_keys=1)
+    r = evaluate(claim("disputed"), t, "t", cfg(require_verified=True))
+    assert r.decision == "disputed"
