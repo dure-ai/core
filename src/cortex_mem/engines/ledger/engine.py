@@ -184,6 +184,11 @@ class LedgerEngine:
     ) -> list[Decision]:
         """Spec section 6, `outcome` and `human_confirm`: add support or
         contradiction to the claims the refs name, when in scope."""
+        if event.scope == "org":
+            # v0.1 covers personal and team only: an org judgment would let
+            # other teams vote and hide the claim from team-scope handoffs
+            store.skip("org_scope")
+            return []
         if event.outcome not in ("success", "failure"):
             store.skip("unknown_outcome")
             return []

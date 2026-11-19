@@ -129,6 +129,42 @@ def test_a_human_confirmed_claim_survives_one_test_failure():
     assert state(db).claim("c-e1").status != "deprecated"
 
 
+def org_judgment(id, user, team, *, signal, outcome, minutes):
+    return ev(id, "", kind="outcome", user=user, team=team, signal=signal, outcome=outcome,
+              refs=("e1",), scope="org", minutes=minutes)
+
+
+def team_handoff(rt):
+    caller = Caller(user="u3", team="t1", session="s9", at=T0 + timedelta(minutes=10))
+    return [(h.id, h.status) for h in rt.handoff("deploy migrations api server", caller, "team")]
+
+
+def test_an_org_success_from_another_team_is_not_evidence():
+    rt, db = runtime()
+    two_observers(rt)
+    assert team_handoff(rt) == [("c-e1", "knowledge")]
+
+    rt.append(org_judgment("e3", "u9", "t2", signal="review", outcome="success", minutes=2))
+
+    assert team_handoff(rt) == [("c-e1", "knowledge")]
+    assert {e.event_id for e in state(db).evidence("c-e1")} == {"e1", "e2"}
+    assert state(db).skipped() == {"org_scope": 1}
+    assert rt.rejections == []
+
+
+def test_an_org_test_failure_from_another_team_does_not_demote_team_knowledge():
+    rt, db = runtime()
+    two_observers(rt)
+
+    rt.append(org_judgment("e3", "z1", "t2", signal="test", outcome="failure", minutes=2))
+
+    assert decisions_of(rt, Demote) == []
+    assert knowledge_ids(db) == ["c-e1"]
+    assert state(db).claim("c-e1").status == "established"
+    assert {e.event_id for e in state(db).evidence("c-e1")} == {"e1", "e2"}
+    assert state(db).skipped() == {"org_scope": 1}
+
+
 def test_judgment_refs_may_name_the_claim_or_its_record():
     results = []
     for ref in ("c-e1", "e1"):
