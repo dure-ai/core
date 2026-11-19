@@ -10,6 +10,7 @@ from collections.abc import Collection, Sequence
 
 from cortex_mem.contract import Decision, Demote, Event, Knowledge, Promote
 from cortex_mem.engines.ledger.config import LedgerConfig
+from cortex_mem.engines.ledger.evidence import VERIFIED
 from cortex_mem.engines.ledger.model import Claim, ClaimStatus, Evidence
 
 TITLE_LENGTH = 80
@@ -108,6 +109,27 @@ def decisions(
             f"(C={float(report.get('C', 0.0)):.2f} >= S={float(report.get('S', 0.0)):.2f})"
         )
         return [
-            Demote(claim.id, reason, (trigger.id,), why="invalid", since=trigger.at)
+            Demote(
+                claim.id,
+                reason,
+                _contradictions(evidence, trigger),
+                why="invalid",
+                since=trigger.at,
+            )
         ]
     return []
+
+
+def _contradictions(evidence: Sequence[Evidence], trigger: Event) -> tuple[str, ...]:
+    """Event ids a Demote(why="invalid") cites: the verified (non-derived)
+    contradiction events, oldest first, then the trigger if not among them.
+    The trigger may be a self-report that only tipped C >= S."""
+    rows = [
+        e
+        for e in evidence
+        if e.stance == "contradict" and e.derived is None and e.channel in VERIFIED
+    ]
+    rows.sort(key=lambda e: (e.at, e.event_id))
+    ids = dict.fromkeys(e.event_id for e in rows)
+    ids.setdefault(trigger.id)
+    return tuple(ids)

@@ -119,6 +119,21 @@ def test_a_tested_failure_demotes_with_the_reason():
     assert claim.status == "deprecated" and claim.invalid_since == demote.since
 
 
+def test_a_demote_cites_the_verified_failures_not_only_the_one_that_tipped_it():
+    rt, db = runtime()
+    rt.append(ev("e1", FACT, user="u1"))
+    rt.append(judgment("e2", "u2", signal="review", minutes=1))
+    rt.append(judgment("e3", "u3", signal="test", outcome="failure", minutes=2))
+    assert state(db).claim("c-e1").status == "disputed"
+
+    rt.append(judgment("e4", "u4", signal="self", outcome="failure", minutes=3))
+
+    [demote] = decisions_of(rt, Demote)
+    assert demote.why == "invalid" and demote.since == T0 + timedelta(minutes=3)
+    assert demote.sources == ("e3", "e4")
+    assert rt.rejections == []
+
+
 def test_a_human_confirmed_claim_survives_one_test_failure():
     rt, db = runtime()
     rt.append(ev("e1", FACT))
