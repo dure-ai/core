@@ -9,12 +9,13 @@ no effect beyond the state and the decisions returned.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from cortex_mem.access import owner_for
 from cortex_mem.contract import (
     Caller,
     Decision,
+    Demote,
     EngineContext,
     Event,
     Handoff,
@@ -56,7 +57,34 @@ class LedgerEngine:
         return []
 
     def tick(self, now: datetime, ctx: EngineContext) -> Sequence[Decision]:
-        return []
+        """Spec section 10: when `review_after` is set, archive each established
+        claim whose last support is older than it, and demote its knowledge.
+        Claims are decided in id order; the result is idempotent because an
+        archived claim is no longer established."""
+        if not self._cfg.review_after:
+            return []
+        store = LedgerStore(ctx.state)
+        review_days = self._cfg.review_after / timedelta(days=1)
+        out: list[Decision] = []
+        for claim in store.claims():
+            if claim.status != "established":
+                continue
+            if now - claim.last_support_at <= self._cfg.review_after:
+                continue
+            claim.status = "archived"
+            if claim.promoted:
+                claim.promoted = False
+                out.append(
+                    Demote(
+                        claim.id,
+                        f"no support for over {review_days:g} days",
+                        (claim.canonical,),
+                        why="stale",
+                        since=now,
+                    )
+                )
+            store.put_claim(claim)
+        return out
 
     def handoff(
         self, query: str, caller: Caller, scope: Scope, ctx: EngineContext, k: int = 6
