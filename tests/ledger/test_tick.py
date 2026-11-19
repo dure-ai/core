@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from cortex_mem.contract import Caller, Demote
+from cortex_mem.contract import Caller, Demote, Promote
 from cortex_mem.engines.ledger import LedgerEngine
 from tests.ledger.helpers import T0, ev, knowledge_ids, runtime, state
 
@@ -85,6 +85,82 @@ def test_archived_claims_take_no_new_records_and_are_not_handed_off():
     fresh = state(db).claim("c-e3")
     assert fresh is not None and fresh.status == "candidate"
     assert knowledge_ids(db) == []
+
+
+DAY = 60 * 24  # minutes
+ARCHIVED_AT = T0 + timedelta(days=100)
+
+
+def judgment(id, user, *, signal, outcome, minutes, kind="outcome"):
+    return ev(id, "", kind=kind, user=user, signal=signal, outcome=outcome, refs=("e1",),
+              minutes=minutes)
+
+
+def archived_runtime():
+    rt, db = runtime(LedgerEngine(REVIEW_90))
+    two_observers(rt)
+    rt.tick(ARCHIVED_AT)
+    assert state(db).claim("c-e1").status == "archived"
+    return rt, db
+
+
+def test_a_tick_records_when_a_claim_was_archived():
+    _, db = archived_runtime()
+    assert state(db).claim("c-e1").invalid_since == ARCHIVED_AT
+
+
+def test_failures_on_an_archived_claim_collect_evidence_but_do_not_revive_it():
+    rt, db = archived_runtime()
+    rt.append(judgment("e3", "u3", signal="self", outcome="failure", minutes=101 * DAY))
+    rt.append(judgment("e4", "u4", signal="test", outcome="failure", minutes=102 * DAY))
+
+    claim = state(db).claim("c-e1")
+    assert claim.status == "archived" and claim.use_failure == 1
+    assert {e.event_id for e in state(db).evidence("c-e1")} == {"e1", "e2", "e3", "e4"}
+    assert rt.handoff("deploy migrations api server", caller(T0 + timedelta(days=103)), "team") == []
+    assert knowledge_ids(db) == []
+    assert len(decisions_of(rt, Demote)) == 1  # only the stale one
+
+    rt.tick(T0 + timedelta(days=400))
+    assert state(db).claim("c-e1").status == "archived"
+
+
+def test_support_that_is_not_verified_or_not_after_the_archival_does_not_revive():
+    rt, db = archived_runtime()
+    rt.append(judgment("e3", "u3", signal="review", outcome="success", minutes=50 * DAY))
+    rt.append(ev("r1", "", kind="recall", user="u4", session="s9", refs=("c-e1",),
+                 minutes=101 * DAY))
+    rt.append(ev("e4", "", kind="outcome", user="u4", session="s9", signal="self",
+                 outcome="success", refs=("e1",), minutes=102 * DAY))
+
+    claim = state(db).claim("c-e1")
+    assert claim.status == "archived" and claim.invalid_since == ARCHIVED_AT
+    assert knowledge_ids(db) == []
+    assert len(decisions_of(rt, Promote)) == 1
+
+
+def test_verified_support_after_the_archival_revives_and_promotes_again():
+    rt, db = archived_runtime()
+    rt.append(judgment("e3", "u3", signal="review", outcome="success", minutes=101 * DAY))
+
+    claim = state(db).claim("c-e1")
+    assert claim.status == "established" and claim.invalid_since is None
+    assert knowledge_ids(db) == ["c-e1"]
+    assert len(decisions_of(rt, Promote)) == 2
+    assert rt.rejections == []
+
+
+def test_a_revived_archived_claim_is_promoted_only_if_the_gate_passes():
+    rt, db = archived_runtime()
+    rt.append(judgment("e3", "u3", signal="self", outcome="failure", minutes=101 * DAY))
+    rt.append(judgment("e4", "u4", signal="self", outcome="failure", minutes=101 * DAY + 1))
+    rt.append(judgment("e5", "u5", signal="review", outcome="success", minutes=102 * DAY))
+
+    claim = state(db).claim("c-e1")
+    assert claim.status == "provisional" and claim.invalid_since is None
+    assert claim.report["checks"]["contradiction"] is False
+    assert knowledge_ids(db) == []
+    assert len(decisions_of(rt, Promote)) == 1
 
 
 def test_tick_order_is_stable_by_claim_id():

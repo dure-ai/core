@@ -39,6 +39,11 @@ from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import signature
 
 
+# Claims taken down (spec 9): they collect evidence but are not re-judged,
+# until verified support dated after `invalid_since` revives them.
+_DOWN = ("deprecated", "archived")
+
+
 class LedgerEngine:
     state_version = "1"
 
@@ -59,8 +64,11 @@ class LedgerEngine:
     def tick(self, now: datetime, ctx: EngineContext) -> Sequence[Decision]:
         """Spec section 10: when `review_after` is set, archive each established
         claim whose last support is older than it, and demote its knowledge.
-        Claims are decided in id order; the result is idempotent because an
-        archived claim is no longer established."""
+        The archival time goes to `invalid_since`: like a deprecated claim, an
+        archived one only collects evidence until verified support dated
+        after it revives the claim. Claims are decided in id order; the
+        result is idempotent because an archived claim is no longer
+        established."""
         if not self._cfg.review_after:
             return []
         store = LedgerStore(ctx.state)
@@ -72,6 +80,7 @@ class LedgerEngine:
             if now - claim.last_support_at <= self._cfg.review_after:
                 continue
             claim.status = "archived"
+            claim.invalid_since = now  # only verified support after it revives
             if claim.promoted:
                 claim.promoted = False
                 out.append(
@@ -231,7 +240,8 @@ class LedgerEngine:
                 derived=None,
             )
         )
-        if claim.status != "deprecated":
+        down = claim.status
+        if down not in _DOWN:
             return self._reevaluate(claim, event, ctx, store)
         since = claim.invalid_since
         if not (
@@ -240,11 +250,11 @@ class LedgerEngine:
             and since is not None
             and event.at > since
         ):
-            store.put_claim(claim)  # deprecated claims only collect evidence
+            store.put_claim(claim)  # down claims only collect evidence
             return []
         claim.invalid_since = None  # revived: judged again from its evidence
         out = self._reevaluate(claim, event, ctx, store)
-        if claim.status == "deprecated":
+        if claim.status == down:
             claim.invalid_since = since
             store.put_claim(claim)
         return out
