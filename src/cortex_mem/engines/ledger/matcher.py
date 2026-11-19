@@ -10,7 +10,7 @@ from typing import NamedTuple, Protocol
 from cortex_mem.access import owner_for
 from cortex_mem.contract import Caller, EngineContext, Event
 from cortex_mem.engines.ledger.config import LedgerConfig
-from cortex_mem.engines.ledger.model import Claim
+from cortex_mem.engines.ledger.model import Claim, Memory
 from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import jaccard, signature
@@ -117,17 +117,8 @@ class LexicalMatcher:
             claim = store.claim(cid)
             if claim is not None and _eligible(claim, event):
                 return Match(cid, 1.0, _copied_from(event, claim, ctx, store, self._cfg))
-        hits = ctx.events.search(
-            event.text, _author(event), event.scope,
-            k=self._cfg.match_pool, kinds=("record",),
-        )
         best: tuple[float, str, str] | None = None  # (score, claim id, event id)
-        for other, _ in hits:
-            if other.id == event.id:
-                continue
-            memory = store.memory(other.id)
-            if memory is None:
-                continue
+        for other, memory in self._observed_hits(event, ctx, store):
             claim = store.claim(memory.claim_id)
             if not _eligible(claim, event):
                 continue
@@ -142,6 +133,36 @@ class LexicalMatcher:
         claim = store.claim(best[1])
         assert claim is not None
         return Match(best[1], best[0], _copied_from(event, claim, ctx, store, self._cfg))
+
+    def _observed_hits(
+        self, event: Event, ctx: EngineContext, store: LedgerStore
+    ) -> list[tuple[Event, Memory]]:
+        """The first `match_pool` search hits that the engine has observed
+        (they have a memory), in search order, never the event itself.
+
+        `ctx.events` is the whole log, not bounded to this event like
+        `ctx.similar` (spec 13): records later in the log take pool slots
+        during a batched sync or a rebuild. Skipping them and widening the
+        search (doubling k) until the pool is full or the search runs out
+        keeps a replay matching like live delivery."""
+        pool = self._cfg.match_pool
+        k = pool
+        while True:
+            hits = ctx.events.search(
+                event.text, _author(event), event.scope, k=k, kinds=("record",)
+            )
+            observed: list[tuple[Event, Memory]] = []
+            for other, _ in hits:
+                if other.id == event.id:
+                    continue
+                memory = store.memory(other.id)
+                if memory is not None:
+                    observed.append((other, memory))
+                    if len(observed) == pool:
+                        return observed
+            if len(hits) < k:
+                return observed
+            k *= 2
 
 
 def group_of(event: Event, ctx: EngineContext) -> str | None:

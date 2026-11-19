@@ -34,6 +34,19 @@ def db(request):
             yield pg
 
 
+@pytest.fixture
+def another_db(db, request):
+    """A second, empty database of the same kind as `db`."""
+    if isinstance(db, InMemoryDatabase):
+        yield InMemoryDatabase()
+    elif isinstance(db, SqliteDatabase):
+        yield SqliteDatabase()
+    else:
+        url = request.getfixturevalue("pg_schemas")()
+        with closing(PostgresDatabase(url)) as pg:
+            yield pg
+
+
 def decisions_of(rt, kind):
     return [v.decision for v in rt.verdicts if isinstance(v.decision, kind)]
 
@@ -198,3 +211,42 @@ def test_another_state_version_rebuilds_the_same_knowledge_base(db, port):
     assert after == before
     assert [(c.id, c.status) for c in state(db).claims()] == claims
     assert rt2.rejections == []
+
+
+def _look_alikes_after_the_match():
+    """FACT and NEAR make one claim; twelve later records look like them and
+    sit in the log before a batched sync has observed them."""
+    out = [ev("e1", FACT, user="u1"), ev("e2", NEAR, user="u2", minutes=1)]
+    out += [ev(f"f{i:02d}", NEAR + " again", user="u3", minutes=2 + i) for i in range(12)]
+    return out
+
+
+def _outcome(db):
+    return (
+        [(c.id, c.status, c.canonical) for c in state(db).claims()],
+        sorted((k.id, k.title, k.body, k.sources) for k in db.knowledge.all()),
+        {c.id: sorted(e.event_id for e in state(db).evidence(c.id)) for c in state(db).claims()},
+    )
+
+
+def test_look_alike_records_later_in_the_log_do_not_change_what_a_batched_sync_builds(
+    db, another_db
+):
+    live, _ = runtime(db=db)
+    for e in _look_alikes_after_the_match():
+        live.append(e)  # one sync per append
+    batched, _ = runtime(db=another_db)
+    for e in _look_alikes_after_the_match():
+        batched.events.append(e)
+    batched.sync()  # every event is in the log before the first is observed
+
+    assert knowledge_ids(db) == ["c-e1"]
+    assert _outcome(another_db) == _outcome(db)
+
+    class Next(LedgerEngine):
+        state_version = "2"
+
+    rebuilt, _ = runtime(engine=Next(), db=db)
+    rebuilt.sync()
+    assert [d.item.id for d in decisions_of(rebuilt, Promote)] == ["c-e1"]
+    assert _outcome(db) == _outcome(another_db)
