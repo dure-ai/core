@@ -283,7 +283,7 @@ def test_a_stronger_record_on_established_knowledge_replaces_its_body():
     rt.append(ev("e3", tested, user="u3", signal="test", minutes=2))
 
     first, second = promotes(rt)
-    assert first.item.body == OTHER  # equal strength: the later record
+    assert first.item.body == FACT  # equal strength: the incumbent stays
     assert second.item.body == tested
     assert second.item.sources == ("e1", "e2", "e3")
     assert state(db).claim("c-e1").canonical == "e3"
@@ -297,7 +297,59 @@ def test_a_derived_record_on_established_knowledge_decides_nothing():
     rt.append(ev("e2", OTHER, user="u2", minutes=1))
     rt.append(ev("e3", OTHER, user="u3", minutes=2))  # a copy of e2
     assert len(promotes(rt)) == 1
-    assert state(db).claim("c-e1").canonical == "e2"
+    assert state(db).claim("c-e1").canonical == "e1"
+
+
+# Jaccard with FACT is 11/13 (joins its claim, not a copy), with NEAR 10/14.
+WEB = "the deploy script must run migrations before restarting the web server every time"
+
+
+@both("e1", "e2", "e3", "e4", "e5")
+def test_a_same_key_repeat_on_established_knowledge_decides_nothing(groups):
+    rt, db = runtime(groups=groups)
+    rt.append(ev("e1", FACT))
+    rt.append(ev("e2", NEAR, user="u2", minutes=1))
+    assert len(promotes(rt)) == 1
+    for i in (3, 4, 5):
+        rt.append(ev(f"e{i}", FACT, session=f"s{i}", minutes=i))
+
+    st = state(db)
+    rows = {e.event_id: e.derived for e in st.evidence("c-e1")}
+    assert rows == dict.fromkeys(["e1", "e2", "e3", "e4", "e5"])  # all counted
+    assert len(promotes(rt)) == 1
+    assert st.claim("c-e1").canonical == "e1"
+    [item] = db.knowledge.all()
+    assert item.body == FACT
+
+
+@both("e1", "e2", "e3")
+def test_another_users_equally_strong_record_on_established_knowledge_decides_nothing(groups):
+    rt, db = runtime(groups=groups)
+    rt.append(ev("e1", FACT))
+    rt.append(ev("e2", NEAR, user="u2", minutes=1))
+    rt.append(ev("e3", WEB, user="u3", minutes=2))
+
+    st = state(db)
+    rows = {e.event_id: e.derived for e in st.evidence("c-e1")}
+    assert rows == {"e1": None, "e2": None, "e3": None}
+    assert len(promotes(rt)) == 1
+    assert st.claim("c-e1").canonical == "e1"
+
+
+@both("e1", "e2", "e3", "e4")
+def test_a_strictly_stronger_record_replaces_the_body_once(groups):
+    rt, db = runtime(groups=groups)
+    rt.append(ev("e1", FACT))
+    rt.append(ev("e2", NEAR, user="u2", minutes=1))
+    rt.append(ev("e3", WEB, user="u3", signal="test", minutes=2))
+    rt.append(ev("e4", FACT, session="s4", minutes=3))  # weaker: the tested one stays
+
+    first, second = promotes(rt)
+    assert first.item.body == FACT
+    assert second.item.body == WEB
+    assert state(db).claim("c-e1").canonical == "e3"
+    [item] = db.knowledge.all()
+    assert item.body == WEB
 
 
 def test_records_with_other_conditions_are_other_claims():
@@ -351,18 +403,61 @@ def _evidence(eid, *, channel="observation", minutes=0, derived=None, stance="su
     )
 
 
-def test_canonical_prefers_the_strongest_then_the_latest_then_the_largest_id():
+def _ids(rows) -> set[str]:
+    return {e.event_id for e in rows}
+
+
+def test_canonical_without_an_incumbent_prefers_the_strongest_then_the_latest_then_the_largest_id():
     rows = [
         _evidence("e1", channel="test", minutes=0),
         _evidence("e2", channel="observation", minutes=5),
         _evidence("e3", channel="doc", minutes=0),
     ]
-    assert canonical_of(rows, CFG) == "e3"  # test and doc tie; same time; larger id
+    assert canonical_of(rows, CFG, records=_ids(rows)) == "e3"  # tie, same time: larger id
     rows.append(_evidence("e4", channel="doc", minutes=1))
-    assert canonical_of(rows, CFG) == "e4"  # later
+    assert canonical_of(rows, CFG, records=_ids(rows)) == "e4"  # later
     rows.append(_evidence("e5", channel="human", minutes=0, derived="copy"))
     rows.append(_evidence("e6", channel="human", minutes=0, stance="contradict"))
-    assert canonical_of(rows, CFG) == "e4"  # derived and contradicting rows are not candidates
+    # derived and contradicting rows are not candidates
+    assert canonical_of(rows, CFG, records=_ids(rows)) == "e4"
+
+
+def test_canonical_keeps_an_incumbent_of_the_greatest_strength():
+    rows = [
+        _evidence("e1", channel="test", minutes=0),
+        _evidence("e2", channel="observation", minutes=5),
+        _evidence("e3", channel="doc", minutes=0),
+        _evidence("e4", channel="doc", minutes=1),
+    ]
+    records = _ids(rows)
+    assert canonical_of(rows, CFG, records=records, current="e1") == "e1"  # ties stay
+    assert canonical_of(rows, CFG, records=records, current="e3") == "e3"
+    # a weaker incumbent gives way to the strongest, latest
+    assert canonical_of(rows, CFG, records=records, current="e2") == "e4"
+    rows.append(_evidence("e5", channel="human", minutes=2))
+    assert canonical_of(rows, CFG, records=_ids(rows), current="e1") == "e5"  # strictly stronger
+
+
+def test_canonical_replaces_an_incumbent_that_no_longer_counts():
+    rows = [
+        _evidence("e1", minutes=0, derived="copy"),
+        _evidence("e2", minutes=1),
+        _evidence("e3", minutes=2),
+    ]
+    assert canonical_of(rows, CFG, records=_ids(rows), current="e1") == "e3"
+    assert canonical_of(rows, CFG, records=_ids(rows), current="gone") == "e3"
+    # an incumbent that is not one of the claim's records is not eligible
+    assert canonical_of(rows, CFG, records={"e2", "e3"}, current="e1") == "e3"
+
+
+def test_canonical_requires_the_claims_records():
+    with pytest.raises(TypeError):
+        canonical_of([_evidence("e1")], CFG)  # type: ignore[call-arg]
+
+
+def test_a_judgement_never_becomes_the_canonical_even_as_incumbent():
+    rows = [_evidence("e1", minutes=0), _evidence("o1", channel="human", minutes=1)]
+    assert canonical_of(rows, CFG, records={"e1"}, current="o1") == "e1"
 
 
 def test_canonical_skips_judgement_evidence_and_falls_back_to_the_first_memory():

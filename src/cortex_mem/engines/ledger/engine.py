@@ -144,7 +144,9 @@ class LedgerEngine:
             for e in evidence
             if (m := store.memory(e.event_id)) is not None and m.claim_id == claim.id
         }
-        canonical = canonical_of(evidence, self._cfg, records=records)
+        canonical = canonical_of(
+            evidence, self._cfg, records=records, current=canonical_before
+        )
         found = ctx.events.get([canonical])
         text = found[0].text if found else ""
 
