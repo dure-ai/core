@@ -6,6 +6,7 @@ English: [CONTRIBUTING.md](CONTRIBUTING.md). 영어 문서가 기준입니다. �
 
 1. **이슈에서 시작합니다.** 기존 이슈를 고르거나 bug, feature, task 양식으로 새로 엽니다. 리뷰에서 나온 후속 작업은 task입니다.
 2. **`main`에서 브랜치를 만듭니다.** 이름은 `type/short-name` 형식입니다. 예: `feat/evidence-engine`
+   아직 머지되지 않은 다른 브랜치 위에 쌓은 브랜치는, 그 브랜치가 스쿼시 머지된 뒤 옮깁니다: `git rebase --onto origin/main <base-branch> <your-branch>`. `main`에는 base 브랜치의 커밋들 대신 스쿼시 커밋 하나가 들어가므로, PR의 base만 바꾸면 그 커밋들이 내 PR에 남습니다.
 3. **PR을 열고** 템플릿을 채웁니다. 이슈는 `Fixes #123`으로 연결하고, PR 하나로 이슈가 끝나지 않으면 `Part of #123`을 씁니다.
 4. CI가 통과하고 리뷰어가 승인하면 **스쿼시로 머지합니다.** 브랜치는 자동으로 삭제됩니다.
 

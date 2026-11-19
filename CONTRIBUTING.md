@@ -6,6 +6,7 @@
 
 1. **Start from an issue.** Pick one or open one with the bug, feature or task form. A follow-up that comes out of a review is a task.
 2. **Branch from `main`.** Name the branch `type/short-name`, for example `feat/evidence-engine`.
+   If your branch is stacked on another branch that is not merged yet, move it after that one is squash-merged: `git rebase --onto origin/main <base-branch> <your-branch>`. The squash commit on `main` replaces the base branch's commits, so changing the PR base alone leaves them in your PR.
 3. **Open a pull request** and fill in the template. Link the issue with `Fixes #123`, or `Part of #123` when the PR does not finish it.
 4. **Merge by squash** once CI passes and a reviewer approves. The branch is deleted automatically.
 

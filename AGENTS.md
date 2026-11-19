@@ -21,7 +21,7 @@ Run the tests before you commit. Do not assume a failure was already there; `mai
 - **Engines do not read the clock.** Use `event.at`, the `now` of `tick`, and `caller.at`.
 - **Engines are deterministic.** The same sequence of events and ticks gives the same decisions and the same handoff. Seed any randomness.
 - **Scope checks stay in the fixed part.** Leaks are stopped in two places only, decision validation and the handoff filter. Do not weaken or bypass either, and do not let a tool argument widen a scope beyond the server configuration.
-- **`cortex-mem` has no runtime dependencies.** Ask before adding one. Server-only dependencies go in `server/`.
+- **`cortex-mem` has no required runtime dependencies.** Ask before adding one. An optional extra needs a reason in the PR. Server-only dependencies go in `server/`.
 - **A new store passes the conformance tests** in `cortex_mem.testing`.
 - **Do not commit database files** (`*.db`) or any credential.
 
