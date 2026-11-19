@@ -374,13 +374,12 @@ def test_an_org_record_is_counted_and_left_alone(groups):
     assert knowledge_ids(db) == []
 
 
-def test_tick_and_handoff_do_nothing_yet():
+def test_tick_does_nothing_yet():
     rt, db = runtime()
     rt.append(ev("e1", FACT, signal="test"))
     engine = rt.engine
     ctx = EngineContext(db.events, db.knowledge, FakeState())
     assert engine.tick(T0, ctx) == []
-    assert engine.handoff("deploy", None, "team", ctx) == []  # type: ignore[arg-type]
 
 
 # --- decide.py ---------------------------------------------------------------

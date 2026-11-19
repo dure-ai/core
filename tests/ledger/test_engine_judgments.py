@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from cortex_mem.contract import Demote, EngineContext, Promote
+from cortex_mem.contract import Caller, Demote, EngineContext, Promote
 from cortex_mem.engines.ledger import LedgerEngine
 from cortex_mem.engines.ledger.store import LedgerStore
 from tests.ledger.helpers import (
@@ -227,8 +227,10 @@ def test_a_judgment_observed_twice_counts_once():
 def test_recall_marks_what_the_session_was_handed():
     rt, db = runtime()
     rt.append(ev("e1", FACT, user="u1"))
-    rt.append(ev("r1", "", kind="recall", user="u2", session="s9", refs=("c-e1",), minutes=1))
-    assert state(db).seen("s9", "c-e1") == ev("x", "", minutes=1).at
+    caller = Caller(user="u2", team="t1", session="s9", at=ev("x", "", minutes=1).at)
+    [handed] = rt.recall("deploy migrations api server", caller, "team", "r1")
+    assert handed.id == "c-e1"
+    assert state(db).seen("s9", "c-e1") == caller.at
 
     rt.append(ev("e2", NEAR, user="u2", session="s9", minutes=2))
     rows = {e.event_id: e.derived for e in state(db).evidence("c-e1")}

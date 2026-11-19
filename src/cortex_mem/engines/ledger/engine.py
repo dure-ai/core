@@ -20,6 +20,7 @@ from cortex_mem.contract import (
     Handoff,
     Scope,
 )
+from cortex_mem.engines.ledger import retrieve
 from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.decide import canonical_of, decisions
 from cortex_mem.engines.ledger.evidence import (
@@ -60,7 +61,8 @@ class LedgerEngine:
     def handoff(
         self, query: str, caller: Caller, scope: Scope, ctx: EngineContext, k: int = 6
     ) -> list[Handoff]:
-        return []
+        store = LedgerStore(ctx.state)
+        return retrieve.handoff(query, caller, scope, ctx, store, self._cfg, k)
 
     def _record(
         self, event: Event, ctx: EngineContext, store: LedgerStore
