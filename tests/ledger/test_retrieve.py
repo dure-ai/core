@@ -6,9 +6,9 @@ from cortex_mem.contract import Caller, EngineContext
 from cortex_mem.engines.ledger import LedgerEngine
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
-from tests.ledger.fakes import FakeSimilarity
-from tests.ledger.helpers import ENGINE, T0, edit_state, ev, runtime, state
-from tests.ledger.test_engine_judgments import FACT, NEAR, judgment
+from .fakes import FakeSimilarity
+from .helpers import ENGINE, T0, edit_state, ev, runtime, state
+from .test_engine_judgments import FACT, NEAR, judgment
 
 # three unrelated claims that share the query word "service"
 ALPHA = "service alpha rotates signing keys quarterly and publishes new keys to every region"

@@ -17,8 +17,8 @@ from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import signature
 from cortex_mem.store.memory import InMemoryDatabase
-from tests.ledger.fakes import FakeSimilarity
-from tests.ledger.test_store import FakeState
+from .fakes import FakeSimilarity
+from .test_store import FakeState
 
 KST = timezone(timedelta(hours=9))
 T0 = datetime(2026, 11, 19, 10, 0, tzinfo=KST)

@@ -12,7 +12,7 @@ from cortex_mem.engines.ledger.engine import LedgerEngine
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
-from tests.ledger.fakes import FakeSimilarity
+from .fakes import FakeSimilarity
 
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
 ENGINE = "ledger"  # name of the engine's state in the database

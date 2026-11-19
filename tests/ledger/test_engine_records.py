@@ -12,8 +12,8 @@ from cortex_mem.engines.ledger.decide import canonical_of, decisions, knowledge_
 from cortex_mem.engines.ledger.model import Claim, Evidence
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.store.memory import InMemoryDatabase
-from tests.ledger.fakes import FakeSimilarity
-from tests.ledger.helpers import (
+from .fakes import FakeSimilarity
+from .helpers import (
     T0,
     count,
     edit_state,
@@ -22,7 +22,7 @@ from tests.ledger.helpers import (
     runtime,
     state,
 )
-from tests.ledger.test_store import FakeState
+from .test_store import FakeState
 
 CFG = LedgerConfig.from_mapping(None)
 FACT = "the deploy script must run migrations before restarting the api server every time"
