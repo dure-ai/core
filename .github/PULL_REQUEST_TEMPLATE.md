@@ -16,5 +16,4 @@ commit body, so write the title as `type(scope): description` (for example
 
 - [ ] Tests added or updated
 - [ ] Docs updated (if behavior or the port contract changed)
-- [ ] I have reviewed the full diff and can explain it
 - [ ] AI assistance was used to create this PR (tool: )
