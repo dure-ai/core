@@ -32,16 +32,11 @@ from cortex_mem.engines.ledger.evidence import (
     tally,
 )
 from cortex_mem.engines.ledger.gate import evaluate
-from cortex_mem.engines.ledger.matcher import eligible, match_claim
+from cortex_mem.engines.ledger.matcher import DOWN, eligible, match_claim
 from cortex_mem.engines.ledger.model import Claim, Derived, Evidence, Memory
 from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import signature
-
-
-# Claims taken down (spec 9): they collect evidence but are not re-judged,
-# until verified support dated after `invalid_since` revives them.
-_DOWN = ("deprecated", "archived")
 
 
 class LedgerEngine:
@@ -255,7 +250,7 @@ class LedgerEngine:
             )
         )
         down = claim.status
-        if down not in _DOWN:
+        if down not in DOWN:  # taken down: collect evidence, do not re-judge
             return self._reevaluate(claim, event, ctx, store)
         since = claim.invalid_since
         if not (

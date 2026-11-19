@@ -15,7 +15,9 @@ from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import jaccard, signature
 
-_DOWN = ("deprecated", "archived")
+# Claims taken down (spec 9): they take no new records and are not re-judged,
+# until verified support dated after `invalid_since` revives them.
+DOWN = ("deprecated", "archived")
 
 
 class Match(NamedTuple):
@@ -38,7 +40,7 @@ def eligible(claim: Claim | None, event: Event) -> bool:
     """Same (scope, owner, conditions) and not taken down."""
     return (
         claim is not None
-        and claim.status not in _DOWN
+        and claim.status not in DOWN
         and claim.scope == event.scope
         and claim.owner == owner_for(event)
         and claim.conditions == dict(event.conditions)
