@@ -37,76 +37,76 @@ def cfg(**gate) -> LedgerConfig:
 
 
 def test_single_observation_is_candidate():
-    r = evaluate(claim(), tl(), "text", CFG)
+    r = evaluate(claim(), tl(), "text", CFG, human_fresh=False)
     assert r.decision == "candidate"
     assert r.checks["sources"] is False
 
 
 def test_two_people_established():
-    r = evaluate(claim(), tl(S=1.4, keys=2), "text", CFG)
+    r = evaluate(claim(), tl(S=1.4, keys=2), "text", CFG, human_fresh=False)
     assert r.decision == "established"
     assert all(r.checks.values())
 
 
 def test_one_person_with_test_established_by_alt_verified():
-    r = evaluate(claim(), tl(S=2.0, keys=1, verified=1, by={"test": 1}), "text", CFG)
+    r = evaluate(claim(), tl(S=2.0, keys=1, verified=1, by={"test": 1}), "text", CFG, human_fresh=False)
     assert r.decision == "established"
 
 
 def test_require_verified_leaves_provisional():
-    r = evaluate(claim(), tl(S=1.4, keys=2), "text", cfg(require_verified=True))
+    r = evaluate(claim(), tl(S=1.4, keys=2), "text", cfg(require_verified=True), human_fresh=False)
     assert r.decision == "provisional"
     assert r.checks["verified"] is False
 
 
 def test_min_span():
     c = cfg(min_span=timedelta(days=3))
-    assert evaluate(claim(), tl(S=1.4, keys=2, span_days=0), "t", c).decision == "provisional"
-    assert evaluate(claim(), tl(S=1.4, keys=2, span_days=4), "t", c).decision == "established"
+    assert evaluate(claim(), tl(S=1.4, keys=2, span_days=0), "t", c, human_fresh=False).decision == "provisional"
+    assert evaluate(claim(), tl(S=1.4, keys=2, span_days=4), "t", c, human_fresh=False).decision == "established"
 
 
 def test_established_disputed_by_contradiction_ratio():
     t = tl(S=1.4, C=1.0, keys=2, contra_keys=1)
-    assert evaluate(claim("established"), t, "t", CFG).decision == "disputed"
-    assert evaluate(claim("disputed"), t, "t", CFG).decision == "disputed"
-    assert evaluate(claim("candidate"), t, "t", CFG).decision == "provisional"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision == "disputed"
+    assert evaluate(claim("disputed"), t, "t", CFG, human_fresh=False).decision == "disputed"
+    assert evaluate(claim("candidate"), t, "t", CFG, human_fresh=False).decision == "provisional"
     one = tl(S=0.7, C=0.7, keys=1, contra_keys=1)
-    assert evaluate(claim("candidate"), one, "t", CFG).decision == "candidate"
+    assert evaluate(claim("candidate"), one, "t", CFG, human_fresh=False).decision == "candidate"
 
 
 def test_disputed_recovers():
-    r = evaluate(claim("disputed"), tl(S=1.4, keys=2), "t", CFG)
+    r = evaluate(claim("disputed"), tl(S=1.4, keys=2), "t", CFG, human_fresh=False)
     assert r.decision == "established"
 
 
 def test_verified_contradiction_deprecates_only_when_c_ge_s():
     t = tl(S=0.7, C=0.7, keys=1, contra_keys=1, vc=True)
-    assert evaluate(claim("established"), t, "t", CFG).decision == "deprecated"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision == "deprecated"
     t = tl(S=1.4, C=0.7, keys=2, contra_keys=1, vc=True)
-    assert evaluate(claim("established"), t, "t", CFG).decision != "deprecated"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision != "deprecated"
 
 
 def test_high_risk_needs_human():
     c = replace(CFG, high_risk_terms=("delete",))
     text = "Delete the staging DB first"
-    r = evaluate(claim(), tl(S=1.4, keys=2), text, c)
+    r = evaluate(claim(), tl(S=1.4, keys=2), text, c, human_fresh=False)
     assert r.decision == "provisional"
     assert r.checks["high_risk"] is False
-    r = evaluate(claim(), tl(S=1.4, keys=2), "restart it", c)
+    r = evaluate(claim(), tl(S=1.4, keys=2), "restart it", c, human_fresh=False)
     assert r.checks["high_risk"] is True
     h = tl(S=3.7, keys=2, verified=1, by={"human": 1, "observation": 1})
-    assert evaluate(claim(), h, text, c).decision == "established"
+    assert evaluate(claim(), h, text, c, human_fresh=True).decision == "established"
 
 
 def test_unknown_scope_raises():
     c = claim()
     c.scope = "org"
     with pytest.raises(ValueError, match="org"):
-        evaluate(c, tl(), "t", CFG)
+        evaluate(c, tl(), "t", CFG, human_fresh=False)
 
 
 def test_report_json_is_plain():
-    r = evaluate(claim(), tl(S=1.4, keys=2), "t", CFG)
+    r = evaluate(claim(), tl(S=1.4, keys=2), "t", CFG, human_fresh=False)
     assert isinstance(r, GateReport)
     j = r.to_json()
     assert j["decision"] == "established"
@@ -119,17 +119,17 @@ def test_report_json_is_plain():
 def test_established_disputed_even_when_span_fails():
     c = cfg(min_span=timedelta(days=3))
     t = tl(S=1.4, C=1.0, keys=2, contra_keys=1, span_days=0)
-    assert evaluate(claim("established"), t, "t", c).decision == "disputed"
+    assert evaluate(claim("established"), t, "t", c, human_fresh=False).decision == "disputed"
 
 
 def test_established_disputed_even_when_sources_fail():
     t = tl(S=0.7, C=0.7, keys=1, contra_keys=1)
-    assert evaluate(claim("established"), t, "t", CFG).decision == "disputed"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision == "disputed"
 
 
 def test_disputed_stays_disputed_when_verified_fails():
     t = tl(S=1.4, C=1.0, keys=2, contra_keys=1)
-    r = evaluate(claim("disputed"), t, "t", cfg(require_verified=True))
+    r = evaluate(claim("disputed"), t, "t", cfg(require_verified=True), human_fresh=False)
     assert r.decision == "disputed"
 
 
@@ -140,25 +140,25 @@ def test_promoted_claims_do_not_fall_back_when_checks_fail(status):
     t = tl(S=0.7, C=0.0, keys=1)
     c = cfg(min_span=timedelta(days=3), require_verified=True)
     risky = replace(c, high_risk_terms=("password",))
-    r = evaluate(claim(status), t, "the password is x", risky)
+    r = evaluate(claim(status), t, "the password is x", risky, human_fresh=False)
     assert r.decision == status
     assert r.checks["sources"] is False and r.checks["high_risk"] is False
 
 
 def test_established_without_sources_stays_established_but_unpromoted_does_not():
     t = tl(S=0.7, keys=1)
-    assert evaluate(claim("established"), t, "t", CFG).decision == "established"
-    assert evaluate(claim("candidate"), t, "t", CFG).decision == "candidate"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision == "established"
+    assert evaluate(claim("candidate"), t, "t", CFG, human_fresh=False).decision == "candidate"
     t2 = tl(S=1.4, keys=2)
     low = cfg(min_span=timedelta(days=3))
-    assert evaluate(claim("provisional"), t2, "t", low).decision == "provisional"
-    assert evaluate(claim("established"), t2, "t", low).decision == "established"
+    assert evaluate(claim("provisional"), t2, "t", low, human_fresh=False).decision == "provisional"
+    assert evaluate(claim("established"), t2, "t", low, human_fresh=False).decision == "established"
 
 
 def test_promoted_claims_still_deprecate_on_strong_contradiction():
     t = tl(S=1.4, C=2.0, keys=2, contra_keys=1, vc=True)
-    assert evaluate(claim("established"), t, "t", CFG).decision == "deprecated"
-    assert evaluate(claim("disputed"), t, "t", CFG).decision == "deprecated"
+    assert evaluate(claim("established"), t, "t", CFG, human_fresh=False).decision == "deprecated"
+    assert evaluate(claim("disputed"), t, "t", CFG, human_fresh=False).decision == "deprecated"
 
 
 def test_high_risk_needs_fresh_human_support_not_just_any():
@@ -170,3 +170,8 @@ def test_high_risk_needs_fresh_human_support_not_just_any():
     assert fresh.checks["high_risk"] is True and fresh.decision == "established"
     benign = evaluate(claim(), t, "all fine", risky, human_fresh=False)
     assert benign.checks["high_risk"] is True
+
+
+def test_human_fresh_must_be_given():
+    with pytest.raises(TypeError, match="human_fresh"):
+        evaluate(claim(), tl(), "t", CFG)  # type: ignore[call-arg]

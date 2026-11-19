@@ -38,15 +38,13 @@ def evaluate(
     text: str,
     cfg: LedgerConfig,
     *,
-    human_fresh: bool | None = None,
+    human_fresh: bool,
 ) -> GateReport:
     """Run the gate checks for a claim and decide its next status.
 
     `human_fresh`: whether non-derived human support exists at or after the
-    canonical record's time (spec 9, high-risk topics). None falls back to
-    any human support in the tally."""
-    if human_fresh is None:
-        human_fresh = t.by_channel.get("human", 0) > 0
+    canonical record's time (spec 9, high-risk topics). Required: any human
+    support in the tally is not enough."""
     rule = cfg.gates.get(claim.scope)
     if rule is None:
         raise ValueError(f"no gate rule for scope: {claim.scope!r}")
