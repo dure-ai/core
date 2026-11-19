@@ -233,8 +233,9 @@ class LedgerEngine:
         success = event.outcome == "success"
         own_report = event.kind == "outcome" and event.signal in (None, "self")
         if own_report and success:
-            # usefulness, not truth: no vote
-            if store.seen(event.session, claim.id) is not None:
+            # usefulness, not truth: no vote; only once the session was handed it
+            seen = store.seen(event.session, claim.id)
+            if seen is not None and seen <= event.at:
                 claim.use_success += 1
                 store.put_claim(claim)
             return []

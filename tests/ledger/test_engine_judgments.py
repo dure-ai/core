@@ -92,6 +92,17 @@ def test_a_success_report_from_a_session_never_handed_the_claim_counts_nothing()
     assert state(db).claim("c-e1").use_success == 0
 
 
+def test_a_success_report_dated_before_the_session_was_handed_the_claim_counts_nothing():
+    rt, db = runtime()
+    rt.append(ev("e1", FACT))
+    rt.append(ev("r1", "", kind="recall", user="u2", session="s9", refs=("c-e1",), minutes=5))
+    rt.append(judgment("e2", "u2", signal="self", session="s9", minutes=2))
+    assert state(db).claim("c-e1").use_success == 0
+
+    rt.append(judgment("e3", "u2", signal="self", session="s9", minutes=5))
+    assert state(db).claim("c-e1").use_success == 1  # handed at the same time: counts
+
+
 def test_an_agents_own_failure_report_does_not_demote_alone():
     rt, db = runtime()
     two_observers(rt)
