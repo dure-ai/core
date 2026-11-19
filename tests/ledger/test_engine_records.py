@@ -208,6 +208,35 @@ def test_a_new_record_does_not_join_a_deprecated_claim(groups):
         assert st.claims_in_group("e1") == ["c-e1", "c-e2"]
 
 
+def test_restating_a_deprecated_fact_opens_one_new_claim_not_one_per_person():
+    rt, db = runtime()
+    for i in range(11):  # more repeats than match_pool: they fill the search pool
+        rt.append(ev(f"o{i:02d}", FACT, user="u1", minutes=i))
+    rt.append(ev("h1", "", kind="human_confirm", user="u9", signal=None, outcome="failure",
+                 refs=("o00",), minutes=20))
+    assert state(db).claim("c-o00").status == "deprecated"
+
+    for i, user in enumerate(("u2", "u3", "u4", "u5")):
+        rt.append(ev(f"n{i}", FACT, user=user, minutes=30 + i))
+
+    st = state(db)
+    assert [c.id for c in st.claims()] == ["c-n0", "c-o00"]
+    assert {st.memory(f"n{i}").claim_id for i in range(4)} == {"c-n0"}
+    assert st.claim("c-o00").status == "deprecated"
+
+
+def test_a_repeat_under_other_conditions_takes_over_the_signature():
+    rt, db = runtime()
+    for i in range(11):
+        rt.append(ev(f"o{i:02d}", FACT, user="u1", minutes=i, conditions={"os": "mac"}))
+    for i, user in enumerate(("u2", "u3")):
+        rt.append(ev(f"n{i}", FACT, user=user, minutes=30 + i, conditions={"os": "linux"}))
+
+    st = state(db)
+    assert [c.id for c in st.claims()] == ["c-n0", "c-o00"]
+    assert st.memory("n1").claim_id == "c-n0"
+
+
 @both("e1", "e2")
 def test_personal_records_use_the_session_as_the_source(groups):
     rt, db = runtime(groups=groups)

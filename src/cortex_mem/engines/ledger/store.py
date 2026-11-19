@@ -118,10 +118,18 @@ class LedgerStore:
         return None if raw is None else str(raw)
 
     def index_signature(
-        self, scope: Scope, owner: str, signature: str, claim_id: str
+        self,
+        scope: Scope,
+        owner: str,
+        signature: str,
+        claim_id: str,
+        *,
+        replace: bool = False,
     ) -> None:
+        """Point the signature at the claim: only if it has none, or always
+        with `replace`."""
         key = _k_sig(scope, owner, signature)
-        if self._s.get(key) is None:
+        if replace or self._s.get(key) is None:
             self._s.put(key, claim_id)
 
     def skip(self, reason: str) -> None:

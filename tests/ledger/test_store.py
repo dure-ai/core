@@ -130,6 +130,8 @@ def test_idempotent_writes() -> None:
     s.index_signature("team", "t", "sig", "c-2")
     assert s.claim_by_signature("team", "t", "sig") == "c-1"
     assert s.claim_by_signature("team", "t", "other") is None
+    s.index_signature("team", "t", "sig", "c-3", replace=True)
+    assert s.claim_by_signature("team", "t", "sig") == "c-3"
 
 
 def test_skip_counts() -> None:

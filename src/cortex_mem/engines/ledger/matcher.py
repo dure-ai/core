@@ -34,7 +34,7 @@ def _author(event: Event) -> Caller:
     return Caller(user=event.user, team=event.team, session=event.session, at=event.at)
 
 
-def _eligible(claim: Claim | None, event: Event) -> bool:
+def eligible(claim: Claim | None, event: Event) -> bool:
     """Same (scope, owner, conditions) and not taken down."""
     return (
         claim is not None
@@ -80,7 +80,7 @@ class GroupMatcher:
         candidates: dict[str, Claim] = {}
         for cid in store.claims_in_group(group.id):
             claim = store.claim(cid)
-            if claim is not None and _eligible(claim, event):
+            if claim is not None and eligible(claim, event):
                 candidates[cid] = claim
         if not candidates:
             return None
@@ -115,12 +115,12 @@ class LexicalMatcher:
         cid = store.claim_by_signature(event.scope, owner, signature(event.text))
         if cid is not None:
             claim = store.claim(cid)
-            if claim is not None and _eligible(claim, event):
+            if claim is not None and eligible(claim, event):
                 return Match(cid, 1.0, _copied_from(event, claim, ctx, store, self._cfg))
         best: tuple[float, str, str] | None = None  # (score, claim id, event id)
         for other, memory in self._observed_hits(event, ctx, store):
             claim = store.claim(memory.claim_id)
-            if not _eligible(claim, event):
+            if not eligible(claim, event):
                 continue
             score = jaccard(event.text, other.text)
             if score < self._cfg.same_threshold:

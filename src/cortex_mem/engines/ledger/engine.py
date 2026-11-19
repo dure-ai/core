@@ -32,7 +32,7 @@ from cortex_mem.engines.ledger.evidence import (
     tally,
 )
 from cortex_mem.engines.ledger.gate import evaluate
-from cortex_mem.engines.ledger.matcher import match_claim
+from cortex_mem.engines.ledger.matcher import eligible, match_claim
 from cortex_mem.engines.ledger.model import Claim, Derived, Evidence, Memory
 from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
@@ -136,9 +136,7 @@ class LedgerEngine:
         if group_id is not None:
             store.add_to_group(group_id, claim.id)
         if similar_of(ctx) is None:
-            store.index_signature(
-                claim.scope, claim.owner, signature(event.text), claim.id
-            )
+            self._index_signature(event, claim, store)
 
         derived: Derived | None = None
         if match is not None:
@@ -171,6 +169,21 @@ class LedgerEngine:
             )
         )
         return self._reevaluate(claim, event, ctx, store)
+
+    @staticmethod
+    def _index_signature(event: Event, claim: Claim, store: LedgerStore) -> None:
+        """Index the record's signature. A signature that points at a claim
+        this record could not join (taken down, or other conditions) is
+        taken over by the record's claim, so the next restatement joins it
+        instead of opening yet another claim (spec 7)."""
+        sig = signature(event.text)
+        current = store.claim_by_signature(claim.scope, claim.owner, sig)
+        stale = (
+            current is not None
+            and current != claim.id
+            and not eligible(store.claim(current), event)
+        )
+        store.index_signature(claim.scope, claim.owner, sig, claim.id, replace=stale)
 
     @staticmethod
     def _resolve(
