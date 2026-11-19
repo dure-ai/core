@@ -17,6 +17,7 @@ from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import signature
 from cortex_mem.store.memory import InMemoryDatabase
+
 from .fakes import FakeSimilarity
 from .test_store import FakeState
 

@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from cortex_mem.contract import Caller, Demote, Promote
 from cortex_mem.engines.ledger import LedgerEngine
+
 from .helpers import T0, ev, knowledge_ids, runtime, state
 
 FACT = "the deploy script must run migrations before restarting the api server every time"

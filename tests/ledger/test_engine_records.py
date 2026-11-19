@@ -12,6 +12,7 @@ from cortex_mem.engines.ledger.decide import canonical_of, decisions, knowledge_
 from cortex_mem.engines.ledger.model import Claim, Evidence
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.store.memory import InMemoryDatabase
+
 from .fakes import FakeSimilarity
 from .helpers import (
     T0,
