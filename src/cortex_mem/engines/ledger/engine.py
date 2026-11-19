@@ -22,7 +22,13 @@ from cortex_mem.contract import (
 )
 from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.decide import canonical_of, decisions
-from cortex_mem.engines.ledger.evidence import channel_of, independence_key, tally
+from cortex_mem.engines.ledger.evidence import (
+    VERIFIED,
+    channel_of,
+    in_scope,
+    independence_key,
+    tally,
+)
 from cortex_mem.engines.ledger.gate import evaluate
 from cortex_mem.engines.ledger.matcher import match_claim
 from cortex_mem.engines.ledger.model import Claim, Derived, Evidence, Memory
@@ -41,6 +47,11 @@ class LedgerEngine:
         store = LedgerStore(ctx.state)
         if event.kind == "record":
             return self._record(event, ctx, store)
+        if event.kind in ("outcome", "human_confirm"):
+            return self._judge(event, ctx, store)
+        if event.kind == "recall":
+            for claim_id in self._resolve(event.refs, store, count_unknown=False):
+                store.mark_seen(event.session, claim_id, event.at)
         return []
 
     def tick(self, now: datetime, ctx: EngineContext) -> Sequence[Decision]:
@@ -123,6 +134,90 @@ class LedgerEngine:
         return self._reevaluate(claim, event, ctx, store)
 
     @staticmethod
+    def _resolve(
+        refs: Sequence[str], store: LedgerStore, *, count_unknown: bool = True
+    ) -> list[str]:
+        """Claim ids the refs name: a claim id as it is, an event id through
+        its memory. Unique, in order; unknown refs are counted."""
+        found: dict[str, None] = {}
+        for ref in refs:
+            if store.claim(ref) is not None:
+                found[ref] = None
+            elif (memory := store.memory(ref)) is not None:
+                found[memory.claim_id] = None
+            elif count_unknown:
+                store.skip("unknown_ref")
+        return list(found)
+
+    def _judge(
+        self, event: Event, ctx: EngineContext, store: LedgerStore
+    ) -> list[Decision]:
+        """Spec section 6, `outcome` and `human_confirm`: add support or
+        contradiction to the claims the refs name, when in scope."""
+        if event.outcome not in ("success", "failure"):
+            store.skip("unknown_outcome")
+            return []
+        out: list[Decision] = []
+        for claim_id in self._resolve(event.refs, store):
+            claim = store.claim(claim_id)
+            assert claim is not None
+            if not in_scope(event, claim):
+                store.skip("out_of_scope_evidence")
+                continue
+            marker = f"judged:{claim_id.replace('%', '%25').replace(':', '%3A')}:" + (
+                event.id.replace("%", "%25").replace(":", "%3A")
+            )
+            if ctx.state.get(marker) is not None:
+                continue  # delivered again: this judgment is already counted
+            ctx.state.put(marker, True)
+            out += self._judge_claim(claim, event, ctx, store)
+        return out
+
+    def _judge_claim(
+        self, claim: Claim, event: Event, ctx: EngineContext, store: LedgerStore
+    ) -> list[Decision]:
+        success = event.outcome == "success"
+        own_report = event.kind == "outcome" and event.signal in (None, "self")
+        if own_report and success:
+            # usefulness, not truth: no vote
+            if store.seen(event.session, claim.id) is not None:
+                claim.use_success += 1
+                store.put_claim(claim)
+            return []
+        if own_report:
+            claim.use_failure += 1
+        channel = channel_of(event)
+        store.put_evidence(
+            Evidence(
+                claim_id=claim.id,
+                event_id=event.id,
+                stance="support" if success else "contradict",
+                channel=channel,
+                key=independence_key(claim.scope, event),
+                user=event.user,
+                at=event.at,
+                derived=None,
+            )
+        )
+        if claim.status != "deprecated":
+            return self._reevaluate(claim, event, ctx, store)
+        since = claim.invalid_since
+        if not (
+            success
+            and channel in VERIFIED
+            and since is not None
+            and event.at > since
+        ):
+            store.put_claim(claim)  # deprecated claims only collect evidence
+            return []
+        claim.invalid_since = None  # revived: judged again from its evidence
+        out = self._reevaluate(claim, event, ctx, store)
+        if claim.status == "deprecated":
+            claim.invalid_since = since
+            store.put_claim(claim)
+        return out
+
+    @staticmethod
     def _retrieved(event: Event, claim_id: str, store: LedgerStore) -> bool:
         """The record repeats what it was handed: it cites the claim, or its
         session was handed the claim before the record was made."""
@@ -152,6 +247,17 @@ class LedgerEngine:
 
         counted = tally(evidence, self._cfg)
         report = evaluate(claim, counted, text, self._cfg)
+        if (
+            before == "established"
+            and canonical != canonical_before
+            and not all(report.checks.values())
+        ):
+            # A promoted claim's status is sticky, but new text must still
+            # pass every gate check: keep the previous canonical and body.
+            canonical = canonical_before
+            found = ctx.events.get([canonical])
+            text = found[0].text if found else ""
+            report = evaluate(claim, counted, text, self._cfg)
         claim.status = report.decision
         claim.report = report.to_json()
         claim.canonical = canonical
