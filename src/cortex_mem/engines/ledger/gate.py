@@ -73,4 +73,11 @@ def evaluate(claim: Claim, t: Tally, text: str, cfg: LedgerConfig) -> GateReport
         decision = "provisional"
     else:
         decision = "candidate"
+    if decision in ("provisional", "candidate") and claim.status in (
+        "established",
+        "disputed",
+    ):
+        # A promoted claim moves only by the table's transitions (spec 9):
+        # failing sources, verified, span or high_risk never demotes it.
+        decision = claim.status
     return GateReport(checks, t.S, t.C, t.confidence, decision)

@@ -131,3 +131,31 @@ def test_disputed_stays_disputed_when_verified_fails():
     t = tl(S=1.4, C=1.0, keys=2, contra_keys=1)
     r = evaluate(claim("disputed"), t, "t", cfg(require_verified=True))
     assert r.decision == "disputed"
+
+
+@pytest.mark.parametrize("status", ["established", "disputed"])
+def test_promoted_claims_do_not_fall_back_when_checks_fail(status):
+    # no sources, no verified channel, no span, a high-risk text: the checks
+    # that gate a promotion fail, but a promoted claim moves only by the table
+    t = tl(S=0.7, C=0.0, keys=1)
+    c = cfg(min_span=timedelta(days=3), require_verified=True)
+    risky = replace(c, high_risk_terms=("password",))
+    r = evaluate(claim(status), t, "the password is x", risky)
+    assert r.decision == status
+    assert r.checks["sources"] is False and r.checks["high_risk"] is False
+
+
+def test_established_without_sources_stays_established_but_unpromoted_does_not():
+    t = tl(S=0.7, keys=1)
+    assert evaluate(claim("established"), t, "t", CFG).decision == "established"
+    assert evaluate(claim("candidate"), t, "t", CFG).decision == "candidate"
+    t2 = tl(S=1.4, keys=2)
+    low = cfg(min_span=timedelta(days=3))
+    assert evaluate(claim("provisional"), t2, "t", low).decision == "provisional"
+    assert evaluate(claim("established"), t2, "t", low).decision == "established"
+
+
+def test_promoted_claims_still_deprecate_on_strong_contradiction():
+    t = tl(S=1.4, C=2.0, keys=2, contra_keys=1, vc=True)
+    assert evaluate(claim("established"), t, "t", CFG).decision == "deprecated"
+    assert evaluate(claim("disputed"), t, "t", CFG).decision == "deprecated"
