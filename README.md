@@ -11,7 +11,7 @@ uv workspace 하나에 패키지 두 개.
 
 | 패키지 | 경로 | 내용 | 의존성 |
 |---|---|---|---|
-| `cortex-mem` | `src/cortex_mem` | 엔진 포트 계약, 런타임, 저장소(PostgreSQL, SQLite, 인메모리), 기준선 엔진, 저장소 적합성 테스트 | 없음 (`sqlite3`는 표준 라이브러리). PostgreSQL은 선택: `cortex-mem[postgres]` |
+| `cortex-mem` | `src/cortex_mem` | 엔진 포트 계약, 런타임, 저장소(PostgreSQL, SQLite, 인메모리), 기준선 엔진, LedgerEngine, 저장소 적합성 테스트 | 없음 (`sqlite3`는 표준 라이브러리). PostgreSQL은 선택: `cortex-mem[postgres]` |
 | `cortex-mem-server` | `server/` | MCP 서버: 설정을 읽어 저장소와 엔진을 조립하고, 도구 인자를 런타임 호출로 바꿈 | `cortex-mem[postgres]`, `mcp` |
 
 하니스와 엔진은 `cortex-mem`에만 의존한다. 세 저장소는 같은 적합성 테스트(`cortex_mem.testing`)를 통과한다.
@@ -110,6 +110,32 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 `ctx.similar`(임베딩을 켰을 때)가 있으면 core 묶음으로 같은 주장을 찾고, 없으면 글자 비교(토큰 자카드)로 대신한다.
 
+### 동작
+
+**평가 시점.** 따로 도는 배치는 없다. 런타임이 이벤트를 전달할 때(`append` 직후. 서버는 도구 호출마다 `Runtime.tick`으로 다른 세션이 쌓은 이벤트를 먼저 전달한다) 그 이벤트가 닿는 주장만 다시 평가한다.
+
+| 이벤트 | 하는 일 |
+|---|---|
+| `record` | 같은 주장을 찾거나 새 주장을 열고 지지 증거를 붙인 뒤 그 주장을 다시 평가한다 |
+| `outcome`·`human_confirm` | `refs`가 가리키는 주장마다 지지·반박 증거를 붙이고 다시 평가한다. 자기 보고 성공은 그 세션이 주장을 건네받은 뒤의 것만 쓸모(`use_success`)로 센다 |
+| `recall` | 세션이 건네받은 주장을 표시한다. 평가하지 않는다 |
+| `tick` | `review_after_days`가 켜져 있으면 마지막 지지가 오래된 established 주장을 보관한다 |
+
+다시 평가는 증거를 세고(S, C, 독립 출처 수), 대표 기록을 고르고, 게이트를 돌려 다음 상태를 정한 뒤, 상태나 대표 기록이 바뀌었으면 결정을 낸다. 같은 이벤트를 다시 받아도 두 번 세지 않는다.
+
+**상태.** `candidate` → `provisional`(출처 충족) → `established`(게이트 전부 통과) ↔ `disputed`(반박 비율 초과). 검증된 채널의 실패가 있고 C ≥ S이면 `deprecated`, `tick`이 오래 지지 없는 established를 `archived`로 보낸다.
+
+- established·disputed는 반박(서로 오감), 강한 반박(deprecated), tick(archived)으로만 바뀐다. 출처·간격 같은 다른 조건이 약해져도 아래 단계로 내려가지 않는다.
+- deprecated·archived는 증거만 쌓는다. 내려간 시각 뒤의 검증된 지지가 와야 다시 게이트를 돈다.
+- 게이트의 기준과 정확히 같은 값(반박 비율이 상한과 같음, C = S)은 기준에 닿은 것으로 본다. S와 C는 소수 가중치의 float 합이라 1e-9 허용 오차로 비교한다.
+- 대표 기록(지식 본문)은 지금 대표가 가장 강한 지지로 남아 있는 한 더 강한 지지 기록이 올 때만 바뀌고, 승격된 주장의 새 본문은 게이트를 다시 통과해야 한다.
+
+**결정.** established가 되거나 승격된 주장의 대표 기록이 바뀌면 `Promote`(지식 id = 주장 id, 본문 = 대표 기록, 근거 = 지지 이벤트)를 낸다. 승격된 주장이 deprecated가 되면 `Demote(why="invalid")`(근거 = 검증된 반박 이벤트와 마지막 실패), archived가 되면 `Demote(why="stale")`를 낸다. disputed는 지식을 내리지 않는다.
+
+**건넬 때(`handoff`).** 지식 검색·기록 검색(임베딩을 켜면 의미 검색 두 목록도)을 RRF로 합쳐 주장 단위로 모으고, 상태 가중·최신성을 곱해 순위를 낸다. deprecated·archived와 조건이 호출자의 `context`와 다른 주장은 뺀다. 항목 하나가 주장 하나이고, 본문 아래에 `[established · human 1, test 1 · 2 sources · since 2026-10-03]` 같은 출처 줄을 붙이며, `sources`에는 지지 이벤트가 모두 들어간다. `status`는 승격된 established만 `knowledge`, 나머지는 `memory`다.
+
+**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "1"`). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`).
+
 설정 키(값은 모두 문자열이다. 기본값은 `config.py`와 같다):
 
 | 키 | 기본값 | 뜻 |
@@ -141,6 +167,8 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 - 임베딩이 없으면 서로 다른 사람의 기록을 글자만으로는 거의 묶지 못한다.
 - v0.1 범위는 personal·team이고 org 범위 기록은 주장을 만들지 않는다.
 - 고위험 단어가 든 본문은 그 본문이 대표가 된 뒤의 사람 확인이 있어야 지식이 된다.
+- 글자 비교 경로는 이미 받은 기록만 후보로 세지만, BM25 점수 통계는 로그 전체에서 나온다. 그래서 처음부터 다시 만들 때 드물게 다른 주장으로 묶일 수 있다. `ctx.events`가 받은 위치까지만 읽게 되면(#19) 없어진다.
+- 보관에서 되살아난 주장이 게이트를 못 넘으면 provisional·candidate로 남고, `tick`은 established만 보관하므로 다시 보관되지 않는다.
 
 ## 임베딩
 
