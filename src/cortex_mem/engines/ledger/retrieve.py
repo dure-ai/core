@@ -4,6 +4,7 @@ its supporting evidence as sources (spec section 11). Reads only."""
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
 
 from cortex_mem.access import event_visible
 from cortex_mem.contract import Caller, EngineContext, Handoff, Scope
@@ -144,9 +145,11 @@ def _line_tally(
 
 
 def _recency(claim: Claim, caller: Caller, cfg: LedgerConfig) -> float:
-    """Recency weight: halves every `half_life` since the last support, never
-    below 0.5; 1.0 when `half_life_days` is 0."""
+    """Recency weight: 0.5 ** (age / half_life), where age is the time since
+    the last counted support (0 if that is after `caller.at`). It falls from
+    1.0 to 0.5 over one half-life and stays at 0.5 after that, so recency at
+    most halves a score. 1.0 when `half_life_days` is 0."""
     if not cfg.half_life:
         return 1.0
-    age = max(caller.at - claim.last_support_at, caller.at - caller.at)
+    age = max(caller.at - claim.last_support_at, timedelta(0))
     return max(0.5, 0.5 ** (age / cfg.half_life))
