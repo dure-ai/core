@@ -226,3 +226,5 @@ def test_high_risk_terms_match_words_not_parts_of_words():
                     human_fresh=False).checks["high_risk"] is True
     assert evaluate(claim(), two, "Rotate the API key", c,
                     human_fresh=False).checks["high_risk"] is False
+    assert evaluate(claim(), two, "Export DB_PASSWORD first", replace(c, high_risk_terms=("password",)),
+                    human_fresh=False).checks["high_risk"] is False

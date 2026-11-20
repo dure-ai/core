@@ -157,7 +157,7 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 | `own_candidate_weight` | `0.7` | 호출자 본인의 candidate 가중 |
 | `review_after_days` | `0` | 이 기간 지지가 없는 established를 보관 처리한다. 0이면 끈다 |
 | `half_life_days` | `0` | 건넬 때 최신성 가중의 반감기. 0이면 끈다 |
-| `high_risk_terms` | 빈 값 | 쉼표로 나눈 단어(공백 제거, 소문자). 본문에 단어로 들어 있으면 사람 확인이 필요하다. 영문 등은 단어 경계가 맞아야 하고(`key`는 `monkey`에 걸리지 않음), 띄어 쓰지 않는 문자 안에서는 어디든 걸린다(`비밀번호를`은 `비밀번호`에 걸림) |
+| `high_risk_terms` | 빈 값 | 쉼표로 나눈 단어(공백 제거, 소문자). 본문에 들어 있으면 사람 확인이 필요하다. 바로 앞이 띄어 쓰는 문자의 글자일 때만 빼고(`key`는 `monkey`에 걸리지 않음) 모두 걸린다. 확인을 놓치지 않는 쪽으로, 뒤에는 무엇이 붙어도 되고 앞의 숫자·`_`·띄어 쓰지 않는 문자도 막지 않는다(`passwords`, `DB_PASSWORD`, `새비밀번호`는 걸림) |
 
 가중, 신뢰, `alpha`, `beta`, 상태 가중, `own_candidate_weight`, `*_days`, `min_sources`, `alt_verified`는 0 이상이어야 한다. `alpha`와 `beta`가 둘 다 0일 수는 없다(지지와 반박이 모두 0이면 신뢰도가 0/0이 된다).
 

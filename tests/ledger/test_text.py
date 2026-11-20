@@ -38,10 +38,16 @@ def test_signature_is_none_for_text_without_tokens():
     assert signature("Порт 8080") != signature("ポートは8080です")
 
 
-def test_contains_term_needs_word_edges_except_inside_runs_without_spaces():
+def test_contains_term_only_rejects_a_letter_right_before_the_term():
     assert contains_term("rotate the api key monthly", "key")
     assert not contains_term("the monkey patch", "key")
     assert not contains_term("see form.py", "rm")
     assert contains_term("never rm -rf / here", "rm -rf")
+    # anything may follow, and `_` or a digit before still counts: miss nothing sensitive
+    assert contains_term("reset all passwords", "password")
+    assert contains_term("export DB_PASSWORD=x", "password")
+    assert contains_term("set api_key in env", "key")
+    assert contains_term("use 2fa codes", "fa")
     assert contains_term("비밀번호를 바꿨다", "비밀번호")
+    assert contains_term("새비밀번호", "비밀번호")
     assert contains_term("修改密码", "密码")

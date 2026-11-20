@@ -41,13 +41,14 @@ def signature(text: str) -> str | None:
 
 
 def contains_term(text: str, term: str) -> bool:
-    """Whether `term` occurs in `text` (both compared lowercase) as whole
-    words: a letter, digit or `_` may not touch either end of it. Inside a
-    script written without spaces any occurrence counts, since particles
-    attach to words there (`비밀번호를` contains `비밀번호`)."""
+    """Whether `term` occurs in `text` (both compared lowercase), unless a
+    letter of a spaced script sits right before it (`key` is not in
+    `monkey`). It errs toward a match, since a miss skips a human check:
+    anything may follow the term (`passwords`), and a digit, `_` or a letter
+    of a script written without spaces may precede it (`DB_PASSWORD`,
+    `새비밀번호`)."""
     term = term.strip().lower()
     if not term:
         return False
-    edge = rf"[^\W{_RUNS}]"
-    pattern = rf"(?<!{edge}){re.escape(term)}(?!{edge})"
-    return re.search(pattern, text.lower()) is not None
+    letter = rf"[^\W\d_{_RUNS}]"
+    return re.search(rf"(?<!{letter}){re.escape(term)}", text.lower()) is not None
