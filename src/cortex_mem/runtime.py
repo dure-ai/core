@@ -472,8 +472,7 @@ class Runtime:
             want = self._want_version()
             if want is not None and self.state.version() != want:
                 self.state.reset(want)
-                for item in self.knowledge.all():
-                    self.knowledge.remove(item.id)
+                self.knowledge.clear()
                 self._knowledge_reconciled = False  # drop the vectors of what was removed
 
     def tick(self, now: datetime) -> None:

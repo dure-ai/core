@@ -1056,3 +1056,25 @@ def test_a_refused_query_finds_nothing_instead_of_failing():
     r = reader(db, index)
     assert r.search("deploy", caller(), "personal") == []
     assert r.knowledge("deploy", caller(), "team") == []
+
+
+def test_sync_knowledge_of_touched_ids_reads_only_their_digests():
+    db = InMemoryDatabase()
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    index.ensure_current(db.knowledge)
+    for i in range(5):
+        db.knowledge.put(item(f"k{i}", body=f"item {i}"))
+    index.sync_knowledge(db.knowledge, None)
+    asked = []
+    real = db.vectors.knowledge_digests
+
+    def recording(ids=None):
+        asked.append(None if ids is None else sorted(ids))
+        return real(ids)
+
+    db.vectors.knowledge_digests = recording
+    db.knowledge.put(item("k2", body="item 2, restated"))
+    index.sync_knowledge(db.knowledge, ["k2"])
+
+    assert asked == [["k2"]]  # not the whole knowledge base
+    assert db.vectors.knowledge_digests(["k2"]) == {"k2": text_digest("deploy\nitem 2, restated")}

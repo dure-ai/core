@@ -267,6 +267,11 @@ class SqliteKnowledgeBase:
                 (rowid, " ".join(words(text)), " ".join(bigrams(text))),
             )
 
+    def clear(self) -> None:
+        with self.db.transaction():
+            self.db.con.execute("DELETE FROM knowledge_fts")
+            self.db.con.execute("DELETE FROM knowledge")
+
     def remove(self, id: str) -> None:
         with self.db.transaction():
             row = self.db.con.execute("SELECT rowid FROM knowledge WHERE id = ?", (id,)).fetchone()
@@ -465,11 +470,16 @@ class SqliteVectorBackend:
                 (kind, id, kind, _pack(vector), digest),
             )
 
-    def knowledge_digests(self) -> dict[str, str]:
-        rows = self.db.query(
-            "SELECT id, digest FROM vectors WHERE kind = 'knowledge' AND digest IS NOT NULL"
-        )
-        return dict(rows)
+    def knowledge_digests(self, ids: Collection[str] | None = None) -> dict[str, str]:
+        sql = "SELECT id, digest FROM vectors WHERE kind = 'knowledge' AND digest IS NOT NULL"
+        if ids is None:
+            return dict(self.db.query(sql))
+        wanted = [id for id in dict.fromkeys(ids) if isinstance(id, str)]
+        found: dict[str, str] = {}
+        for i in range(0, len(wanted), 500):  # below SQLite's bound-parameter limit
+            chunk = wanted[i : i + 500]
+            found.update(self.db.query(sql + f" AND id IN ({', '.join('?' * len(chunk))})", chunk))
+        return found
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         rows = self.db.query("SELECT vec FROM vectors WHERE kind = ? AND id = ?", (kind, id))
