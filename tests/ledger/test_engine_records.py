@@ -567,16 +567,22 @@ def test_evidence_rows_say_whether_they_come_from_a_record():
 
 
 class _CountingState:
-    """A StateStore that counts the memory rows read."""
+    """A StateStore that counts the memory rows read and the evidence scans."""
 
     def __init__(self, inner):
         self._inner = inner
         self.memory_reads = 0
+        self.evidence_scans = 0
 
     def get(self, key):
         if key.startswith("mem:"):
             self.memory_reads += 1
         return self._inner.get(key)
+
+    def scan(self, prefix=""):
+        if prefix.startswith("ev:"):
+            self.evidence_scans += 1
+        return self._inner.scan(prefix)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -596,3 +602,5 @@ def test_joining_a_large_claim_does_not_read_the_memory_of_each_record():
 
     assert LedgerStore(st).memory("new").claim_id == "c-e00"
     assert st.memory_reads <= CFG.match_pool + 3  # search hits, not every record
+    assert st.evidence_scans == 1  # copy check and re-evaluation share one read
+    assert [e.event_id for e in LedgerStore(st).evidence("c-e00")][-1] == "new"

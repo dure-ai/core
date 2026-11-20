@@ -230,3 +230,23 @@ def test_judged_round_trip_and_components_do_not_collide():
     assert not st.judged("a", "b:c")
     st.mark_judged("a%3Ab", "d")
     assert not st.judged("a:b", "d")
+
+
+def test_evidence_is_read_once_and_kept_current_by_writes() -> None:
+    class Counting(FakeState):
+        scans = 0
+
+        def scan(self, prefix=""):
+            self.scans += 1
+            return super().scan(prefix)
+
+    st = Counting()
+    LedgerStore(st).put_evidence(ev("c-1", "e1"))
+    s = LedgerStore(st)
+    assert [e.event_id for e in s.evidence("c-1")] == ["e1"]
+    s.put_evidence(ev("c-1", "e0", T0 - timedelta(minutes=1)))
+    s.put_evidence(ev("c-1", "e1", T0 + timedelta(minutes=1)))  # overwrites e1
+    assert [(e.event_id, e.at) for e in s.evidence("c-1")] == [
+        ("e0", T0 - timedelta(minutes=1)), ("e1", T0 + timedelta(minutes=1))]
+    assert st.scans == 1
+    assert [e.event_id for e in LedgerStore(st).evidence("c-1")] == ["e0", "e1"]  # written through

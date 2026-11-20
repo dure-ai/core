@@ -78,11 +78,16 @@ def _k_sig(scope: Scope, owner: str, signature: str) -> str:
 class LedgerStore:
     """Typed reads and writes over the engine's `ctx.state`.
 
-    Holds no cache: every call goes to the state store, so it sees the
-    writes staged by the current delivery."""
+    Made for one observe, tick or handoff call. Reads go to the state store,
+    so they see the writes staged by the current delivery, except a claim's
+    evidence: it is read once and kept, and `put_evidence` updates the kept
+    rows as it writes. Every evidence write goes through this class, so the
+    kept rows stay what the state store holds."""
+
     def __init__(self, state: StateStore) -> None:
         """Wrap `state` (the engine's `ctx.state`)."""
         self._s = state
+        self._evidence: dict[str, dict[str, Evidence]] = {}  # claim -> event -> row
 
     def memory(self, event_id: str) -> Memory | None:
         """The memory a record event became, or None if it was never observed."""
@@ -109,12 +114,18 @@ class LedgerStore:
 
     def evidence(self, claim_id: str) -> list[Evidence]:
         """The claim's evidence rows, oldest first (ties by event id)."""
-        found = [Evidence.from_json(v) for _, v in self._s.scan(_p_ev(claim_id))]
-        return sorted(found, key=lambda e: (e.at, e.event_id))
+        rows = self._evidence.get(claim_id)
+        if rows is None:
+            found = (Evidence.from_json(v) for _, v in self._s.scan(_p_ev(claim_id)))
+            rows = self._evidence[claim_id] = {e.event_id: e for e in found}
+        return sorted(rows.values(), key=lambda e: (e.at, e.event_id))
 
     def put_evidence(self, evidence: Evidence) -> None:
         """Write an evidence row; the same claim and event overwrite one row."""
         self._s.put(_k_ev(evidence.claim_id, evidence.event_id), evidence.to_json())
+        rows = self._evidence.get(evidence.claim_id)
+        if rows is not None:
+            rows[evidence.event_id] = evidence
 
     def seen(self, session: str, claim_id: str) -> datetime | None:
         """When the session was first handed the claim, or None."""
