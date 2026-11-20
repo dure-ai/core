@@ -66,6 +66,7 @@ def ev(cid: str, eid: str, at: datetime = T0) -> Evidence:
         user="u",
         at=at,
         derived=None,
+        record=True,
     )
 
 
@@ -77,8 +78,8 @@ def test_roundtrip_memory_claim_evidence() -> None:
     c2 = claim()
     c2.invalid_since = None
     assert Claim.from_json(json.loads(json.dumps(c2.to_json()))) == c2
-    for d in (None, "copy"):
-        e = Evidence("c", "e", "contradict", "test", "k", "u", T0, d)
+    for d, record in ((None, True), ("copy", False)):
+        e = Evidence("c", "e", "contradict", "test", "k", "u", T0, d, record)
         assert Evidence.from_json(json.loads(json.dumps(e.to_json()))) == e
 
 

@@ -428,7 +428,7 @@ def _evidence(eid, *, channel="observation", minutes=0, derived=None, stance="su
               user="u1"):
     return Evidence(
         claim_id="c-e1", event_id=eid, stance=stance, channel=channel, key=f"u:{user}",
-        user=user, at=T0 + timedelta(minutes=minutes), derived=derived,
+        user=user, at=T0 + timedelta(minutes=minutes), derived=derived, record=True,
     )
 
 
@@ -552,3 +552,47 @@ def test_records_without_latin_or_hangul_words_do_not_share_a_claim():
 
     assert [c.id for c in state(db).claims()] == [f"c-e{i}" for i in range(len(texts))]
     assert count(db, "sig:") == 4  # the two emoji-only records have no words to sign
+
+
+def test_evidence_rows_say_whether_they_come_from_a_record():
+    rt, db = runtime()
+    rt.append(ev("e1", FACT))
+    rt.append(ev("j1", "", kind="outcome", user="u2", signal="test", outcome="success",
+                 refs=("e1",), minutes=1))
+    rt.append(ev("e2", NEAR, user="u3", minutes=2))
+
+    rows = state(db).evidence("c-e1")
+    assert [(e.event_id, e.record) for e in rows] == [("e1", True), ("j1", False), ("e2", True)]
+    assert LedgerEngine.state_version == "2"
+
+
+class _CountingState:
+    """A StateStore that counts the memory rows read."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.memory_reads = 0
+
+    def get(self, key):
+        if key.startswith("mem:"):
+            self.memory_reads += 1
+        return self._inner.get(key)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_joining_a_large_claim_does_not_read_the_memory_of_each_record():
+    rt, db = runtime()
+    for i in range(40):
+        rt.append(ev(f"e{i:02d}", FACT, user=f"u{i}", minutes=i))
+    new = ev("new", NEAR, user="z", minutes=50)
+    db.events.append(new)
+
+    st = _CountingState(FakeState())
+    for key, value in db.state("ledger").scan(""):
+        st._inner.put(key, value)
+    LedgerEngine().observe(new, EngineContext(db.events, db.knowledge, st, None))
+
+    assert LedgerStore(st).memory("new").claim_id == "c-e00"
+    assert st.memory_reads <= CFG.match_pool + 3  # search hits, not every record

@@ -21,13 +21,22 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-def jaccard(a: str, b: str) -> float:
-    """Jaccard overlap of the token sets of two texts (0.0 when both are empty)."""
-    left, right = set(tokenize(a)), set(tokenize(b))
-    union = left | right
+def token_set(text: str) -> frozenset[str]:
+    """The set of a text's tokens, for comparing one text with many."""
+    return frozenset(tokenize(text))
+
+
+def overlap(left: frozenset[str], right: frozenset[str]) -> float:
+    """Jaccard overlap of two token sets (0.0 when both are empty)."""
+    union = len(left | right)
     if not union:
         return 0.0
-    return len(left & right) / len(union)
+    return len(left & right) / union
+
+
+def jaccard(a: str, b: str) -> float:
+    """Jaccard overlap of the token sets of two texts (0.0 when both are empty)."""
+    return overlap(token_set(a), token_set(b))
 
 
 def signature(text: str) -> str | None:

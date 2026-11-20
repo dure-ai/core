@@ -207,7 +207,7 @@ def test_another_state_version_rebuilds_the_same_knowledge_base(db, port):
     assert "sentinel" in state(db).skipped()
 
     class Next(LedgerEngine):
-        state_version = "2"
+        state_version = LedgerEngine.state_version + "-next"
 
     rt2, _ = runtime(engine=Next(), db=db, groups=groups)
     rt2.sync()
@@ -251,7 +251,7 @@ def test_look_alike_records_later_in_the_log_do_not_change_what_a_batched_sync_b
     assert _outcome(another_db) == _outcome(db)
 
     class Next(LedgerEngine):
-        state_version = "2"
+        state_version = LedgerEngine.state_version + "-next"
 
     rebuilt, _ = runtime(engine=Next(), db=db)
     rebuilt.sync()

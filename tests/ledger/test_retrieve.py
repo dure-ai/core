@@ -201,3 +201,34 @@ def test_recency_is_off_by_default_and_halves_with_the_half_life():
     # the floor: ages of thousands of years still leave both in play
     far = handed({"half_life_days": "30"}, old=0, new=1, at_days=10**6)
     assert sorted(far) == ["c-e1", "c-e2"]
+
+
+class _ScanCounting:
+    """A StateStore that counts the evidence scans."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.evidence_scans = 0
+
+    def scan(self, prefix=""):
+        if prefix.startswith("ev:"):
+            self.evidence_scans += 1
+        return self._inner.scan(prefix)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_handoff_reads_evidence_only_until_it_has_k_items():
+    rt, db = runtime()
+    for i in range(30):  # 30 separate claims (Jaccard 7/9 < same_threshold)
+        rt.append(ev(f"e{i:02d}", f"service {i} reads config from deploy file {i}.yaml",
+                     user=f"u{i}", minutes=i))
+    full = rt.handoff("service config deploy file", caller(), "team", k=3)
+
+    st = _ScanCounting(db.state(ENGINE))
+    ctx = EngineContext(db.events, db.knowledge, st, None)
+    out = LedgerEngine().handoff("service config deploy file", caller(), "team", ctx, k=3)
+
+    assert [h.id for h in out] == [h.id for h in full] and len(out) == 3
+    assert st.evidence_scans == 3

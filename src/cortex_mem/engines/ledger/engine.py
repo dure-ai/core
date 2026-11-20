@@ -47,7 +47,7 @@ class LedgerEngine:
     contradiction or long silence. Load it on the server with
     `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`."""
 
-    state_version = "1"
+    state_version = "2"  # 2: evidence rows carry `record`
 
     def __init__(self, config: Mapping[str, str] | None = None) -> None:
         """Parse `config` (string keys and values, see README); None or an
@@ -180,6 +180,7 @@ class LedgerEngine:
                 user=event.user,
                 at=event.at,
                 derived=derived,
+                record=True,
             )
         )
         return self._reevaluate(claim, event, ctx, store)
@@ -277,6 +278,7 @@ class LedgerEngine:
                 user=event.user,
                 at=event.at,
                 derived=None,
+                record=False,
             )
         )
         down = claim.status
@@ -308,18 +310,16 @@ class LedgerEngine:
         return seen is not None and seen < event.at
 
     @staticmethod
-    def _human_fresh(
-        evidence: Sequence[Evidence], canonical: str, store: LedgerStore
-    ) -> bool:
+    def _human_fresh(evidence: Sequence[Evidence], canonical: str) -> bool:
         """Human support (not derived) at or after the canonical record's time."""
-        memory = store.memory(canonical)
-        if memory is None:
+        made = next((e.at for e in evidence if e.record and e.event_id == canonical), None)
+        if made is None:
             return False
         return any(
             e.channel == "human"
             and e.stance == "support"
             and e.derived is None
-            and e.at >= memory.at
+            and e.at >= made
             for e in evidence
         )
 
@@ -331,11 +331,7 @@ class LedgerEngine:
         for. Writes the claim."""
         before, canonical_before = claim.status, claim.canonical
         evidence = store.evidence(claim.id)
-        records = {
-            e.event_id
-            for e in evidence
-            if (m := store.memory(e.event_id)) is not None and m.claim_id == claim.id
-        }
+        records = {e.event_id for e in evidence if e.record}
         canonical = canonical_of(
             evidence, self._cfg, records=records, current=canonical_before
         )
@@ -348,7 +344,7 @@ class LedgerEngine:
             counted,
             text,
             self._cfg,
-            human_fresh=self._human_fresh(evidence, canonical, store),
+            human_fresh=self._human_fresh(evidence, canonical),
         )
         if (
             before in ("established", "disputed")
@@ -365,7 +361,7 @@ class LedgerEngine:
                 counted,
                 text,
                 self._cfg,
-                human_fresh=self._human_fresh(evidence, canonical, store),
+                human_fresh=self._human_fresh(evidence, canonical),
             )
         claim.status = report.decision
         claim.report = report.to_json()

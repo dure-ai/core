@@ -13,7 +13,7 @@ from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.model import Claim, Memory
 from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
-from cortex_mem.engines.ledger.text import jaccard, signature
+from cortex_mem.engines.ledger.text import overlap, signature, token_set
 
 # The lexical search widens to at most this many times `match_pool` hits.
 _WIDEN_LIMIT = 16
@@ -65,19 +65,17 @@ def _copied_from(
     """Event id of the claim's record by another user that the new record
     copies (token Jaccard >= `copy_threshold`), or None. The highest score
     wins; equal scores go to the smallest event id."""
-    ids = {claim.id.removeprefix("c-"), claim.canonical}
-    ids.update(ev.event_id for ev in store.evidence(claim.id))
-    others = [
-        i for i in sorted(ids)
-        if (m := store.memory(i)) is not None
-        and m.claim_id == claim.id
-        and m.user != event.user
-    ]
+    ids = {e.event_id for e in store.evidence(claim.id) if e.record and e.user != event.user}
+    ids.add(claim.canonical)
+    others = [e for e in ctx.events.get(sorted(ids)) if e.user != event.user]
+    mine = token_set(event.text)
     best: tuple[float, str] | None = None
-    for other in ctx.events.get(others):
-        score = jaccard(event.text, other.text)
+    for other in others:
+        score = overlap(mine, token_set(other.text))
         if score >= cfg.copy_threshold and (best is None or score > best[0]):
             best = (score, other.id)  # ids ascend, so the first of equal scores wins
+            if score == 1.0:
+                break  # nothing scores higher, and later ids lose ties
     return None if best is None else best[1]
 
 
@@ -151,11 +149,12 @@ class LexicalMatcher:
             if claim is not None and eligible(claim, event):
                 return Match(cid, 1.0, _copied_from(event, claim, ctx, store, self._cfg))
         best: tuple[float, str, str] | None = None  # (score, claim id, event id)
+        mine = token_set(event.text)
         for other, memory in self._observed_hits(event, ctx, store):
             claim = store.claim(memory.claim_id)
             if not eligible(claim, event):
                 continue
-            score = jaccard(event.text, other.text)
+            score = overlap(mine, token_set(other.text))
             if score < self._cfg.same_threshold:
                 continue
             key = (score, memory.claim_id, other.id)
@@ -184,6 +183,7 @@ class LexicalMatcher:
         pool = self._cfg.match_pool
         limit = pool * _WIDEN_LIMIT
         k = pool
+        memories: dict[str, Memory | None] = {}  # a wider search repeats earlier hits
         while True:
             hits = ctx.events.search(
                 event.text, _author(event), event.scope, k=k, kinds=("record",)
@@ -192,7 +192,9 @@ class LexicalMatcher:
             for other, _ in hits:
                 if other.id == event.id:
                     continue
-                memory = store.memory(other.id)
+                if other.id not in memories:
+                    memories[other.id] = store.memory(other.id)
+                memory = memories[other.id]
                 if memory is not None:
                     observed.append((other, memory))
                     if len(observed) == pool:

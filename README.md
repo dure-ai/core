@@ -134,7 +134,7 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 **건넬 때(`handoff`).** 지식 검색·기록 검색(임베딩을 켜면 의미 검색 두 목록도)을 RRF로 합쳐 주장 단위로 모으고, 상태 가중·최신성을 곱해 순위를 낸다. deprecated·archived와 조건이 호출자의 `context`와 다른 주장은 뺀다. 항목 하나가 주장 하나이고, 본문 아래에 `[established · human 1, test 1 · 2 sources · since 2026-10-03]` 같은 출처 줄을 붙이며, `sources`에는 지지 이벤트가 모두 들어간다. `status`는 승격된 established만 `knowledge`, 나머지는 `memory`다.
 
-**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "1"`). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`). 같은 이벤트가 다시 전달돼도 한 번만 센다.
+**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "2"`: 증거 줄이 기록에서 왔는지(`record`)를 함께 저장한다). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`). 같은 이벤트가 다시 전달돼도 한 번만 센다.
 
 설정 키(값은 모두 문자열이다. 기본값은 `config.py`와 같다):
 

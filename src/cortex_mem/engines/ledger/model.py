@@ -154,7 +154,10 @@ class Evidence:
     `stance` is support or contradict, `channel` how it was checked, `key`
     the independence key (events with the same key are one vote), and
     `derived` why it does not count: "retrieved" (restates knowledge the
-    session was handed) or "copy" (copies another user's text); None counts."""
+    session was handed) or "copy" (copies another user's text); None counts.
+    `record` is True for the row a record wrote on its own claim (the claim
+    holds its memory) and False for a judgment, so readers need not look up
+    memories to tell them apart."""
     claim_id: str
     event_id: str
     stance: Stance
@@ -163,6 +166,7 @@ class Evidence:
     user: str
     at: datetime
     derived: Derived | None
+    record: bool
 
     def to_json(self) -> dict[str, Any]:
         """Plain JSON for the state store."""
@@ -175,6 +179,7 @@ class Evidence:
             "user": self.user,
             "at": _dt(self.at),
             "derived": self.derived,
+            "record": self.record,
         }
 
     @classmethod
@@ -189,4 +194,5 @@ class Evidence:
             user=data["user"],
             at=_parse(data["at"]),
             derived=cast("Derived | None", data.get("derived")),
+            record=bool(data["record"]),
         )

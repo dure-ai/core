@@ -35,7 +35,7 @@ def claim(scope="team", owner="t1") -> Claim:
 def e(key, channel="observation", stance="support", derived=None, days=0, eid=None):
     return Evidence(claim_id="c1", event_id=eid or f"{key}-{channel}-{stance}-{days}",
                     stance=stance, channel=channel, key=key, user="u",
-                    at=T0 + timedelta(days=days), derived=derived)
+                    at=T0 + timedelta(days=days), derived=derived, record=False)
 
 
 def test_verified_set():

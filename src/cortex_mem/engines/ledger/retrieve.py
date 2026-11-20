@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import timedelta
 
 from cortex_mem.access import event_visible
-from cortex_mem.contract import Caller, EngineContext, Handoff, Scope
+from cortex_mem.contract import Caller, EngineContext, Event, Handoff, Scope
 from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.evidence import Tally, tally
 from cortex_mem.engines.ledger.model import Claim, Evidence
@@ -86,47 +86,51 @@ def handoff(
     caller's own candidate uses `own_candidate_weight`) x recency; ties by
     claim id. `status` is "knowledge" only for an established claim the
     knowledge base holds."""
-    ranked: list[tuple[float, str, Handoff]] = []
+    # Score every candidate from its claim and canonical record alone, then read
+    # evidence best first and only until k items are found: evidence decides
+    # whether a claim is left out (no counted support) but not its score.
+    claims: list[tuple[Claim, float]] = []
     for claim_id, relevance in _candidates(query, caller, scope, ctx, store, cfg).items():
         claim = store.claim(claim_id)
         if claim is None or claim.status in ("deprecated", "archived"):
             continue
         if any(caller.context.get(key, value) != value for key, value in claim.conditions.items()):
             continue
-        found = ctx.events.get([claim.canonical])
-        if not found or not event_visible(found[0], caller, scope):
+        claims.append((claim, relevance))
+    canonicals = {e.id: e for e in ctx.events.get([c.canonical for c, _ in claims])}
+
+    ranked: list[tuple[float, Claim, Event]] = []
+    for claim, relevance in claims:
+        canonical = canonicals.get(claim.canonical)
+        if canonical is None or not event_visible(canonical, caller, scope):
             continue
-        canonical = found[0]
-        evidence = store.evidence(claim.id)
-        support: list[Evidence] = [e for e in evidence if e.stance == "support" and e.derived is None]
-        if not support:
-            continue
-        full = tally(evidence, cfg)
-        line = provenance_line(claim, full)
         own = claim.status == "candidate" and canonical.user == caller.user
-        weight = cfg.status_weights[claim.status]
-        if own:
-            weight = cfg.own_candidate_weight
-        score = relevance * weight * _recency(claim, caller, cfg)
-        knowledge = (
-            claim.status == "established" and bool(ctx.knowledge.get([claim.id]))
+        weight = cfg.own_candidate_weight if own else cfg.status_weights[claim.status]
+        ranked.append((relevance * weight * _recency(claim, caller, cfg), claim, canonical))
+    ranked.sort(key=lambda r: (-r[0], r[1].id))
+
+    chosen: list[tuple[Claim, Event, list[Evidence], Tally]] = []
+    for _, claim, canonical in ranked:
+        if len(chosen) == k:
+            break
+        evidence = store.evidence(claim.id)
+        support = [e for e in evidence if e.stance == "support" and e.derived is None]
+        if support:
+            chosen.append((claim, canonical, support, tally(evidence, cfg)))
+
+    established = [c.id for c, _, _, _ in chosen if c.status == "established"]
+    held = {item.id for item in ctx.knowledge.get(established)} if established else set()
+    return [
+        Handoff(
+            id=claim.id,
+            content=f"{canonical.text}\n\n{provenance_line(claim, full)}",
+            sources=tuple(e.event_id for e in support),
+            status="knowledge" if claim.id in held else "memory",
+            conditions=dict(claim.conditions),
+            confidence=full.confidence,
         )
-        ranked.append(
-            (
-                score,
-                claim.id,
-                Handoff(
-                    id=claim.id,
-                    content=f"{canonical.text}\n\n{line}",
-                    sources=tuple(e.event_id for e in support),
-                    status="knowledge" if knowledge else "memory",
-                    conditions=dict(claim.conditions),
-                    confidence=full.confidence,
-                ),
-            )
-        )
-    ranked.sort(key=lambda r: (-r[0], r[1]))
-    return [h for _, _, h in ranked[:k]]
+        for claim, canonical, support, full in chosen
+    ]
 
 
 def _recency(claim: Claim, caller: Caller, cfg: LedgerConfig) -> float:

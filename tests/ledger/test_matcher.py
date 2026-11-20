@@ -69,7 +69,7 @@ class World:
             self.store.put_evidence(Evidence(
                 claim_id=cid, event_id=event.id, stance="support",
                 channel="observation", key=event.user, user=event.user, at=T0,
-                derived=None))
+                derived=None, record=True))
         self.store.put_memory(Memory(id=event.id, claim_id=cid, user=event.user,
                                      team=event.team, session=event.session,
                                      at=T0, group=group))

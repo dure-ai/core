@@ -185,7 +185,8 @@ def _evidence(stance: str, counts: dict[str, int], tag: str) -> list[Evidence]:
         for i in range(counts.get(channel, 0)):
             key = f"u:{tag}{rank}{channel}{i}"
             rows.append(Evidence(claim_id="c1", event_id=f"{key}-{stance}", stance=stance,
-                                 channel=channel, key=key, user=key, at=T0, derived=None))
+                                 channel=channel, key=key, user=key, at=T0, derived=None,
+                                 record=False))
     return rows
 
 
@@ -205,7 +206,8 @@ def _in_key_order(stance: str, channels: str, tag: str) -> list[Evidence]:
     for i, c in enumerate(channels):
         key = f"u:{tag}{i:02d}"
         rows.append(Evidence(claim_id="c1", event_id=f"{key}-{stance}", stance=stance,
-                             channel=names[c], key=key, user=key, at=T0, derived=None))
+                             channel=names[c], key=key, user=key, at=T0, derived=None,
+                             record=False))
     return rows
 
 
