@@ -13,12 +13,15 @@ from cortex_mem.embed import EmbeddingError, HashEmbedder
 
 
 class TxnSpy:
+    """Wraps a Database's transaction() and counts how deep the transactions
+    opened through it are (see the module docstring)."""
     def __init__(self, db):
         self.db = db
         self.depth = 0
 
     @contextmanager
     def transaction(self):
+        """db.transaction(), counted while it is open."""
         with self.db.transaction():
             self.depth += 1
             try:
@@ -28,6 +31,8 @@ class TxnSpy:
 
     @property
     def open(self) -> bool:
+        """True while a write transaction is open, through the spy or by the
+        store itself."""
         return self.depth > 0 or getattr(self.db, "_depth", 0) > 0
 
 
@@ -56,10 +61,12 @@ class SpyEmbedder:
 
     @property
     def texts(self):
+        """Every text embedded, in call order."""
         return [t for texts, _, _ in self.calls for t in texts]
 
     @property
     def batches(self):
+        """The texts of each embed call."""
         return [texts for texts, _, _ in self.calls]
 
     @property
@@ -114,6 +121,7 @@ class SpyBackend:
         self.log = []  # ("put_vector", kind, id) | ("put_group", event_id) | ("delete_vectors", kind, ids)
 
     def __getattr__(self, name):
+        """The inner backend's attribute; a watched method also records its calls."""
         target = getattr(self._inner, name)
         if name not in self._watch:
             return target
@@ -125,13 +133,16 @@ class SpyBackend:
         return watched
 
     def put_vector(self, kind, id, vector, digest=None):
+        """Log the write, then delegate."""
         self.log.append(("put_vector", kind, id))
         self._inner.put_vector(kind, id, vector, digest)
 
     def put_group(self, event_id, *args, **kw):
+        """Log the write, then delegate."""
         self.log.append(("put_group", event_id))
         self._inner.put_group(event_id, *args, **kw)
 
     def delete_vectors(self, kind, ids):
+        """Log the delete, then delegate."""
         self.log.append(("delete_vectors", kind, tuple(sorted(ids))))
         self._inner.delete_vectors(kind, ids)

@@ -204,6 +204,8 @@ class Runtime:
         return [v for v in self.verdicts if not v.accepted]
 
     def _staged(self, read_only: bool = False) -> _StagedState:
+        """A fresh staged view of the engine's state for one call; read_only
+        raises PermissionError on a write (handoff)."""
         return _StagedState(self.state, read_only=read_only)
 
     def _ctx(self, state: _StagedState, upto: int) -> EngineContext:

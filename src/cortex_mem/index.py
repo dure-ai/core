@@ -50,6 +50,7 @@ def _embedded(event: Event) -> bool:
 
 
 def _passage(item: Knowledge) -> str:
+    """The text a knowledge item is embedded from: title, a newline, body."""
     return f"{item.title}\n{item.body}"
 
 
@@ -69,6 +70,8 @@ class Index:
         group_threshold: float,
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
+        """group_threshold: the cosine at or above which a record joins the group
+        of its closest earlier member (CORTEX_GROUP_THRESHOLD on the server)."""
         self._backend = backend
         self._embedder = embedder
         self._threshold = group_threshold
@@ -97,6 +100,8 @@ class Index:
         return {**self.want(), "generation": generation}
 
     def stale(self) -> bool:
+        """True when the stored index was built for another config than want(),
+        or never built."""
         return self._backend.meta() != self.want()
 
     def generation(self) -> int:
@@ -245,12 +250,19 @@ class Index:
         return generation, self._backend.indexed()
 
     def _pending(self, events: EventStore, after: int, upto: int) -> Iterable[tuple[int, Event]]:
+        """(seq, event) after `after` up to and including `upto`, in append order."""
         for seq, event in events.since(after):
             if seq > upto:
                 return
             yield seq, event
 
     def _index_event(self, seq: int, event: Event, generation: int) -> None:
+        """Index one event within `generation`. An event that is not embedded only
+        moves the position. A record's vector (cached before this call) and
+        group are found outside any transaction; then one short transaction
+        moves the position from seq - 1 to seq and writes both. Raises
+        CursorConflict, writing nothing, when another process moved the
+        position or rebuilt the index."""
         if not _embedded(event):
             with self._transaction():
                 self._backend.set_indexed(seq - 1, seq, generation)
@@ -327,12 +339,15 @@ class Index:
         return vector
 
     def _embed(self, texts: list[str], kind: EmbedKind) -> list[list[float]]:
+        """The embedder's vectors for texts as plain floats; EmbeddingError when
+        it returns another number of vectors than texts."""
         out = self._embedder.embed(texts, kind)
         if len(out) != len(texts):
             raise EmbeddingError(f"embedder returned {len(out)} vectors for {len(texts)} texts")
         return [[float(x) for x in vector] for vector in out]
 
     def _embed_one(self, text: str, kind: EmbedKind) -> list[float]:
+        """The embedder's vector for one text."""
         return self._embed([text], kind)[0]
 
     def _group_for(self, vector: list[float], scope: Scope, owner: str, event_id: str, seq: int) -> str:
@@ -358,6 +373,8 @@ class Index:
         return found
 
     def _group(self, event_id: str, upto: int | None) -> tuple[str, list[str]] | None:
+        """(group id, its members with seq <= upto) for the event, or None when
+        the event is not grouped or is itself past upto."""
         group_id = self._backend.group_of(event_id)
         if group_id is None:
             return None
@@ -373,6 +390,8 @@ class _Reader:
     def __init__(
         self, index: Index, events: EventReader, knowledge: KnowledgeReader, upto: int | None
     ) -> None:
+        """upto bounds every event read (None: no bound); `model` is the embedding
+        model the index was built with."""
         self._index = index
         self._events = events
         self._knowledge = knowledge
@@ -387,6 +406,8 @@ class _Reader:
         k: int = 20,
         kinds: Collection[Kind] | None = None,
     ) -> list[tuple[Event, float]]:
+        """SimilarityReader.search over the events at positions <= upto; a blank
+        query gives []."""
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
@@ -396,6 +417,9 @@ class _Reader:
     def neighbors(
         self, event_id: str, caller: Caller, scope: Scope, k: int = 20
     ) -> list[tuple[Event, float]]:
+        """SimilarityReader.neighbors. [] when the start event is unknown, hidden
+        from the caller, not grouped, or past upto: even filtered scores would
+        tell the caller how close visible events are to text they may not read."""
         # Unknown or unseen start: even filtered scores would tell the caller
         # how close visible events are to text they may not read.
         start = self._events.get([event_id])
@@ -414,6 +438,8 @@ class _Reader:
     def knowledge(
         self, query: str, caller: Caller, scope: Scope, k: int = 20
     ) -> list[tuple[Knowledge, float]]:
+        """SimilarityReader.knowledge over the knowledge base as it stands now
+        (upto does not bound it); a blank query gives []."""
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
@@ -422,6 +448,8 @@ class _Reader:
         return [(items[id], score) for id, score in hits if id in items]
 
     def group(self, event_id: str) -> Group | None:
+        """SimilarityReader.group: members only up to upto; scope and owner are
+        the first member's."""
         found = self._index._group(event_id, self._upto)
         if found is None:
             return None
@@ -432,5 +460,6 @@ class _Reader:
         return Group(group_id, first[0].scope, owner_for(first[0]), tuple(members))
 
     def _with_events(self, hits: list[tuple[str, float]]) -> list[tuple[Event, float]]:
+        """The hits as (Event, score), in order, dropping ids with no event."""
         events = {e.id: e for e in self._events.get([id for id, _ in hits])}
         return [(events[id], score) for id, score in hits if id in events]

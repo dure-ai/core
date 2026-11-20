@@ -29,7 +29,11 @@ class Embedder(Protocol):
     model: str
     dim: int
 
-    def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]: ...
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
+        """One vector per text, in order, each `dim` long. kind says whether the
+        texts are stored (passage) or searched with (query); a model may embed
+        the two differently. Raises EmbeddingError when the backend fails."""
+        ...
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -90,6 +94,8 @@ class HashEmbedder:
     """Deterministic offline embedder using signed hashed token counts."""
 
     def __init__(self, dim: int = 256) -> None:
+        """dim: vector length. The model name is `hash-<dim>`, so another dim is
+        another index version and the index is rebuilt."""
         self.dim = dim
         self.model = f"hash-{dim}"
 
@@ -98,6 +104,9 @@ class HashEmbedder:
         return [self._one(t) for t in texts]
 
     def _one(self, text: str) -> list[float]:
+        """Each word and bigram adds +1 or -1 (the sign from the same sha256) at
+        the slot its hash picks; the result is L2-normalized, or all zeros for
+        a text with no tokens."""
         vec = [0.0] * self.dim
         for token in words(text) + bigrams(text):
             n = int.from_bytes(hashlib.sha256(token.encode("utf-8")).digest()[:8], "big")
@@ -120,6 +129,12 @@ class UpstageEmbedder:
         timeout: float = 30.0,
         batch: int = 64,
     ) -> None:
+        """passage_model embeds stored texts and query_model search queries;
+        `model`, the name the index version records, is the passage model.
+        Texts go `batch` per request (at least 1), each request waiting at most
+        `timeout` seconds. Raises ValueError, without quoting the key, for an
+        api_key that is empty, has surrounding whitespace, or holds a character
+        outside printable ASCII."""
         # The key goes into a header: a control or non-ASCII character would make
         # http.client raise an error that quotes the header, key included.
         # The message never quotes the key.
@@ -142,6 +157,7 @@ class UpstageEmbedder:
         return self._dim
 
     def __repr__(self) -> str:
+        """Names the models only, never the API key."""
         return f"UpstageEmbedder(passage_model={self.passage_model!r}, query_model={self.query_model!r})"
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
@@ -153,6 +169,14 @@ class UpstageEmbedder:
         return out
 
     def _post(self, model: str, chunk: list[str]) -> list[list[float]]:
+        """One POST /embeddings for the chunk; its vectors in input order, by the
+        response's `index` field. Learns `dim` from the first non-empty response.
+
+        Every failure is an EmbeddingError whose message never holds the key:
+        an HTTP error, a timeout, a network error, a request that cannot be
+        built or sent, or a response that is not valid embeddings JSON
+        (missing, repeated or extra indexes, empty vectors, or lengths that
+        differ from each other or from `dim`)."""
         body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
         unsendable: str | None = None
         try:

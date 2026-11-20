@@ -71,6 +71,8 @@ def report(pairs: Sequence[dict[str, Any]], embedder: Embedder, thresholds: Sequ
 
 
 def _parse_thresholds(text: str) -> list[float]:
+    """Comma-separated thresholds, each from 0 to 1; blank parts are skipped.
+    ValueError for a part that is not a number in range, or for none at all."""
     thresholds = []
     for part in text.split(","):
         if not part.strip():
@@ -88,6 +90,8 @@ def _parse_thresholds(text: str) -> list[float]:
 
 
 def _read_pairs(path: Path) -> list[dict[str, Any]]:
+    """The pairs file: one JSON object per non-blank line, with strings `a`
+    and `b` and a boolean `same`. ValueError naming file:line otherwise."""
     pairs = []
     with path.open(encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -109,6 +113,8 @@ def _read_pairs(path: Path) -> list[dict[str, Any]]:
 
 
 def _format(rows: list[Row]) -> str:
+    """The rows as a tab-separated table, then the lowest threshold whose
+    rival_rate is at most RIVAL_LIMIT (or a line saying none qualifies)."""
     lines = ["threshold\tsame_rate\trival_rate\tn_same\tn_rival"]
     for r in rows:
         lines.append(f"{r.threshold}\t{r.same_rate:.3f}\t{r.rival_rate:.3f}\t{r.n_same}\t{r.n_rival}")
@@ -121,6 +127,9 @@ def _format(rows: list[Row]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Measure and print the table. Returns 2 for bad input or settings
+    (including a pairs file without both same and rival pairs), 1 when
+    embedding fails, else 0."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("pairs", type=Path, help="JSON Lines file of {a, b, same} objects")
     parser.add_argument("--embedder", choices=["hash", "upstage"], required=True)

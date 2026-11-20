@@ -188,6 +188,7 @@ class InMemoryVectorBackend:
     kind = "memory"
 
     def __init__(self, events: EventReader, knowledge: KnowledgeReader) -> None:
+        """events and knowledge: the stores the searches judge visibility over."""
         self._events = events
         self._knowledge = knowledge
         self._vectors: dict[str, dict[str, list[float]]] = {

@@ -151,7 +151,9 @@ class VectorBackend(Protocol):
         """id -> digest of the knowledge vectors that have one."""
         ...
 
-    def vector(self, kind: str, id: str) -> list[float] | None: ...
+    def vector(self, kind: str, id: str) -> list[float] | None:
+        """The stored vector of that kind and id, or None."""
+        ...
 
     def vectors(self, kind: str, upto: int | None = None) -> Iterator[tuple[str, list[float]]]:
         """Event vectors in first-insertion order, knowledge vectors by id.
@@ -166,9 +168,15 @@ class VectorBackend(Protocol):
     # Groups
     def put_group(
         self, event_id: str, group_id: str, scope: Scope, owner: str, seq: int
-    ) -> None: ...
+    ) -> None:
+        """Put the event in group_id within the (scope, owner) cell at position
+        seq. An event has one group: putting it again moves it, with its new
+        cell and seq."""
+        ...
 
-    def group_of(self, event_id: str) -> str | None: ...
+    def group_of(self, event_id: str) -> str | None:
+        """The event's group id, or None when it is not grouped."""
+        ...
 
     def members(self, group_id: str, upto: int | None = None) -> list[str]:
         """Event ids of the group ordered by seq, only those with seq <= upto
@@ -180,9 +188,15 @@ class VectorBackend(Protocol):
         ...
 
     # Embedding cache
-    def cached(self, model: str, digest: str) -> list[float] | None: ...
+    def cached(self, model: str, digest: str) -> list[float] | None:
+        """The cached vector of the text with this digest embedded by this model,
+        or None. Keyed by model, so models never mix; reset() keeps the cache."""
+        ...
 
-    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None: ...
+    def cache(self, model: str, digest: str, vector: Sequence[float]) -> None:
+        """Store or replace the vector of the text with this digest embedded by
+        this model (float32, any dimension)."""
+        ...
 
     # Similarity: cosine of the float32 query against the stored vectors.
     def nearest_member(
@@ -222,13 +236,19 @@ class Database(Protocol):
     Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)."""
 
     @property
-    def events(self) -> EventStore: ...
+    def events(self) -> EventStore:
+        """The event log."""
+        ...
 
     @property
-    def knowledge(self) -> KnowledgeStore: ...
+    def knowledge(self) -> KnowledgeStore:
+        """The knowledge base."""
+        ...
 
     @property
-    def vectors(self) -> VectorBackend: ...
+    def vectors(self) -> VectorBackend:
+        """The vectors, groups and embedding cache of the similarity index."""
+        ...
 
     def state(self, engine: str) -> EngineStateBackend:
         """State and cursor of the engine with this name (its import path)."""
