@@ -20,7 +20,7 @@ from ..contract import (
     KnowledgeReader,
     Scope,
 )
-from ..embed import cosine, float32, top_by_cosine
+from ..embed import QueryScorer, float32, top_by_cosine
 from .base import CursorConflict
 from .text import bigrams, words
 
@@ -309,14 +309,14 @@ class InMemoryVectorBackend:
     def nearest_member(
         self, scope: Scope, owner: str, vector: Sequence[float], upto: int
     ) -> tuple[str, float] | None:
-        query = float32(vector)
+        score_of = QueryScorer(float32(vector))
         table = self._vectors["event"]
         best: tuple[str, float] | None = None
         for seq, id in self._cells.get((scope, owner), []):  # (seq, id) order
             if seq > upto:
                 break
             if id in table:
-                score = cosine(query, table[id])
+                score = score_of(table[id])
                 if best is None or score > best[1]:  # strictly: a tie keeps the earlier
                     best = (id, score)
         return best

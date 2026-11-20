@@ -24,7 +24,7 @@ from os import PathLike
 from typing import Any
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
-from ..embed import cosine, float32, top_by_cosine
+from ..embed import QueryScorer, float32, top_by_cosine
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
@@ -534,10 +534,10 @@ class SqliteVectorBackend:
             "WHERE g.scope = ? AND g.owner = ? AND g.seq <= ? ORDER BY g.seq, g.event_id",
             (scope, owner, upto),
         )
-        query = float32(vector)
+        score_of = QueryScorer(float32(vector))
         best: tuple[str, float] | None = None
         for id, blob in rows:
-            score = cosine(query, _unpack(blob))
+            score = score_of(_unpack(blob))
             if best is None or score > best[1]:  # strictly: a tie keeps the earlier
                 best = (id, score)
         return best

@@ -1,9 +1,10 @@
 import hashlib
 import math
+import random
 
 import pytest
 
-from cortex_mem.embed import HashEmbedder, cosine, float32, text_digest
+from cortex_mem.embed import HashEmbedder, cosine, float32, text_digest, top_by_cosine
 
 
 def e(text, dim=256, kind="passage"):
@@ -110,3 +111,24 @@ def test_float32_rounds_finite_values():
 def test_float32_refuses_non_finite_values(bad):
     with pytest.raises(ValueError, match="finite"):
         float32(bad)
+
+
+def _fsum_cosine(a, b):
+    """The reference: every sum correctly rounded by math.fsum."""
+    na2 = math.fsum(x * x for x in a)
+    nb2 = math.fsum(y * y for y in b)
+    return math.fsum(x * y for x, y in zip(a, b)) / math.sqrt(na2 * nb2)
+
+
+@pytest.mark.parametrize("dim", [3, 256, 4096])
+def test_cosine_of_float32_vectors_is_bit_for_bit_the_fsum_formula(dim):
+    # The stores keep float32, whose products are exact in a double: any exact
+    # summation (fsum, sumprod) then gives the same float, so the Python stores
+    # rank exactly as before however the sums are computed.
+    rng = random.Random(dim)
+    query = float32([rng.gauss(0, 1) for _ in range(dim)])
+    vectors = [float32([rng.gauss(0, 1) for _ in range(dim)]) for _ in range(200)]
+    assert [cosine(query, v) for v in vectors] == [_fsum_cosine(query, v) for v in vectors]
+    assert [s for _, s in top_by_cosine(query, enumerate(vectors), 200)] == sorted(
+        (s for s in (_fsum_cosine(query, v) for v in vectors) if s > 0), reverse=True
+    )
