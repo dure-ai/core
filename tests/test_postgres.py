@@ -706,6 +706,29 @@ class TestPgVectors(VectorBackendContract):
         self.open("none").vectors.reset({"model": "m3", "group_threshold": 0.9})
         assert _hnsw_indexes(db) == set()
 
+    def test_hnsw_indexes_come_back_after_a_rollback_or_another_process_reset(self):
+        db = self.open("hnsw")
+        vb = db.vectors
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        with pytest.raises(RuntimeError, match="later failure"), db.transaction():
+            vb.put_vector("event", "e1", [1.0, 0.0])  # builds the indexes, then rolls back
+            raise RuntimeError("later failure")
+        assert _hnsw_indexes(db) == set()
+        vb.put_vector("event", "e1", [1.0, 0.0])
+        assert _hnsw_indexes(db) == {"event_vectors_hnsw_d2", "knowledge_vectors_hnsw_d2"}
+
+        self.open("hnsw").vectors.reset({"model": "m2", "group_threshold": 0.8})  # another process
+        assert _hnsw_indexes(db) == set()
+        vb.put_vector("event", "e2", [0.0, 1.0])  # same D as before, in the new generation
+        assert _hnsw_indexes(db) == {"event_vectors_hnsw_d2", "knowledge_vectors_hnsw_d2"}
+
+    def test_a_zero_vector_scores_0_as_in_python(self, db, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.0})
+        vb.put_vector("event", "e1", [0.0, 0.0])
+        vb.put_group("e1", "e1", "team", "t1", 1)
+        assert vb.nearest_member("team", "t1", [1.0, 0.0], 1) == ("e1", 0.0)
+        assert vb.nearest_member("team", "t1", [0.0, 0.0], 1) == ("e1", 0.0)
+
     def test_no_hnsw_index_without_the_setting(self, db, vb):
         vb.reset({"model": "m1", "group_threshold": 0.8})
         vb.put_vector("event", "e1", [1.0, 0.0])

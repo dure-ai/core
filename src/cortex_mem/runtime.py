@@ -302,6 +302,12 @@ class Runtime:
         """How many events wait after the engine's cursor (read now, no lock)."""
         return sum(1 for _ in self.events.since(self.state.cursor()))
 
+    def waiting(self) -> list[str]:
+        """Ids of the events that wait after the engine's cursor, in order
+        (read now, no lock): an event is delivered (or skipped) once it is
+        not among them."""
+        return [event.id for _, event in self.events.since(self.state.cursor())]
+
     def _deliver_next(
         self, epoch: int, cursor: int, seq: int, event: Event, generation: int | None
     ) -> tuple[int, list[str]]:
@@ -450,8 +456,10 @@ class Runtime:
         one short transaction that computes the version again (the index may
         have been rebuilt meanwhile). A rebuild by any process adds 1 to the
         index generation, so it changes the version of every engine on the
-        store. The knowledge base is kept; replayed Promotes replace items
-        with the same id."""
+        store. The same transaction empties the knowledge base: the replay
+        promotes again what the engine still holds true, and an item it no
+        longer promotes would otherwise stay with no engine state left to
+        demote it. Knowledge vectors follow on this sync."""
         if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
         want = self._want_version()
@@ -461,6 +469,9 @@ class Runtime:
             want = self._want_version()
             if want is not None and self.state.version() != want:
                 self.state.reset(want)
+                for item in self.knowledge.all():
+                    self.knowledge.remove(item.id)
+                self._knowledge_reconciled = False  # drop the vectors of what was removed
 
     def tick(self, now: datetime) -> None:
         """Deliver what is pending, then let time pass: engine.tick runs with

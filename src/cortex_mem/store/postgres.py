@@ -306,10 +306,15 @@ class PostgresDatabase:
                 self._depth -= 1
                 if outer:
                     self._rollback()
+                    self._vectors.forget_hnsw()  # indexes built inside it are gone
                 raise
             self._depth -= 1
             if outer:
-                self._commit()
+                try:
+                    self._commit()
+                except BaseException:
+                    self._vectors.forget_hnsw()
+                    raise
 
     def _begin(self) -> None:
         """BEGIN, set this transaction's lock_timeout, and take the database-wide
@@ -752,7 +757,9 @@ class PgVectorBackend:
 
     def __init__(self, db: PostgresDatabase) -> None:
         self.db = db
-        self._hnsw_for: int | None = None  # the D this backend last built (or checked) indexes for
+        # (generation, D) this backend last built or checked the indexes for. Another
+        # generation (a reset by any process drops them) or a rollback makes it stale.
+        self._hnsw_for: tuple[int, int] | None = None
 
     def load(self) -> None:
         """On opening the database: with HNSW on, build the indexes of an index version
@@ -762,7 +769,12 @@ class PgVectorBackend:
         with self.db.transaction():
             dim = self._dim()
             if dim is not None:
-                self._ensure_hnsw(dim)
+                self._ensure_hnsw(dim, self.generation())
+
+    def forget_hnsw(self) -> None:
+        """Called when a write transaction rolls back: indexes built inside it
+        are gone, so the next put checks them again."""
+        self._hnsw_for = None
 
     # Index state
 
@@ -861,11 +873,12 @@ class PgVectorBackend:
         )
         return [r[0] for r in rows]
 
-    def _ensure_hnsw(self, dim: int) -> None:
+    def _ensure_hnsw(self, dim: int, generation: int) -> None:
         """Inside a write transaction, with HNSW on: build the missing indexes for D, once
-        per D per backend. A table holding a component beyond halfvec range (written while
-        HNSW was off) gets no index, since building it would fail; it is searched exactly."""
-        self._hnsw_for = dim
+        per D and index generation per backend (until a rollback). A table holding a
+        component beyond halfvec range (written while HNSW was off) gets no index, since
+        building it would fail; it is searched exactly."""
+        self._hnsw_for = (generation, dim)
         if dim > HNSW_MAX_DIM:
             log.warning(
                 "vectors have %d dimensions, more than HNSW's %d for halfvec; searching exactly",
@@ -906,8 +919,10 @@ class PgVectorBackend:
             self._check_dim(values, dim)  # likewise
             if self._get_meta("dim") is None:
                 self._set_meta("dim", str(len(values)))
-            if self.db.vector_index == "hnsw" and self._hnsw_for != len(values):
-                self._ensure_hnsw(len(values))
+            if self.db.vector_index == "hnsw":
+                generation = self.generation()
+                if self._hnsw_for != (generation, len(values)):
+                    self._ensure_hnsw(len(values), generation)
             if kind == "event":
                 # ord is assigned on first insert; replacing keeps it (and the position).
                 self.db.con.execute(

@@ -170,10 +170,10 @@ class Service:
         return caller
 
     def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
-        """Append an event; returns its id, whether the engine has seen
-        everything (pending() == 0 after the call: false while an earlier
-        event, an embedding outage or a failing engine holds delivery back)
-        and how many events still wait (None when that could not be read).
+        """Append an event; returns its id, whether the engine has taken this
+        event in (false while it waits: behind an earlier event, an embedding
+        outage or a failing engine) and how many events still wait, this one
+        or others (None when that could not be read).
         Once stored, the event is not lost if delivery fails: it is retried
         later, so the agent must not record it again."""
         event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
@@ -187,13 +187,13 @@ class Service:
         finally:
             self._log_skipped()
         try:
-            pending: int | None = self.runtime.pending()
+            waiting = self.runtime.waiting()
         except Exception:
             # The event is stored: answer delivered false, never an error the
             # agent would answer by recording it again.
             log.exception("event %s stored, but its delivery could not be checked", event.id)
             return event.id, False, None
-        return event.id, pending == 0, pending
+        return event.id, event.id not in waiting, len(waiting)
 
     def _log_skipped(self) -> None:
         for skipped in self.runtime.skipped[self._skipped_logged:]:
@@ -425,8 +425,9 @@ def record_episode(
     memories this builds on. repo/rev: where the evidence is (repo, commit);
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, delivered and
-    pending: delivered false (pending > 0 events wait) means it is stored and
-    will reach memory later, so do not record it again. pending is an integer,
+    pending: delivered false means it is stored and will reach memory later
+    (it is among the pending events that wait), so do not record it again.
+    pending counts every event that waits, from any session, as an integer,
     or null when it could not be read (delivered is then false; the record is
     still stored)."""
     return get_service().record(text, scope, conditions, refs or (), repo, rev)

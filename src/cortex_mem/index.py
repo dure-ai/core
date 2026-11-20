@@ -16,6 +16,8 @@ by the VectorBackend (contract §5); this module embeds, caches, picks the
 group and keeps the position.
 """
 
+import logging
+import math
 from collections.abc import Callable, Collection, Iterable
 from contextlib import AbstractContextManager, nullcontext
 
@@ -31,8 +33,10 @@ from .contract import (
     Scope,
     SimilarityReader,
 )
-from .embed import Embedder, EmbeddingError, EmbedKind, text_digest
+from .embed import Embedder, EmbeddingError, EmbeddingRejected, EmbedKind, text_digest
 from .store.base import CursorConflict, EventStore, VectorBackend
+
+log = logging.getLogger(__name__)
 
 _QUERY_CACHE_SIZE = 256
 EMBED_BATCH = 64  # texts per embed call when filling the cache
@@ -78,6 +82,9 @@ class Index:
         self._transaction = transaction
         # Query vectors live only in this process, never in the backend.
         self._queries: dict[str, list[float]] = {}
+        # Digests of passages the embedder refused (EmbeddingRejected): they get no
+        # vector and are not asked about again by this process.
+        self._rejected: set[str] = set()
 
     def want(self) -> dict:
         """The index version this Index builds. It names the store, because
@@ -145,7 +152,10 @@ class Index:
         there, with the cache it filled. If a batch of several texts fails,
         they are embedded one at a time: the events before the first text
         that cannot be embedded are indexed, and then its EmbeddingError is
-        raised (unless another process indexed that event meanwhile).
+        raised (unless another process indexed that event meanwhile). A text
+        the embedder refuses (EmbeddingRejected) is not an outage: its events
+        are indexed like events that are not embedded, with no vector and no
+        group, and the pass goes on.
 
         Raises IndexConfigChanged, writing nothing more, when the stored index
         holds another config than this Index's, at the start or after a
@@ -155,19 +165,21 @@ class Index:
         failure: tuple[int, EmbeddingError] | None = None  # (seq of that event, its error)
         unexplained = 0
         while limit > position:
-            texts = [event.text for seq, event in self._pending(events, position, limit) if _embedded(event)]
+            texts = [event.text for seq, event in self._pending(events, position, limit) if self._embeds(event)]
             batch = self._cache_batches(texts)
             if batch is not None:
                 chunk, exc = batch
                 # Find the text that fails, unless the batch held only that one.
                 found = (chunk[0], exc) if len(chunk) == 1 else self._first_failure(chunk)
-                if found is not None:
+                if found is not None and isinstance(found[1], EmbeddingRejected):
+                    self._reject(found[0], found[1])  # its events get no vector; go on
+                elif found is not None:
                     seq = next(
                         seq for seq, event in self._pending(events, position, limit)
-                        if _embedded(event) and event.text == found[0]
+                        if self._embeds(event) and event.text == found[0]
                     )
                     failure, limit = (seq, found[1]), seq - 1
-                continue  # every text succeeded on its own: go on with them all
+                continue  # every text succeeded on its own, or one was refused: try the rest
             try:
                 for seq, event in self._pending(events, position, limit):
                     self._index_event(seq, event, generation)
@@ -216,13 +228,21 @@ class Index:
             items = knowledge.get(list(dict.fromkeys(touched)))
             gone = set(touched) - {item.id for item in items}
         changed = [item for item in items if stored.get(item.id) != text_digest(_passage(item))]
+        # A refused passage gets no vector; one stored for an earlier passage goes.
+        changed = [i for i in changed if text_digest(_passage(i)) not in self._rejected or i.id in stored]
         if not changed and not gone:
             return
         vectors = self._knowledge_vectors(changed)
+        refused = {item.id for item in changed if item.id not in vectors}
         with self._transaction():
             if self._backend.generation() != generation or self.stale():
                 return  # rebuilt meanwhile, maybe for another model: not ours to write into
             still_gone = gone - {item.id for item in knowledge.get(list(gone))} if gone else set()
+            if refused:  # only while the item still has the passage that was refused
+                still_gone |= {
+                    item.id for item in knowledge.get(sorted(refused))
+                    if text_digest(_passage(item)) in self._rejected
+                }
             if still_gone:
                 self._backend.delete_vectors("knowledge", sorted(still_gone))
             self._put_knowledge(knowledge, vectors)
@@ -263,7 +283,7 @@ class Index:
         moves the position from seq - 1 to seq and writes both. Raises
         CursorConflict, writing nothing, when another process moved the
         position or rebuilt the index."""
-        if not _embedded(event):
+        if not self._embeds(event):
             with self._transaction():
                 self._backend.set_indexed(seq - 1, seq, generation)
             return
@@ -312,11 +332,38 @@ class Index:
         return None
 
     def _knowledge_vectors(self, items: list[Knowledge]) -> dict[str, tuple[str, list[float]]]:
-        """id -> (passage digest, vector), embedding what the cache lacks."""
-        self._cache_passages(_passage(item) for item in items)
+        """id -> (passage digest, vector), embedding what the cache lacks.
+        Items whose passage the embedder refuses are left out; an outage raises."""
+        self._cache_or_reject([_passage(item) for item in items])
         return {
-            item.id: (text_digest(_passage(item)), self._passage_vector(_passage(item))) for item in items
+            item.id: (text_digest(_passage(item)), self._passage_vector(_passage(item)))
+            for item in items
+            if text_digest(_passage(item)) not in self._rejected
         }
+
+    def _cache_or_reject(self, texts: list[str]) -> None:
+        """Cache every text the embedder accepts and remember the ones it
+        refuses (EmbeddingRejected); raise any other EmbeddingError."""
+        while True:
+            failed = self._cache_batches(t for t in texts if text_digest(t) not in self._rejected)
+            if failed is None:
+                return
+            chunk, exc = failed
+            found = (chunk[0], exc) if len(chunk) == 1 else self._first_failure(chunk)
+            if found is None:
+                continue  # every text succeeded on its own
+            if not isinstance(found[1], EmbeddingRejected):
+                raise found[1]
+            self._reject(*found)
+
+    def _reject(self, text: str, error: EmbeddingError) -> None:
+        """Remember a refused passage, by digest, and log it without its text."""
+        self._rejected.add(text_digest(text))
+        log.warning("the embedder refused a passage (%d characters), which gets no vector: %s", len(text), error)
+
+    def _embeds(self, event: Event) -> bool:
+        """Whether the event gets a vector: an embedded record whose text was not refused."""
+        return _embedded(event) and text_digest(event.text) not in self._rejected
 
     def _put_knowledge(self, knowledge: KnowledgeReader, vectors: dict[str, tuple[str, list[float]]]) -> None:
         """Inside a write transaction: store each vector whose item still has
@@ -344,7 +391,11 @@ class Index:
         out = self._embedder.embed(texts, kind)
         if len(out) != len(texts):
             raise EmbeddingError(f"embedder returned {len(out)} vectors for {len(texts)} texts")
-        return [[float(x) for x in vector] for vector in out]
+        vectors = [[float(x) for x in vector] for vector in out]
+        if not all(math.isfinite(x) for vector in vectors for x in vector):
+            # As an EmbeddingError, so it is retried like any other embedding failure.
+            raise EmbeddingError("the embedder returned a vector with values that are not finite")
+        return vectors
 
     def _embed_one(self, text: str, kind: EmbedKind) -> list[float]:
         """The embedder's vector for one text."""
@@ -362,11 +413,16 @@ class Index:
                 return group_id
         return event_id
 
-    def _query_vector(self, query: str) -> list[float]:
-        """Embed a query once per process; an LRU of _QUERY_CACHE_SIZE entries."""
+    def _query_vector(self, query: str) -> list[float] | None:
+        """Embed a query once per process; an LRU of _QUERY_CACHE_SIZE entries.
+        None when the embedder refuses the query (EmbeddingRejected): it then
+        finds nothing, like a query with no similar text."""
         found = self._queries.pop(query, None)
         if found is None:
-            found = self._embed_one(query, "query")
+            try:
+                found = self._embed_one(query, "query")
+            except EmbeddingRejected:
+                return None
         self._queries[query] = found  # most recently used goes last
         while len(self._queries) > _QUERY_CACHE_SIZE:
             del self._queries[next(iter(self._queries))]
@@ -407,10 +463,12 @@ class _Reader:
         kinds: Collection[Kind] | None = None,
     ) -> list[tuple[Event, float]]:
         """SimilarityReader.search over the events at positions <= upto; a blank
-        query gives []."""
+        query, or one the embedder refuses, gives []."""
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
+        if target is None:
+            return []
         hits = self._index._backend.search_events(target, caller, scope, k, kinds, self._upto)
         return self._with_events(hits)
 
@@ -439,10 +497,13 @@ class _Reader:
         self, query: str, caller: Caller, scope: Scope, k: int = 20
     ) -> list[tuple[Knowledge, float]]:
         """SimilarityReader.knowledge over the knowledge base as it stands now
-        (upto does not bound it); a blank query gives []."""
+        (upto does not bound it); a blank query, or one the embedder refuses,
+        gives []."""
         if query.strip() == "":
             return []
         target = self._index._query_vector(query)
+        if target is None:
+            return []
         hits = self._index._backend.search_knowledge(target, caller, scope, k)
         items = {item.id: item for item in self._knowledge.get([id for id, _ in hits])}
         return [(items[id], score) for id, score in hits if id in items]

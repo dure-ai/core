@@ -359,13 +359,32 @@ def test_delivered_responses_say_how_many_events_wait():
     assert out["delivered"] is True and out["pending"] == 0
 
 
+def test_delivered_is_about_this_event_not_the_backlog():
+    from cortex_mem.contract import Event
+
+    db = SqliteDatabase()
+    m = service(db)
+    real = m.runtime.append
+
+    def append_then_another_session(event):
+        out = real(event)  # delivered
+        db.events.append(Event(id="other", kind="record", at=T0, user="u2", team="t1", session="s2",
+                               scope="personal", text="another session's record"))
+        return out
+
+    m.runtime.append = append_then_another_session
+    out = m.record("deploy uses release tags")
+
+    assert out["delivered"] is True and out["pending"] == 1  # the other event waits, not ours
+
+
 def test_a_failing_pending_count_still_reports_the_event_as_stored(caplog):
     m = service(SqliteDatabase())
 
     def down():
         raise OSError("store is down")
 
-    m.runtime.pending = down
+    m.runtime.waiting = down
     out = m.record("deploy uses release tags")
 
     assert out["delivered"] is False and out["pending"] is None

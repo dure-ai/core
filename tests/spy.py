@@ -9,7 +9,7 @@ PostgreSQL count their own nesting depth).
 
 from contextlib import contextmanager
 
-from cortex_mem.embed import EmbeddingError, HashEmbedder
+from cortex_mem.embed import EmbeddingError, EmbeddingRejected, HashEmbedder
 
 
 class TxnSpy:
@@ -39,15 +39,18 @@ class TxnSpy:
 class SpyEmbedder:
     """HashEmbedder that records every embed call with whether a write
     transaction was open at that moment. `fail_on` texts raise EmbeddingError;
-    `during` (if set) is called with the texts before they are embedded, so a
-    test can change the store between an embedding and its write."""
+    a `reject_on` text alone raises EmbeddingRejected (in a batch, EmbeddingError,
+    as the Upstage embedder does); `during` (if set) is called with the texts
+    before they are embedded, so a test can change the store between an
+    embedding and its write."""
 
-    def __init__(self, spy, inner=None, fail_on=(), during=None):
+    def __init__(self, spy, inner=None, fail_on=(), during=None, reject_on=()):
         self.spy = spy
         self.inner = inner or HashEmbedder()
         self.model = self.inner.model
         self.dim = self.inner.dim
         self.fail_on = set(fail_on)
+        self.reject_on = set(reject_on)
         self.during = during
         self.calls = []  # (texts, kind, transaction open)
 
@@ -57,6 +60,10 @@ class SpyEmbedder:
             self.during(list(texts), kind)
         if any(t in self.fail_on for t in texts):
             raise EmbeddingError("embedding backend is down")
+        if any(t in self.reject_on for t in texts):
+            if len(texts) == 1:
+                raise EmbeddingRejected("the embedding API refused this text")
+            raise EmbeddingError("the embedding API refused the request")
         return self.inner.embed(texts, kind)
 
     @property

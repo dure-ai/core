@@ -20,7 +20,14 @@ EmbedKind = Literal["passage", "query"]
 
 
 class EmbeddingError(Exception):
-    """Raised when an embedding backend fails."""
+    """Raised when an embedding backend fails. The text may well embed later:
+    the index retries it and holds back what depends on it."""
+
+
+class EmbeddingRejected(EmbeddingError):
+    """The backend works but refuses this one text (too long, for example),
+    so retrying cannot help: the index leaves that text without a vector.
+    Raised only for a single text, never for a batch."""
 
 
 class Embedder(Protocol):
@@ -120,6 +127,11 @@ class HashEmbedder:
 class UpstageEmbedder:
     """Embedder backed by the Upstage embeddings HTTP API."""
 
+    # Statuses that may mean "this input", not "this service" or "this key".
+    REJECTING = frozenset({400, 413, 422})
+    # Embedded to tell a refused text from a model or request the API refuses outright.
+    PROBE = "ping"
+
     def __init__(
         self,
         api_key: str,
@@ -148,6 +160,7 @@ class UpstageEmbedder:
         self.timeout = timeout
         self.batch = max(1, batch)
         self._dim: int | None = None
+        self._working: set[str] = set()  # models that have answered in this process
 
     @property
     def dim(self) -> int:
@@ -161,12 +174,33 @@ class UpstageEmbedder:
         return f"UpstageEmbedder(passage_model={self.passage_model!r}, query_model={self.query_model!r})"
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
-        """Embed texts in batches with the model matching kind."""
+        """Embed texts in batches with the model matching kind.
+
+        A single text answered with a status in REJECTING raises
+        EmbeddingRejected once the model is known to work: it has answered
+        before in this process, or it answers the PROBE text now. Otherwise,
+        and for a batch of several texts, the error is an EmbeddingError."""
         model = self.passage_model if kind == "passage" else self.query_model
         out: list[list[float]] = []
         for i in range(0, len(texts), self.batch):
-            out.extend(self._post(model, list(texts[i : i + self.batch])))
+            chunk = list(texts[i : i + self.batch])
+            try:
+                out.extend(self._post(model, chunk))
+            except _Refused as exc:
+                if len(chunk) == 1 and self._works(model):
+                    raise EmbeddingRejected(f"the embedding API refused this text with HTTP {exc.code}") from None
+                raise EmbeddingError(f"embedding request failed with HTTP {exc.code}") from None
         return out
+
+    def _works(self, model: str) -> bool:
+        """Whether `model` has embedded something in this process, or embeds PROBE now."""
+        if model in self._working:
+            return True
+        try:
+            self._post(model, [self.PROBE])
+        except EmbeddingError:
+            return False
+        return True
 
     def _post(self, model: str, chunk: list[str]) -> list[list[float]]:
         """One POST /embeddings for the chunk; its vectors in input order, by the
@@ -190,6 +224,8 @@ class UpstageEmbedder:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             exc.close()
+            if exc.code in self.REJECTING:
+                raise _Refused(exc.code) from None
             raise EmbeddingError(f"embedding request failed with HTTP {exc.code}") from None
         except TimeoutError:
             raise EmbeddingError(f"embedding request timed out after {self.timeout}s") from None
@@ -225,4 +261,14 @@ class UpstageEmbedder:
             raise EmbeddingError("embedding response has empty or inconsistent vector lengths")
         if self._dim is None and vectors:
             self._dim = width
+        self._working.add(model)
         return vectors
+
+
+class _Refused(EmbeddingError):
+    """Inside UpstageEmbedder: an HTTP status in REJECTING, before embed decides
+    whether the text or the request is at fault."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"embedding request failed with HTTP {code}")
+        self.code = code
