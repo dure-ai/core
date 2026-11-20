@@ -363,6 +363,10 @@ class SqliteStateBackend:
         rows = self.db.query("SELECT version FROM engine_cursor WHERE engine = ?", (self.engine,))
         return rows[0][0] if rows else None
 
+    def position(self) -> tuple[int, int, str | None]:
+        rows = self.db.query("SELECT epoch, cursor, version FROM engine_cursor WHERE engine = ?", (self.engine,))
+        return (rows[0][0], rows[0][1], rows[0][2]) if rows else (0, 0, None)
+
     def reset(self, version: str) -> None:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM engine_state WHERE engine = ?", (self.engine,))
@@ -424,6 +428,15 @@ class SqliteVectorBackend:
     def indexed(self) -> int:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
         return int(rows[0][0]) if rows else 0
+
+    def position(self) -> tuple[dict | None, int, int]:
+        found = dict(self.db.query("SELECT key, value FROM vector_meta WHERE key IN ('meta', 'generation', 'indexed')"))
+        meta = found.get("meta")
+        return (
+            json.loads(meta) if meta is not None else None,
+            int(found.get("generation", 0)),
+            int(found.get("indexed", 0)),
+        )
 
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():

@@ -258,6 +258,12 @@ class EngineStateBackendContract(_Contract):
         state.commit(1, 1, {}, set(), epoch=1)  # a tick: the cursor stays, the epoch moves
         assert state.epoch() == 2
 
+    def test_position_reads_epoch_cursor_and_version_together(self, state):
+        assert state.position() == (0, 0, None)
+        state.reset("1")
+        state.commit(0, 4, {"a": 1}, set(), epoch=1)
+        assert state.position() == (state.epoch(), state.cursor(), state.version()) == (2, 4, "1")
+
     def test_reset_bumps_the_epoch(self, state):
         state.reset("1")  # no row yet: created at epoch 1
         assert state.epoch() == 1
@@ -625,6 +631,13 @@ class VectorBackendContract(_Contract):
         assert vb.meta() == meta  # the generation is not part of meta
         vb.reset({"model": "m2", "group_threshold": 0.9})
         assert vb.generation() == 2
+
+    def test_position_reads_meta_generation_and_indexed_together(self, vb):
+        assert vb.position() == (None, 0, 0)
+        meta = {"model": "m1", "group_threshold": 0.8}
+        vb.reset(meta)
+        vb.set_indexed(0, 5, vb.generation())
+        assert vb.position() == (vb.meta(), vb.generation(), vb.indexed()) == (meta, 1, 5)
 
     def test_set_indexed_checks_position_and_generation(self, vb):
         vb.reset({"model": "m1", "group_threshold": 0.8})

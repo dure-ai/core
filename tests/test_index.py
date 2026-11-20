@@ -802,6 +802,10 @@ def test_advance_raises_a_conflict_it_cannot_explain(opened):
         def indexed(self):
             return 0
 
+        def position(self):
+            meta, generation, _ = self._inner.position()
+            return meta, generation, 0
+
     spy = TxnSpy(db)
     backend = Stuck(db.vectors, spy)
     with pytest.raises(CursorConflict):

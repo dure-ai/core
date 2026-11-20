@@ -174,6 +174,9 @@ class InMemoryStateBackend:
     def version(self) -> str | None:
         return self._version
 
+    def position(self) -> tuple[int, int, str | None]:
+        return self._epoch, self._cursor, self._version
+
     def reset(self, version: str) -> None:
         self._data.clear()
         self._cursor = 0
@@ -223,6 +226,9 @@ class InMemoryVectorBackend:
 
     def indexed(self) -> int:
         return self._indexed
+
+    def position(self) -> tuple[dict | None, int, int]:
+        return self.meta(), self._generation, self._indexed
 
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         if self._indexed != expected or self._generation != generation:

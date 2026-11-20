@@ -86,6 +86,12 @@ class EngineStateBackend(Protocol):
         """The engine state_version the state was written with (None = never set)."""
         ...
 
+    def position(self) -> tuple[int, int, str | None]:
+        """(epoch(), cursor(), version()) read together, in one step on a
+        durable store: what a delivery reads before it starts and checks
+        before it commits, at the cost of one round trip."""
+        ...
+
     def reset(self, version: str) -> None:
         """Drop every key, move the cursor back to 0, record `version` and
         add 1 to the epoch."""
@@ -128,6 +134,11 @@ class VectorBackend(Protocol):
 
     def indexed(self) -> int:
         """Position of the last event indexed (0 = none)."""
+        ...
+
+    def position(self) -> tuple[dict | None, int, int]:
+        """(meta(), generation(), indexed()) read together, in one step on a
+        durable store, so the three come from one moment."""
         ...
 
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:

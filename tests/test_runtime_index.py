@@ -1368,3 +1368,64 @@ def test_a_tick_over_an_index_rebuilt_twice_is_dropped(store, tmp_path, request)
 
     assert rt.state.get("ticked") is None and db.knowledge.get(["t1"]) == []
     assert rt.state.epoch() == epoch
+
+
+# ── round trips to PostgreSQL ───────────────────────────────────────────────
+
+
+class _CountingConnection:
+    """Wraps a psycopg connection and counts the statements sent through it."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.statements = []
+
+    def execute(self, query, params=None, **kw):
+        self.statements.append(" ".join(str(query).split())[:80])
+        return self._inner.execute(query, params, **kw)
+
+    def cursor(self, *args, **kw):
+        outer = self
+        inner = self._inner.cursor(*args, **kw)
+
+        class _Cursor:
+            def __enter__(self):
+                inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return inner.__exit__(*exc)
+
+            def executemany(self, query, rows, **kw):
+                outer.statements.append(" ".join(str(query).split())[:80])
+                return inner.executemany(query, rows, **kw)
+
+            def __getattr__(self, name):
+                return getattr(inner, name)
+
+        return _Cursor()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+# A record on PostgreSQL (append, index, deliver, commit) took 65 statements before
+# the reads were combined. Each is a round trip, which is what a remote database costs.
+ROUND_TRIPS_PER_RECORD = 49
+
+
+def test_a_record_takes_few_round_trips_to_postgresql(request):
+    from cortex_mem.store.postgres import PostgresDatabase
+
+    db = PostgresDatabase(request.getfixturevalue("pg_schema"))
+    request.addfinalizer(db.close)
+    rt = runtime(ProbeEngine(), db)
+    for i in range(5):
+        rt.append(ev(f"w{i}", f"warm up record {i}"))
+    counting = _CountingConnection(db.con)
+    db.con = counting
+
+    rt.append(ev("e1", "deploy uses release tags"))
+
+    db.con = counting._inner
+    assert len(counting.statements) <= ROUND_TRIPS_PER_RECORD, "\n".join(counting.statements)
