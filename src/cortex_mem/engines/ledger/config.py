@@ -160,6 +160,7 @@ class LedgerConfig:
 
 
 def _known_keys() -> set[str]:
+    """Every config key the engine accepts."""
     keys = {
         "similar.same_threshold",
         "same_threshold",
@@ -181,6 +182,7 @@ def _known_keys() -> set[str]:
 
 
 def _check_keys(raw: Mapping[str, str]) -> None:
+    """Raise ValueError naming the first unknown key."""
     known = _known_keys()
     for key in raw:
         if key not in known:
@@ -188,6 +190,7 @@ def _check_keys(raw: Mapping[str, str]) -> None:
 
 
 def _float(key: str, value: str) -> float:
+    """Parse a finite float, or raise ValueError naming the key."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -198,6 +201,7 @@ def _float(key: str, value: str) -> float:
 
 
 def _int(key: str, value: str) -> int:
+    """Parse an integer, or raise ValueError naming the key."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -205,6 +209,7 @@ def _int(key: str, value: str) -> int:
 
 
 def _bool(key: str, value: str) -> bool:
+    """Parse exactly "true" or "false", or raise ValueError naming the key."""
     if value == "true":
         return True
     if value == "false":
@@ -213,10 +218,12 @@ def _bool(key: str, value: str) -> bool:
 
 
 def _non_negative(key: str, value: float) -> float:
+    """Return the value, or raise ValueError if it is negative."""
     if value < 0:
         raise ValueError(f"{key} must be >= 0")
     return value
 
 
 def _days(key: str, value: float) -> timedelta:
+    """A non-negative number of days as a timedelta."""
     return timedelta(days=_non_negative(key, value))

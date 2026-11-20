@@ -21,18 +21,27 @@ DOWN = ("deprecated", "archived")
 
 
 class Match(NamedTuple):
+    """The claim a record joins: its id, how similar the record is to it
+    (neighbour score or token Jaccard; 1.0 for a signature hit), and the
+    event id of another author's record it copies, if any."""
+
     claim_id: str
     similarity: float
     copied_from: str | None  # event id of another author's record copied verbatim
 
 
 class ClaimMatcher(Protocol):
+    """Finds the existing claim a new record belongs to."""
+
     def match(
         self, event: Event, ctx: EngineContext, store: LedgerStore
-    ) -> Match | None: ...
+    ) -> Match | None:
+        """The claim the record joins, or None to open a new claim."""
+        ...
 
 
 def _author(event: Event) -> Caller:
+    """The record's author as a caller, so searches see what the author could see."""
     return Caller(user=event.user, team=event.team, session=event.session, at=event.at)
 
 
@@ -50,6 +59,9 @@ def eligible(claim: Claim | None, event: Event) -> bool:
 def _copied_from(
     event: Event, claim: Claim, ctx: EngineContext, store: LedgerStore, cfg: LedgerConfig
 ) -> str | None:
+    """Event id of the claim's record by another user that the new record
+    copies (token Jaccard >= `copy_threshold`), or None. The highest score
+    wins; equal scores go to the smallest event id."""
     ids = {claim.id.removeprefix("c-"), claim.canonical}
     ids.update(ev.event_id for ev in store.evidence(claim.id))
     others = [
@@ -67,12 +79,20 @@ def _copied_from(
 
 
 class GroupMatcher:
+    """Matches through core groups (`ctx.similar`, embeddings on)."""
+
     def __init__(self, cfg: LedgerConfig) -> None:
+        """Use `cfg.match_pool` and `cfg.similar_same_threshold`."""
         self._cfg = cfg
 
     def match(
         self, event: Event, ctx: EngineContext, store: LedgerStore
     ) -> Match | None:
+        """Among the eligible claims holding records of the record's core
+        group, the one whose records are its nearest neighbours (best score
+        among the first `match_pool` neighbours, 0 if none is among them),
+        ties by claim id, if that score reaches `similar.same_threshold`.
+        None without a port, a group or an eligible claim."""
         similar = similar_of(ctx)
         if similar is None:
             return None
@@ -107,12 +127,19 @@ class GroupMatcher:
 
 
 class LexicalMatcher:
+    """Matches by text when there is no similarity port."""
+
     def __init__(self, cfg: LedgerConfig) -> None:
+        """Use `cfg.match_pool`, `cfg.same_threshold` and `cfg.copy_threshold`."""
         self._cfg = cfg
 
     def match(
         self, event: Event, ctx: EngineContext, store: LedgerStore
     ) -> Match | None:
+        """The eligible claim the record's text fingerprint points at; else,
+        among the observed search hits, the eligible claim of the record with
+        the highest token Jaccard at or above `same_threshold` (ties by claim
+        id, then event id). None if nothing qualifies."""
         owner = owner_for(event)
         cid = store.claim_by_signature(event.scope, owner, signature(event.text))
         if cid is not None:

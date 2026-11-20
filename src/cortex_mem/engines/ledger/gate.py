@@ -20,6 +20,9 @@ _TIE = 1e-9
 
 @dataclass(frozen=True)
 class GateReport:
+    """The outcome of one gate run: each check's result, the tallied S and C,
+    the confidence, and the status decided for the claim."""
+
     checks: Mapping[str, bool]  # sources, verified, span, contradiction, high_risk
     S: float
     C: float
@@ -27,6 +30,7 @@ class GateReport:
     decision: ClaimStatus
 
     def to_json(self) -> dict[str, Any]:
+        """Plain JSON, stored as `Claim.report`."""
         return {
             "checks": {k: bool(v) for k, v in self.checks.items()},
             "S": float(self.S),

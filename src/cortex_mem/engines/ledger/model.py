@@ -21,10 +21,12 @@ Derived = Literal["retrieved", "copy"]
 
 
 def _dt(value: datetime) -> str:
+    """ISO 8601 text of a datetime."""
     return value.isoformat()
 
 
 def _parse(value: str) -> datetime:
+    """Parse a stored datetime; a value without a timezone is corrupt and raises ValueError."""
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         raise ValueError(f"stored datetime has no timezone: {value!r}")
@@ -33,6 +35,12 @@ def _parse(value: str) -> datetime:
 
 @dataclass(frozen=True)
 class Memory:
+    """A record event the engine observed, and the claim it joined.
+
+    `id` is the event id, `user`/`team`/`session` its author, `at` its time,
+    and `group` the core group the record was in when observed (None without
+    embeddings).
+    """
     id: str
     claim_id: str
     user: str
@@ -42,6 +50,7 @@ class Memory:
     group: str | None
 
     def to_json(self) -> dict[str, Any]:
+        """Plain JSON for the state store."""
         return {
             "id": self.id,
             "claim_id": self.claim_id,
@@ -54,6 +63,7 @@ class Memory:
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Self:
+        """Rebuild from `to_json` output."""
         return cls(
             id=data["id"],
             claim_id=data["claim_id"],
@@ -67,6 +77,21 @@ class Memory:
 
 @dataclass
 class Claim:
+    """One claim: the records that say the same thing, and what the gate made of them.
+
+    - `scope`, `owner`: the visibility cell the claim lives in (owner is the
+      user at personal scope, the team at team scope).
+    - `conditions`: the context the claim holds under; a record with other
+      conditions opens another claim.
+    - `canonical`: event id of the record whose text is the knowledge body.
+    - `first_at`, `last_support_at`: first and last counted support.
+    - `invalid_since`: when it was deprecated or archived; only verified
+      support after it revives the claim.
+    - `promoted`: whether the knowledge base holds it (a Promote went out
+      and no Demote since).
+    - `use_success`, `use_failure`: reports of using it after it was handed
+      over; usefulness, not votes on truth.
+    - `report`: the last gate report (`GateReport.to_json`)."""
     id: str
     scope: Scope
     owner: str
@@ -82,6 +107,7 @@ class Claim:
     report: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
+        """Plain JSON for the state store."""
         return {
             "id": self.id,
             "scope": self.scope,
@@ -102,6 +128,7 @@ class Claim:
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Self:
+        """Rebuild from `to_json` output."""
         since = data.get("invalid_since")
         return cls(
             id=data["id"],
@@ -122,6 +149,12 @@ class Claim:
 
 @dataclass(frozen=True)
 class Evidence:
+    """One piece of evidence on a claim, from one event.
+
+    `stance` is support or contradict, `channel` how it was checked, `key`
+    the independence key (events with the same key are one vote), and
+    `derived` why it does not count: "retrieved" (restates knowledge the
+    session was handed) or "copy" (copies another user's text); None counts."""
     claim_id: str
     event_id: str
     stance: Stance
@@ -132,6 +165,7 @@ class Evidence:
     derived: Derived | None
 
     def to_json(self) -> dict[str, Any]:
+        """Plain JSON for the state store."""
         return {
             "claim_id": self.claim_id,
             "event_id": self.event_id,
@@ -145,6 +179,7 @@ class Evidence:
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Self:
+        """Rebuild from `to_json` output."""
         return cls(
             claim_id=data["claim_id"],
             event_id=data["event_id"],

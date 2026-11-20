@@ -62,6 +62,7 @@ def _candidates(
 
 
 def _claims_of(found: Sequence[tuple[object, float]], store: LedgerStore) -> list[str]:
+    """Claim ids of the observed records among search hits, in hit order."""
     ids: list[str] = []
     for event, _ in found:
         memory = store.memory(event.id)  # type: ignore[attr-defined]
@@ -74,6 +75,16 @@ def handoff(
     query: str, caller: Caller, scope: Scope, ctx: EngineContext,
     store: LedgerStore, cfg: LedgerConfig, k: int,
 ) -> list[Handoff]:
+    """At most k items, one per claim, best first.
+
+    Candidates are claims fused by RRF over knowledge and record search (plus
+    the similarity port's two lists when embeddings are on). Deprecated and
+    archived claims, claims with a condition `caller.context` contradicts,
+    claims whose canonical record the caller cannot see, and claims with no
+    counted support are left out. Score = relevance x status weight (the
+    caller's own candidate uses `own_candidate_weight`) x recency; ties by
+    claim id. `status` is "knowledge" only for an established claim the
+    knowledge base holds."""
     ranked: list[tuple[float, str, Handoff]] = []
     for claim_id, relevance in _candidates(query, caller, scope, ctx, store, cfg).items():
         claim = store.claim(claim_id)
@@ -133,6 +144,8 @@ def _line_tally(
 
 
 def _recency(claim: Claim, caller: Caller, cfg: LedgerConfig) -> float:
+    """Recency weight: halves every `half_life` since the last support, never
+    below 0.5; 1.0 when `half_life_days` is 0."""
     if not cfg.half_life:
         return 1.0
     age = max(caller.at - claim.last_support_at, caller.at - caller.at)

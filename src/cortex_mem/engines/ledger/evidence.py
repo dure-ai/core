@@ -44,6 +44,19 @@ def independence_key(scope: Scope, event: Event) -> str:
 
 @dataclass(frozen=True)
 class Tally:
+    """A claim's evidence counted per independent source (derived rows excluded).
+
+    - `S`, `C`: summed strength of support and contradiction, one source
+      counting once at its strongest channel.
+    - `support_keys`, `verified_keys`, `contra_keys`: independent sources
+      that support, support through a verified channel, and contradict.
+    - `verified_contra`: whether any contradiction came through a verified
+      channel.
+    - `first_support`, `last_support`: time span of the support.
+    - `by_channel`: support sources by their strongest channel.
+    - `confidence`: (S + alpha) / (S + C + alpha + beta).
+    """
+
     S: float
     C: float
     support_keys: int

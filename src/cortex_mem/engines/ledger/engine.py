@@ -40,12 +40,28 @@ from cortex_mem.engines.ledger.text import signature
 
 
 class LedgerEngine:
+    """Evidence-ledger engine for the core engine port (`contract.Engine`).
+
+    Groups records into claims, keeps one vote per independent source,
+    promotes a claim when it passes the gate and demotes it on verified
+    contradiction or long silence. Load it on the server with
+    `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`."""
+
     state_version = "1"
 
     def __init__(self, config: Mapping[str, str] | None = None) -> None:
+        """Parse `config` (string keys and values, see README); None or an
+        empty mapping means the defaults. Raises ValueError on an unknown
+        key or an out-of-range value."""
         self._cfg = LedgerConfig.from_mapping(config)
 
     def observe(self, event: Event, ctx: EngineContext) -> Sequence[Decision]:
+        """Apply one event and return the decisions it causes.
+
+        A record joins or opens a claim and supports it; an outcome or
+        human_confirm judges the claims its refs name; a recall marks the
+        claims the session was handed. Only the claims the event touches are
+        re-evaluated. Other kinds are ignored."""
         store = LedgerStore(ctx.state)
         if event.kind == "record":
             return self._record(event, ctx, store)
@@ -93,6 +109,9 @@ class LedgerEngine:
     def handoff(
         self, query: str, caller: Caller, scope: Scope, ctx: EngineContext, k: int = 6
     ) -> list[Handoff]:
+        """At most k items for the query, one per claim, best first, each
+        with its canonical text, a provenance line and all its counted
+        support as sources. Reads only (see `retrieve.handoff`)."""
         store = LedgerStore(ctx.state)
         return retrieve.handoff(query, caller, scope, ctx, store, self._cfg, k)
 
@@ -225,6 +244,15 @@ class LedgerEngine:
     def _judge_claim(
         self, claim: Claim, event: Event, ctx: EngineContext, store: LedgerStore
     ) -> list[Decision]:
+        """Apply one judgment event to one claim.
+
+        An agent's own success report counts as use (`use_success`), not as
+        evidence, and only if the session was handed the claim at or before
+        it. Every other judgment becomes a support or contradiction row (an
+        own failure report also counts `use_failure`). A live claim is then
+        re-evaluated; a deprecated or archived one only collects the row,
+        unless the row is verified support dated after `invalid_since`,
+        which revives it for re-evaluation."""
         success = event.outcome == "success"
         own_report = event.kind == "outcome" and event.signal in (None, "self")
         if own_report and success:
