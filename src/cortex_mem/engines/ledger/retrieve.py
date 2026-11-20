@@ -101,8 +101,8 @@ def handoff(
         support: list[Evidence] = [e for e in evidence if e.stance == "support" and e.derived is None]
         if not support:
             continue
-        line = provenance_line(claim, _line_tally(claim, evidence, support, cfg))
         full = tally(evidence, cfg)
+        line = provenance_line(claim, full)
         own = claim.status == "candidate" and canonical.user == caller.user
         weight = cfg.status_weights[claim.status]
         if own:
@@ -127,21 +127,6 @@ def handoff(
         )
     ranked.sort(key=lambda r: (-r[0], r[1]))
     return [h for _, _, h in ranked[:k]]
-
-
-def _line_tally(
-    claim: Claim, evidence: Sequence[Evidence], support: list[Evidence], cfg: LedgerConfig
-) -> Tally:
-    """Support counted from the sources only; contradictions from all evidence."""
-    counted = tally(support, cfg)
-    contra = tally(evidence, cfg)
-    return Tally(
-        S=counted.S, C=contra.C, support_keys=counted.support_keys,
-        verified_keys=counted.verified_keys, contra_keys=contra.contra_keys,
-        verified_contra=contra.verified_contra, first_support=counted.first_support,
-        last_support=counted.last_support, by_channel=counted.by_channel,
-        confidence=contra.confidence,
-    )
 
 
 def _recency(claim: Claim, caller: Caller, cfg: LedgerConfig) -> float:
