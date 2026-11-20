@@ -274,6 +274,10 @@ class RecordingBackend:
     def indexed(self):
         return 0 if self._ignore_cursor else self._inner.indexed()
 
+    def position(self):
+        meta, generation, _ = self._inner.position()
+        return meta, generation, self.indexed()
+
     def set_indexed(self, expected, seq, generation):
         """Logged as ("set_indexed", expected, seq, accepted), refused attempts too."""
         if self._ignore_cursor:
@@ -394,6 +398,10 @@ def test_the_write_log_catches_an_indexer_that_ignores_the_shared_cursor(kind, w
     class ReadsZero(RecordingBackend):
         def indexed(self):
             return 0
+
+        def position(self):
+            meta, generation, _ = self._inner.position()
+            return meta, generation, 0
 
     checked = Index(ReadsZero(db.vectors, log), CountingEmbedder(), 0.9, transaction=db.transaction)
     with pytest.raises(CursorConflict):

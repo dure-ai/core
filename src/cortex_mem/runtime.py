@@ -253,9 +253,9 @@ class Runtime:
         outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
         retries: dict[int, int] = {}  # seq -> restarts after the index or the engine's version moved
         while True:
-            # No transaction: the commit checks the epoch and cursor read here.
-            epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
-            cursor = self.state.cursor()
+            # No transaction: the commit checks the epoch and cursor read here,
+            # both in one read, before the state the engine reads.
+            epoch, cursor, _ = self.state.position()
             pending = next(iter(self.events.since(cursor)), None)
             if pending is None:
                 return delivered
@@ -367,12 +367,15 @@ class Runtime:
         since the version was checked (check the versions again first). The
         epoch and cursor are checked again by state.commit; this read spares
         the decision checks of a result that is going to be dropped."""
-        if self.state.epoch() != epoch or self.state.cursor() != cursor:
+        now_epoch, now_cursor, version = self.state.position()
+        if now_epoch != epoch or now_cursor != cursor:
             return "read"
-        if self.index is not None and (self.index.generation() != generation or self.index.indexed() < seq):
-            return "read"
+        if self.index is not None:
+            now_generation, indexed = self.index.position()
+            if now_generation != generation or indexed < seq:
+                return "read"
         want = self._want(generation)
-        if want is not None and self.state.version() != want:
+        if want is not None and version != want:
             return "version"
         return None
 
@@ -484,8 +487,7 @@ class Runtime:
         commits nothing: it takes no write lock and leaves the epoch alone,
         so it never refuses another process's observe."""
         self.sync()
-        epoch = self.state.epoch()  # first: before the cursor and the state the engine reads
-        cursor = self.state.cursor()
+        epoch, cursor, _ = self.state.position()  # one read, before the state the engine reads
         generation = None if self.index is None else self.index.generation()
         staged = self._staged()
         decisions = list(self.engine.tick(now, self._ctx(staged, cursor)))

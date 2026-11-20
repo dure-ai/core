@@ -214,6 +214,14 @@ class PostgresDatabase:
                 else "the connection string could not be parsed"
             )
             raise ConnectionError(f"cannot connect to PostgreSQL ({self._where}): {reason}") from None
+        try:
+            # Once per connection rather than SET LOCAL in every transaction: it only
+            # bounds lock waits, and this connection takes no lock but the advisory one
+            # (and DDL in _create). set_config binds the value.
+            self.con.execute("SELECT set_config('lock_timeout', %s, false)", (lock_timeout,))
+        except psycopg.errors.InvalidParameterValue:  # matches the pattern but PostgreSQL refuses it
+            self.con.close()
+            raise _bad_lock_timeout(lock_timeout) from None
         # MCP servers may call tools from worker threads; one lock serializes them.
         self._lock = threading.RLock()
         self._depth = 0
@@ -317,18 +325,13 @@ class PostgresDatabase:
                     raise
 
     def _begin(self) -> None:
-        """BEGIN, set this transaction's lock_timeout, and take the database-wide
-        advisory lock. TimeoutError when the lock stays taken past the timeout;
-        on any failure the transaction is rolled back."""
-        from psycopg.errors import InvalidParameterValue, LockNotAvailable
+        """BEGIN and take the database-wide advisory lock, waiting at most the
+        connection's lock_timeout. TimeoutError when the lock stays taken past
+        the timeout; on any failure the transaction is rolled back."""
+        from psycopg.errors import LockNotAvailable
 
         self.con.execute("BEGIN")
         try:
-            # set_config(..., true) is SET LOCAL with a bound value.
-            try:
-                self.con.execute("SELECT set_config('lock_timeout', %s, true)", (self.lock_timeout,))
-            except InvalidParameterValue:  # matches the pattern but PostgreSQL refuses it
-                raise _bad_lock_timeout(self.lock_timeout) from None
             self.con.execute("SELECT pg_advisory_xact_lock(%s)", (TRANSACTION_LOCK,))
         except LockNotAvailable:
             self._rollback()
@@ -680,6 +683,10 @@ class PgStateBackend:
         rows = self.db.query("SELECT version FROM engine_cursor WHERE engine = %s", (self.engine,))
         return rows[0][0] if rows else None
 
+    def position(self) -> tuple[int, int, str | None]:
+        rows = self.db.query("SELECT epoch, cursor, version FROM engine_cursor WHERE engine = %s", (self.engine,))
+        return (rows[0][0], rows[0][1], rows[0][2]) if rows else (0, 0, None)
+
     def reset(self, version: str) -> None:
         with self.db.transaction():
             con = self.db.con
@@ -816,9 +823,18 @@ class PgVectorBackend:
         value = self._get_meta("indexed")
         return int(value) if value is not None else 0
 
+    def position(self) -> tuple[dict | None, int, int]:
+        found = dict(self.db.query("SELECT key, value FROM vector_meta WHERE key IN ('meta', 'generation', 'indexed')"))
+        meta = found.get("meta")
+        return (
+            json.loads(meta) if meta is not None else None,
+            int(found.get("generation", 0)),
+            int(found.get("indexed", 0)),
+        )
+
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:
         with self.db.transaction():
-            current, now = self.indexed(), self.generation()
+            _, now, current = self.position()
             if current != expected or now != generation:
                 raise CursorConflict(
                     f"index at {current} (generation {now}), not {expected} (generation {generation})"
@@ -915,9 +931,10 @@ class PgVectorBackend:
         values = float32(vector)
         self._check_halfvec(values)  # before any write, so the transaction stays usable
         with self.db.transaction():
-            dim = self._dim()
+            recorded = self._get_meta("dim")
+            dim = int(recorded) if recorded is not None else self._dim()
             self._check_dim(values, dim)  # likewise
-            if self._get_meta("dim") is None:
+            if recorded is None:
                 self._set_meta("dim", str(len(values)))
             if self.db.vector_index == "hnsw":
                 generation = self.generation()

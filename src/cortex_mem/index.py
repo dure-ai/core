@@ -33,7 +33,14 @@ from .contract import (
     Scope,
     SimilarityReader,
 )
-from .embed import Embedder, EmbeddingError, EmbeddingRejected, EmbedKind, text_digest
+from .embed import (
+    Embedder,
+    EmbeddingError,
+    EmbeddingRejected,
+    EmbedKind,
+    float32,
+    text_digest,
+)
 from .store.base import CursorConflict, EventStore, VectorBackend
 
 log = logging.getLogger(__name__)
@@ -85,6 +92,9 @@ class Index:
         # Digests of passages the embedder refused (EmbeddingRejected): they get no
         # vector and are not asked about again by this process.
         self._rejected: set[str] = set()
+        # Vectors this process just embedded and cached, by digest: the write that
+        # follows takes them from here instead of reading the cache back.
+        self._fresh: dict[str, list[float]] = {}
 
     def want(self) -> dict:
         """The index version this Index builds. It names the store, because
@@ -118,6 +128,11 @@ class Index:
     def indexed(self) -> int:
         """Position of the last event indexed (0 = none)."""
         return self._backend.indexed()
+
+    def position(self) -> tuple[int, int]:
+        """(generation(), indexed()) in one read."""
+        _, generation, indexed = self._backend.position()
+        return generation, indexed
 
     def ensure_current(self, knowledge: KnowledgeReader) -> bool:
         """Rebuild the index when it is stale: drop vectors, groups and the
@@ -160,6 +175,7 @@ class Index:
         Raises IndexConfigChanged, writing nothing more, when the stored index
         holds another config than this Index's, at the start or after a
         conflict: the caller runs ensure_current and tries again."""
+        self._fresh.clear()  # leftovers of an earlier pass may have been rebuilt away
         generation, position = self._read_position()
         limit = upto  # lowered to just before an event whose text cannot be embedded
         failure: tuple[int, EmbeddingError] | None = None  # (seq of that event, its error)
@@ -264,10 +280,10 @@ class Index:
         checked against it conflicts. Raises IndexConfigChanged if the index
         holds another config than this Index's (a rebuild by another process
         with another model or threshold): its generation is not ours to write."""
-        generation = self._backend.generation()
-        if self.stale():
-            raise IndexConfigChanged(f"the index was built for {self._backend.meta()}, not {self.want()}")
-        return generation, self._backend.indexed()
+        meta, generation, position = self._backend.position()  # one read: one moment
+        if meta != self.want():
+            raise IndexConfigChanged(f"the index was built for {meta}, not {self.want()}")
+        return generation, position
 
     def _pending(self, events: EventStore, after: int, upto: int) -> Iterable[tuple[int, Event]]:
         """(seq, event) after `after` up to and including `upto`, in append order."""
@@ -319,6 +335,8 @@ class Index:
             with self._transaction():
                 for text, vector in zip(chunk, vectors, strict=True):
                     self._backend.cache(model, text_digest(text), vector)
+            for text, vector in zip(chunk, vectors, strict=True):
+                self._fresh[text_digest(text)] = float32(vector)  # as the cache keeps it
         return None
 
     def _first_failure(self, texts: list[str]) -> tuple[str, EmbeddingError] | None:
@@ -378,6 +396,9 @@ class Index:
         """From the cache, else embedded and cached. Never call it inside a
         write transaction: on a miss it embeds."""
         model, digest = self._embedder.model, text_digest(text)
+        found = self._fresh.pop(digest, None)
+        if found is not None:
+            return found
         found = self._backend.cached(model, digest)
         if found is not None:
             return found
