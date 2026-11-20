@@ -406,23 +406,27 @@ BM25_B = 0.75
 # final filter and does not change them. Placeholders are psycopg's.
 _EVENT_COLS = ", ".join("e." + c for c in _EVENT_COLUMNS.split(", "))
 _SEARCH_SQL = f"""
-WITH vis AS (
+WITH vis AS MATERIALIZED (
     SELECT e.seq FROM events e WHERE {pg_params(EVENT_VISIBLE_SQL)}
+), hits AS MATERIALIZED (
+    -- Only the query terms' postings, found from the term index; every CTE is computed
+    -- once, so the cost is one pass over the visible events plus the postings.
+    SELECT t.seq, t.term, t.tf
+    FROM event_terms t JOIN vis ON vis.seq = t.seq
+    WHERE t.term = ANY(%(terms)s)
 ), df AS (
-    SELECT t.term, count(*)::float8 AS df
-    FROM event_terms t JOIN vis ON vis.seq = t.seq WHERE t.term = ANY(%(terms)s) GROUP BY t.term
-), corpus AS (
+    SELECT term, count(*)::float8 AS df FROM hits GROUP BY term
+), corpus AS MATERIALIZED (
     SELECT count(*)::float8 AS n, avg(s.len)::float8 AS avgdl
     FROM vis JOIN event_stats s ON s.seq = vis.seq
 )
 SELECT {_EVENT_COLS},
        sum(ln((corpus.n - df.df + 0.5) / (df.df + 0.5) + 1)
-           * t.tf * ({BM25_K1} + 1) / (t.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * s.len / corpus.avgdl))) AS score
-FROM event_terms t
-JOIN df ON df.term = t.term
-JOIN vis ON vis.seq = t.seq
-JOIN events e ON e.seq = t.seq
-JOIN event_stats s ON s.seq = t.seq
+           * h.tf * ({BM25_K1} + 1) / (h.tf + {BM25_K1} * (1 - {BM25_B} + {BM25_B} * s.len / corpus.avgdl))) AS score
+FROM hits h
+JOIN df ON df.term = h.term
+JOIN events e ON e.seq = h.seq
+JOIN event_stats s ON s.seq = h.seq
 CROSS JOIN corpus
 """
 
@@ -585,6 +589,11 @@ class PgKnowledgeStore:
         with self.db.transaction():
             for table in ("knowledge", "knowledge_terms", "knowledge_stats"):
                 self.db.con.execute(f"DELETE FROM {table} WHERE id = %s", (id,))
+
+    def clear(self) -> None:
+        with self.db.transaction():
+            for table in ("knowledge", "knowledge_terms", "knowledge_stats"):
+                self.db.con.execute(f"DELETE FROM {table}")
 
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         ids = list(ids)
@@ -955,9 +964,11 @@ class PgVectorBackend:
                     (id, _literal(values), digest),
                 )
 
-    def knowledge_digests(self) -> dict[str, str]:
-        rows = self.db.query("SELECT id, digest FROM knowledge_vectors WHERE digest IS NOT NULL")
-        return dict(rows)
+    def knowledge_digests(self, ids: Collection[str] | None = None) -> dict[str, str]:
+        sql = "SELECT id, digest FROM knowledge_vectors WHERE digest IS NOT NULL"
+        if ids is None:
+            return dict(self.db.query(sql))
+        return dict(self.db.query(sql + " AND id = ANY(%s)", (_text_ids(list(ids)),)))
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         key = "event_id" if kind == "event" else "id"

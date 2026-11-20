@@ -113,6 +113,9 @@ class InMemoryKnowledgeBase:
     def remove(self, id: str) -> None:
         self._items.pop(id, None)
 
+    def clear(self) -> None:
+        self._items.clear()
+
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         return [self._items[i] for i in ids if i in self._items]
 
@@ -249,8 +252,10 @@ class InMemoryVectorBackend:
             else:
                 self._digests[id] = digest
 
-    def knowledge_digests(self) -> dict[str, str]:
-        return dict(self._digests)
+    def knowledge_digests(self, ids: Collection[str] | None = None) -> dict[str, str]:
+        if ids is None:
+            return dict(self._digests)
+        return {id: self._digests[id] for id in ids if id in self._digests}
 
     def vector(self, kind: str, id: str) -> list[float] | None:
         found = self._vectors[kind].get(id)

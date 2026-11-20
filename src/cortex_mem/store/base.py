@@ -48,6 +48,10 @@ class KnowledgeStore(KnowledgeReader, Protocol):
         """Remove the item; unknown ids are ignored."""
         ...
 
+    def clear(self) -> None:
+        """Remove every item at once (an engine reset empties the knowledge base)."""
+        ...
+
 
 class EngineStateBackend(Protocol):
     """One engine's persistent state plus its delivery cursor."""
@@ -158,8 +162,9 @@ class VectorBackend(Protocol):
         "event" it is ignored."""
         ...
 
-    def knowledge_digests(self) -> dict[str, str]:
-        """id -> digest of the knowledge vectors that have one."""
+    def knowledge_digests(self, ids: Collection[str] | None = None) -> dict[str, str]:
+        """id -> digest of the knowledge vectors that have one; with `ids`, of
+        those ids only (unknown ids are left out)."""
         ...
 
     def vector(self, kind: str, id: str) -> list[float] | None:

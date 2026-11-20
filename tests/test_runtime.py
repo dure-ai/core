@@ -526,8 +526,12 @@ def test_a_new_engine_version_replays_into_an_emptied_knowledge_base():
     assert [k.id for k in kb.all()] == ["k1", "k2"]
 
     # The new version no longer promotes k2: without emptying, k2 would stay
-    # with no engine state left to demote it.
+    # with no engine state left to demote it. The store empties in one step.
+    removed = []
+    real_remove = kb.remove
+    kb.remove = lambda id: (removed.append(id), real_remove(id))
     v2 = V2({"e1": [Promote(mine("k1", "e1", body="restated"))]})
     assert runtime(v2, events, kb, state).sync() == 2
+    assert removed == []
     assert v2.seen == ["e1", "e2"]
     assert [(k.id, k.body) for k in kb.all()] == [("k1", "restated")]

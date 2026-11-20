@@ -232,9 +232,9 @@ class Index:
         generation = self._backend.generation()  # first: a rebuild after this read changes it
         if self.stale():
             return
-        # Reads every stored digest (and, in full, every vector id): O(knowledge
-        # base) per call. A per-id lookup on the port would avoid it.
-        stored = self._backend.knowledge_digests()
+        # In full: every stored digest and vector id. For touched ids: theirs only,
+        # so a decision costs what it touched, not the size of the knowledge base.
+        stored = self._backend.knowledge_digests(None if touched is None else list(dict.fromkeys(touched)))
         if touched is None:
             items = list(knowledge.all())
             # Ids of every stored vector: one without a digest is removed too.

@@ -161,6 +161,15 @@ class KnowledgeStoreContract(_Contract):
         assert kb.get(["k1"]) == []
         assert kb.all() == []
 
+    def test_knowledge_clear_removes_every_item(self, kb):
+        for id in ["a", "b", "c"]:
+            kb.put(item(id, "deploy uses tags"))
+        kb.clear()
+        assert kb.all() == [] and kb.get(["a"]) == []
+        assert kb.search("deploy tags", Caller("u1", "t1", "s1", T0), "org", 10) == []
+        kb.put(item("d", "deploy uses tags"))  # usable again afterwards
+        assert [k.id for k, _ in kb.search("deploy tags", Caller("u1", "t1", "s1", T0), "org", 10)] == ["d"]
+
     def test_knowledge_get_finds_nothing_for_ids_that_are_not_strings(self, kb):
         kb.put(item("1"))
         kb.put(item("k2"))
@@ -691,6 +700,14 @@ class VectorBackendContract(_Contract):
         vb.reset({"model": "m1", "group_threshold": 0.8})
         assert vb.knowledge_digests() == {}
         assert vb.cached("m1", "d1") == [0.5]
+
+    def test_knowledge_digests_of_some_ids_only(self, vb):
+        vb.put_vector("knowledge", "k1", [1.0, 0.0], digest="d1")
+        vb.put_vector("knowledge", "k2", [0.0, 1.0], digest="d2")
+        vb.put_vector("knowledge", "k3", [1.0, 1.0])
+        assert vb.knowledge_digests(["k2", "k3", "nope"]) == {"k2": "d2"}
+        assert vb.knowledge_digests([]) == {}
+        assert vb.knowledge_digests(None) == {"k1": "d1", "k2": "d2"}
 
 
 class _Counting:
