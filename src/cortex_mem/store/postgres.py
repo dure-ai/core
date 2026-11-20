@@ -150,6 +150,8 @@ class TransactionAborted(RuntimeError):
 
 
 def _bad_lock_timeout(value: str) -> ValueError:
+    """The ValueError for a lock timeout that is not a PostgreSQL duration,
+    naming the setting to change."""
     return ValueError(
         f"lock timeout {value!r} is not a PostgreSQL duration; set {LOCK_TIMEOUT_SETTING} "
         "to a value such as 30s, 500ms or 2min (0 waits forever)"
@@ -170,6 +172,7 @@ def _text_ids(ids: list[Any]) -> list[str]:
 
 
 def _redact(text: str, *secrets: str) -> str:
+    """text with every non-empty secret replaced by ***."""
     for secret in secrets:
         if secret:
             text = text.replace(secret, "***")
@@ -177,9 +180,21 @@ def _redact(text: str, *secrets: str) -> str:
 
 
 class PostgresDatabase:
+    """All stores in the connection's current schema, behind one autocommit
+    connection. Writes go through transaction(), which serializes writers
+    in every process with one advisory lock. Needs the pgvector extension."""
     kind = "postgres"
 
     def __init__(self, url: str, lock_timeout: str = "30s", vector_index: str = "none") -> None:
+        """url: a libpq connection string or URL. lock_timeout: how long
+        transaction() waits for the write lock, as a PostgreSQL duration
+        ("0" waits forever). vector_index: "none" (exact search) or "hnsw"
+        (see PgVectorBackend). Creates the tables if missing.
+
+        Raises ValueError for a bad setting, ConnectionError (password
+        redacted) when it cannot connect, and RuntimeError when pgvector (or,
+        for HNSW, a recent enough pgvector) is missing or the schema is of
+        another version."""
         if vector_index not in VECTOR_INDEXES:
             raise ValueError(f"vector_index must be one of {VECTOR_INDEXES}, not {vector_index!r}")
         check_lock_timeout(lock_timeout)
@@ -216,9 +231,13 @@ class PostgresDatabase:
             raise
 
     def __repr__(self) -> str:
+        """Host, port and database only, never the password."""
         return f"PostgresDatabase({self._where})"
 
     def _create(self) -> None:
+        """Create the tables if missing, under the write lock so two processes
+        starting on an empty schema do not race. RuntimeError for a schema of
+        another version, or one from before the epoch and digest columns."""
         # Under the write lock, so two processes starting on an empty schema do not race.
         with self.transaction():
             self.con.execute("CREATE TABLE IF NOT EXISTS cortex_meta (key text PRIMARY KEY, value text)")
@@ -287,12 +306,20 @@ class PostgresDatabase:
                 self._depth -= 1
                 if outer:
                     self._rollback()
+                    self._vectors.forget_hnsw()  # indexes built inside it are gone
                 raise
             self._depth -= 1
             if outer:
-                self._commit()
+                try:
+                    self._commit()
+                except BaseException:
+                    self._vectors.forget_hnsw()
+                    raise
 
     def _begin(self) -> None:
+        """BEGIN, set this transaction's lock_timeout, and take the database-wide
+        advisory lock. TimeoutError when the lock stays taken past the timeout;
+        on any failure the transaction is rolled back."""
         from psycopg.errors import InvalidParameterValue, LockNotAvailable
 
         self.con.execute("BEGIN")
@@ -314,6 +341,9 @@ class PostgresDatabase:
             raise
 
     def _commit(self) -> None:
+        """COMMIT, unless PostgreSQL aborted the transaction: then roll back and
+        raise TransactionAborted. A failed COMMIT is rolled back too, so the
+        advisory lock is released."""
         from psycopg.pq import TransactionStatus
 
         if self.con.info.transaction_status == TransactionStatus.INERROR:
@@ -357,6 +387,7 @@ class PostgresDatabase:
             return cur.fetchall() if cur.description is not None else []
 
     def close(self) -> None:
+        """Close the connection."""
         self.con.close()
 
 
@@ -394,6 +425,7 @@ CROSS JOIN corpus
 
 
 def _row_to_event(row: tuple) -> Event:
+    """An Event from a row of _EVENT_COLUMNS."""
     id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
     return Event(
         id=id, kind=kind, at=datetime.fromisoformat(at), user=user, team=team, session=session,
@@ -404,6 +436,9 @@ def _row_to_event(row: tuple) -> Event:
 
 
 class PgEventStore:
+    """The event log: events in append order (seq), with each event's term
+    counts (event_terms, event_stats) for BM25 search whose statistics
+    count only the events the caller may see."""
     def __init__(self, db: PostgresDatabase) -> None:
         self.db = db
 
@@ -503,6 +538,7 @@ ORDER BY score DESC, k.id COLLATE "C" LIMIT %(k)s
 
 
 def _row_to_knowledge(row: tuple) -> Knowledge:
+    """A Knowledge item from a row of _KNOWLEDGE_COLUMNS."""
     id, kind, title, body, scope, owner, sources, conditions = row
     return Knowledge(
         id=id, kind=kind, title=title, body=body, scope=scope, owner=owner,
@@ -511,6 +547,8 @@ def _row_to_knowledge(row: tuple) -> Knowledge:
 
 
 class PgKnowledgeStore:
+    """The knowledge base, with each item's term counts (knowledge_terms,
+    knowledge_stats) for BM25 search over what the caller may see."""
     def __init__(self, db: PostgresDatabase) -> None:
         self.db = db
 
@@ -675,6 +713,8 @@ def _as_float32(values: list[float]) -> list[float]:
 
 
 def _hnsw_name(table: str, dim: int) -> str:
+    """Name of the HNSW index on `table` for dimension `dim`, such as
+    event_vectors_hnsw_d256."""
     return f"{table}_hnsw_d{dim}"
 
 
@@ -717,7 +757,9 @@ class PgVectorBackend:
 
     def __init__(self, db: PostgresDatabase) -> None:
         self.db = db
-        self._hnsw_for: int | None = None  # the D this backend last built (or checked) indexes for
+        # (generation, D) this backend last built or checked the indexes for. Another
+        # generation (a reset by any process drops them) or a rollback makes it stale.
+        self._hnsw_for: tuple[int, int] | None = None
 
     def load(self) -> None:
         """On opening the database: with HNSW on, build the indexes of an index version
@@ -727,15 +769,22 @@ class PgVectorBackend:
         with self.db.transaction():
             dim = self._dim()
             if dim is not None:
-                self._ensure_hnsw(dim)
+                self._ensure_hnsw(dim, self.generation())
+
+    def forget_hnsw(self) -> None:
+        """Called when a write transaction rolls back: indexes built inside it
+        are gone, so the next put checks them again."""
+        self._hnsw_for = None
 
     # Index state
 
     def _get_meta(self, key: str) -> str | None:
+        """A vector_meta value ("meta", "generation", "indexed" or "dim"), or None."""
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = %s", (key,))
         return rows[0][0] if rows else None
 
     def _set_meta(self, key: str, value: str) -> None:
+        """Write a vector_meta value; call it inside a write transaction."""
         self.db.con.execute(
             "INSERT INTO vector_meta (key, value) VALUES (%s, %s) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
@@ -790,6 +839,8 @@ class PgVectorBackend:
         return rows[0][0] if rows else None
 
     def _check_dim(self, vector: list[float], dim: int | None) -> None:
+        """ValueError for an empty vector, or one whose length is not `dim`, the
+        index version's dimension (None: not known yet, anything goes)."""
         if not vector:
             raise ValueError("a vector must have at least one dimension")
         if dim is not None and len(vector) != dim:
@@ -814,6 +865,7 @@ class PgVectorBackend:
         return dim if rows[0][0] else None
 
     def _hnsw_indexes(self) -> list[str]:
+        """Names of the HNSW indexes on the vector tables of the current schema."""
         rows = self.db.query(
             "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
             "AND tablename = ANY(%s) AND indexname ~ '_hnsw_d[0-9]+$'",
@@ -821,11 +873,12 @@ class PgVectorBackend:
         )
         return [r[0] for r in rows]
 
-    def _ensure_hnsw(self, dim: int) -> None:
+    def _ensure_hnsw(self, dim: int, generation: int) -> None:
         """Inside a write transaction, with HNSW on: build the missing indexes for D, once
-        per D per backend. A table holding a component beyond halfvec range (written while
-        HNSW was off) gets no index, since building it would fail; it is searched exactly."""
-        self._hnsw_for = dim
+        per D and index generation per backend (until a rollback). A table holding a
+        component beyond halfvec range (written while HNSW was off) gets no index, since
+        building it would fail; it is searched exactly."""
+        self._hnsw_for = (generation, dim)
         if dim > HNSW_MAX_DIM:
             log.warning(
                 "vectors have %d dimensions, more than HNSW's %d for halfvec; searching exactly",
@@ -866,8 +919,10 @@ class PgVectorBackend:
             self._check_dim(values, dim)  # likewise
             if self._get_meta("dim") is None:
                 self._set_meta("dim", str(len(values)))
-            if self.db.vector_index == "hnsw" and self._hnsw_for != len(values):
-                self._ensure_hnsw(len(values))
+            if self.db.vector_index == "hnsw":
+                generation = self.generation()
+                if self._hnsw_for != (generation, len(values)):
+                    self._ensure_hnsw(len(values), generation)
             if kind == "event":
                 # ord is assigned on first insert; replacing keeps it (and the position).
                 self.db.con.execute(

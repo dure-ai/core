@@ -27,16 +27,20 @@ class MigrationError(Exception):
 
 
 def _count(db, table: str) -> int:
+    """Row count of `table`."""
     return db.query(f"SELECT count(*) FROM {table}")[0][0]
 
 
 def _check_empty(pg) -> None:
+    """MigrationError when any table the migration writes already has rows."""
     full = [t for t in TABLES if _count(pg, t)]
     if full:
         raise MigrationError(f"the target must be empty, but it already has rows in: {', '.join(full)}")
 
 
 def _copy_events(src, pg) -> None:
+    """Append every source event in order. MigrationError when the source seq
+    has a gap or an event lands at another seq in the target."""
     for expected, (seq, event) in enumerate(src.events.since(0), 1):
         if seq != expected:
             raise MigrationError(f"the source events have a gap: expected seq {expected}, found {seq}")
@@ -47,6 +51,8 @@ def _copy_events(src, pg) -> None:
 
 
 def _copy_state(src, pg) -> None:
+    """Copy engine_state, and each engine's cursor and version, as they are.
+    The target's epoch starts at 0."""
     # Written directly: the state backend's commit needs the cursor it expects, and a
     # migration has no engine to ask. This is the one place that bypasses it.
     con = pg.con
@@ -62,6 +68,8 @@ def _copy_state(src, pg) -> None:
 
 
 def _copy_cache(src, pg) -> None:
+    """Copy the embedding cache. MigrationError for a row that is not a
+    float32 vector or that PostgreSQL refuses."""
     for model, digest, blob in src.query("SELECT model, digest, vec FROM embed_cache ORDER BY model, digest"):
         if len(blob) == 0 or len(blob) % 4:
             raise MigrationError(f"embedding cache row {digest[:12]} is not a float32 vector")
@@ -128,6 +136,8 @@ def _snapshot(path: Path, into: Path) -> Path:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Migrate, print the row counts per table and return 0. Returns 2 with a
+    one-line error, never holding the URL, when anything fails."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("sqlite_path", type=Path, help="the SQLite store to read (never changed)")
     parser.add_argument("pg_url", help="PostgreSQL URL of an empty target (never printed)")
@@ -154,6 +164,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _run(path: Path, url: str) -> list[tuple[str, int, int]]:
+    """Snapshot the source into a temporary directory, open both stores and
+    migrate; a failed connection to PostgreSQL becomes a MigrationError."""
     import tempfile
 
     from cortex_mem.store.postgres import PostgresDatabase

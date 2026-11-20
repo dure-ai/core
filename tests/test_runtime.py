@@ -504,3 +504,30 @@ def test_a_tick_that_only_deletes_state_commits():
     rt.tick(T0)
 
     assert state.get("old") is None and state.epoch() == epoch + 1
+
+
+# ── a new engine version replays into an emptied knowledge base ─────────────
+
+
+def test_a_new_engine_version_replays_into_an_emptied_knowledge_base():
+    class V1(Scripted):
+        state_version = "1"
+
+    class V2(Scripted):
+        state_version = "2"
+
+    def mine(id, source, body="deploy uses tags"):
+        return item(id, (source,), scope="personal", owner="u1", body=body)
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    rt = runtime(V1({"e1": [Promote(mine("k1", "e1"))], "e2": [Promote(mine("k2", "e2"))]}), events, kb, state)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    assert [k.id for k in kb.all()] == ["k1", "k2"]
+
+    # The new version no longer promotes k2: without emptying, k2 would stay
+    # with no engine state left to demote it.
+    v2 = V2({"e1": [Promote(mine("k1", "e1", body="restated"))]})
+    assert runtime(v2, events, kb, state).sync() == 2
+    assert v2.seen == ["e1", "e2"]
+    assert [(k.id, k.body) for k in kb.all()] == [("k1", "restated")]

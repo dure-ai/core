@@ -382,6 +382,7 @@ def _pack(vector: Sequence[float]) -> bytes:
 
 
 def _unpack(blob: bytes) -> list[float]:
+    """A float32 BLOB back as Python floats."""
     values = array("f")
     values.frombytes(blob)
     return values.tolist()

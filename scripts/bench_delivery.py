@@ -129,9 +129,11 @@ class CountingEmbedder:
         self.calls = 0
 
     def __getattr__(self, name: str) -> Any:
+        """model, dim and the rest come from the wrapped HashEmbedder."""
         return getattr(self._inner, name)
 
     def embed(self, texts: Sequence[str], kind: Any) -> list[list[float]]:
+        """Count the call, then embed with the HashEmbedder."""
         self.calls += 1
         return self._inner.embed(texts, kind)
 
@@ -140,6 +142,8 @@ class CountingTransaction:
     """Wraps `db.transaction` and counts only the outermost entries (a depth counter)."""
 
     def __init__(self, db: Any) -> None:
+        """Replace db.transaction with this wrapper. Build the Index and Runtime
+        afterwards, so they take the wrapper."""
         self._inner = db.transaction
         self._lock = threading.Lock()
         self._depth = 0
@@ -148,6 +152,7 @@ class CountingTransaction:
 
     @contextmanager
     def __call__(self):
+        """db's own transaction, counted in `outer` when it is the outermost."""
         with self._lock:
             if self._depth == 0:
                 self.outer += 1
@@ -164,12 +169,17 @@ class BenchEngine:
     """Passes events through. `observe` sleeps `hold` seconds on the event with id `slow_id`."""
 
     def __init__(self, promote: bool, slow_id: str | None = None, hold: float = 0.0) -> None:
+        """promote: return a Promote for every event, so delivery writes
+        knowledge. slow_id and hold: the event whose observe sleeps, and for
+        how many seconds; `started` is set when that sleep begins."""
         self.promote = promote
         self.slow_id = slow_id
         self.hold = hold
         self.started = threading.Event()
 
     def observe(self, event: Event, ctx: Any) -> list[Any]:
+        """Sleep on the slow event, then promote the event's text as personal
+        knowledge when `promote` is set."""
         if self.slow_id is not None and event.id == self.slow_id:
             self.started.set()
             time.sleep(self.hold)
@@ -187,13 +197,17 @@ class BenchEngine:
         return [Promote(item)]
 
     def tick(self, now: datetime, ctx: Any) -> list[Any]:
+        """No decisions."""
         return []
 
     def handoff(self, query: str, caller: Any, scope: Any, ctx: Any, k: int = 6) -> list[Any]:
+        """No items."""
         return []
 
 
 def make_event(event_id: str, i: int) -> Event:
+    """Personal record number i, i seconds after _AT0; its text shares topic
+    and component words with other events."""
     return Event(
         id=event_id,
         kind="record",
@@ -216,6 +230,7 @@ def make_runtime(db: Any, engine: BenchEngine, name: str, embedder: CountingEmbe
 
 
 def summary(values: list[float]) -> dict[str, float]:
+    """min, median and max of the values (all 0.0 when there are none)."""
     if not values:
         return {"min": 0.0, "median": 0.0, "max": 0.0}
     return {"min": min(values), "median": statistics.median(values), "max": max(values)}
@@ -225,6 +240,9 @@ def summary(values: list[float]) -> dict[str, float]:
 
 
 def measure_write_transactions(store: str, pg_url: str | None, events: int) -> dict[str, Any]:
+    """Measurement A: append `events` records through a Runtime with an Index
+    on a fresh store. Returns the outermost write transactions (in total
+    and per event) and the number of embed calls."""
     with fresh_store(store, pg_url) as open_db:
         db = open_db()
         counter = CountingTransaction(db)
@@ -240,6 +258,11 @@ def measure_write_transactions(store: str, pg_url: str | None, events: int) -> d
 
 
 def measure_append_while_observe_holds(store: str, pg_url: str | None, hold: float, reps: int) -> dict[str, Any]:
+    """Measurement B, `reps` times on a fresh store each: while one
+    connection's engine sleeps `hold` seconds in observe, time a raw
+    events.append and a Runtime.append on a second connection. Returns
+    min, median and max of each; an append that fails, a slow engine that
+    never starts, or a failure on the slow side counts in `errors`."""
     raw: list[float] = []
     via_runtime: list[float] = []
     errors = 0
@@ -287,6 +310,7 @@ def measure_append_while_observe_holds(store: str, pg_url: str | None, hold: flo
 
 
 def git_commit() -> str:
+    """Short hash of the checked-out commit, or "unknown"."""
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
@@ -299,6 +323,8 @@ def git_commit() -> str:
 def run_bench(
     store: str, label: str, events: int = 200, hold: float = 3.0, reps: int = REPS, pg_url: str | None = None
 ) -> dict[str, Any]:
+    """Both measurements on one store, with the label and commit: the JSON
+    result."""
     a = measure_write_transactions(store, pg_url, events)
     b = measure_append_while_observe_holds(store, pg_url, hold, reps)
     return {
@@ -313,6 +339,9 @@ def run_bench(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the benchmark, print the JSON result and write it to --out
+    (default: bench-<label>-<store>.json under DEFAULT_OUT_DIR). Returns
+    the exit code."""
     parser = argparse.ArgumentParser(description="Measure write transactions per event and append latency.")
     parser.add_argument("--store", required=True, choices=["sqlite", "pg"])
     parser.add_argument("--label", required=True, help="names the run; part of the default output file name")

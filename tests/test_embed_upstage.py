@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from cortex_mem.embed import EmbeddingError, UpstageEmbedder
+from cortex_mem.embed import EmbeddingError, EmbeddingRejected, UpstageEmbedder
 
 KEY = "sk-test-secret"
 
@@ -13,7 +13,7 @@ KEY = "sk-test-secret"
 class Fake:
     def __init__(self):
         self.requests = []
-        self.status = 200
+        self.status = 200  # or callable(request_json) -> int
         self.body = None  # callable(request_json) -> bytes/obj, or None for default
         self.delay = 0.0
         self.base_url = ""
@@ -39,7 +39,7 @@ def fake():
             body = state.body(req) if state.body else _default(req)
             payload = body if isinstance(body, bytes) else json.dumps(body).encode()
             try:
-                self.send_response(state.status)
+                self.send_response(state.status(req) if callable(state.status) else state.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -233,3 +233,51 @@ def test_a_bad_key_that_reaches_the_request_becomes_an_embedding_error(key, offl
         emb.embed(["a"], "passage")
     assert key not in _everything(info.value)
     assert info.value.__context__ is None and info.value.__cause__ is None
+
+
+# A 4xx for one text is that text's fault only when the model works (contract §5).
+
+
+def test_a_400_for_one_text_after_a_success_rejects_that_text(fake):
+    emb = make(fake)
+    emb.embed(["ok"], "passage")
+    fake.status = 400
+    with pytest.raises(EmbeddingRejected) as info:
+        emb.embed(["far too long"], "passage")
+    assert KEY not in str(info.value)
+    assert len(fake.requests) == 2  # no probe: this model already answered
+
+
+def test_a_400_for_one_text_is_checked_with_a_probe_first(fake):
+    fake.status = lambda req: 400 if req["input"] == ["far too long"] else 200
+    emb = make(fake)
+    with pytest.raises(EmbeddingRejected):
+        emb.embed(["far too long"], "query")
+    assert [(r["json"]["model"], r["json"]["input"]) for r in fake.requests] == [
+        ("q-model", ["far too long"]), ("q-model", [UpstageEmbedder.PROBE])]
+
+
+def test_a_400_the_probe_gets_too_is_an_outage(fake):
+    fake.status = 400  # e.g. a model name the API does not know
+    with pytest.raises(EmbeddingError) as info:
+        make(fake).embed(["x"], "passage")
+    assert not isinstance(info.value, EmbeddingRejected)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500, 503])
+def test_other_statuses_are_outages(fake, status):
+    emb = make(fake)
+    emb.embed(["ok"], "passage")
+    fake.status = status
+    with pytest.raises(EmbeddingError) as info:
+        emb.embed(["x"], "passage")
+    assert not isinstance(info.value, EmbeddingRejected)
+
+
+def test_a_400_for_several_texts_is_not_a_rejection(fake):
+    emb = make(fake)
+    emb.embed(["ok"], "passage")
+    fake.status = 400
+    with pytest.raises(EmbeddingError) as info:
+        emb.embed(["a", "b"], "passage")  # the index then tries them one at a time
+    assert not isinstance(info.value, EmbeddingRejected)

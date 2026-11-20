@@ -7,7 +7,14 @@ import pytest
 from spy import SpyBackend, SpyEmbedder, TxnSpy
 
 from cortex_mem.contract import Caller, Event, Group, Knowledge
-from cortex_mem.embed import EmbeddingError, HashEmbedder, cosine, float32, text_digest
+from cortex_mem.embed import (
+    EmbeddingError,
+    EmbeddingRejected,
+    HashEmbedder,
+    cosine,
+    float32,
+    text_digest,
+)
 from cortex_mem.index import EMBED_BATCH, Index, IndexConfigChanged
 from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
@@ -599,7 +606,7 @@ def test_a_non_finite_embedding_fails_loudly_and_writes_nothing(make):
     emb = TableEmbedder({"a": [float("nan"), 1.0, 0.0]})
     index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
     index.ensure_current(db.knowledge)
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(EmbeddingError, match="finite"):
         index.advance(db.events, 1)
     assert (list(db.vectors.vectors("event")), db.vectors.group_of("e1"), db.vectors.indexed()) == ([], None, 0)
     assert db.vectors.cached("table", text_digest("a")) is None
@@ -991,3 +998,57 @@ def test_advance_does_not_raise_when_another_process_indexed_past_the_failure(op
     assert db_a.vectors.indexed() == 3
     assert a_backend.log == []  # the other process indexed every event, once
     assert [e[-1] for e in b_backend.log] == ["e1", "e1", "e2", "e2", "e3", "e3"]
+
+
+# ── texts the embedder refuses (EmbeddingRejected) ──────────────────────────
+
+
+def test_a_refused_record_is_indexed_without_a_vector_and_the_rest_go_on(opened):
+    db = appended(opened(), ev("e1", "fine"), ev("e2", "refused"), ev("e3", "also fine"))
+    index, emb, _, _ = spied(db)
+    emb.reject_on.add("refused")
+
+    index.advance(db.events, 3)
+
+    assert db.vectors.indexed() == 3
+    assert [id for id, _ in db.vectors.vectors("event")] == ["e1", "e3"]
+    assert db.vectors.group_of("e2") is None
+    assert emb.inside == []
+    asked = len(emb.calls)
+    appended(db, ev("e4", "refused"))
+    index.advance(db.events, 4)
+    assert db.vectors.indexed() == 4 and db.vectors.group_of("e4") is None
+    assert len(emb.calls) == asked  # this process does not ask about that text again
+
+
+def test_a_refused_knowledge_passage_has_no_vector_and_loses_its_old_one(opened):
+    db = opened()
+    index, emb, _, _ = spied(db)
+    db.knowledge.put(item("k1", body="fine"))
+    index.sync_knowledge(db.knowledge, None)
+    assert db.vectors.vector("knowledge", "k1") is not None
+
+    db.knowledge.put(item("k1", body="refused"))
+    emb.reject_on.add("deploy\nrefused")
+    index.sync_knowledge(db.knowledge, ["k1"])
+
+    assert db.vectors.vector("knowledge", "k1") is None
+    db.knowledge.put(item("k2", body="also fine"))
+    index.sync_knowledge(db.knowledge, None)  # a full pass skips it too
+    assert sorted(id for id, _ in db.vectors.vectors("knowledge")) == ["k2"]
+
+
+def test_a_refused_query_finds_nothing_instead_of_failing():
+    emb = FailingEmbedder(())
+    db, index = build([ev("e1", "deploy uses tags")], embedder=emb)
+
+    class Refusing(CountingEmbedder):
+        def embed(self, texts, kind):
+            if kind == "query":
+                raise EmbeddingRejected("too long")
+            return super().embed(texts, kind)
+
+    index._embedder = Refusing()
+    r = reader(db, index)
+    assert r.search("deploy", caller(), "personal") == []
+    assert r.knowledge("deploy", caller(), "team") == []

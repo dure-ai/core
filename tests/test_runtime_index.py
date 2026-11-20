@@ -23,7 +23,7 @@ from cortex_mem.contract import (
     Knowledge,
     Promote,
 )
-from cortex_mem.embed import EmbeddingError, HashEmbedder
+from cortex_mem.embed import EmbeddingError, EmbeddingRejected, HashEmbedder
 from cortex_mem.index import Index, IndexConfigChanged
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
@@ -365,7 +365,9 @@ def test_the_runtime_never_embeds_inside_a_write_transaction(store, tmp_path):
     assert emb.calls and emb.inside == []
     assert rebuilding.calls and rebuilding.inside == []
     assert engine.seen[:4] == ["e1", "e2", "e5", "e3"]
-    assert db.vectors.vector("knowledge", "k2") is not None
+    # Each rebuild reset the engine and emptied the knowledge base; the replay
+    # promoted k1 and demoted it again, and a replay does not tick (k2).
+    assert db.knowledge.all() == [] and list(db.vectors.vectors("knowledge")) == []
 
 
 # ── index version ───────────────────────────────────────────────────────────
@@ -404,9 +406,11 @@ def test_changed_threshold_rebuilds_groups_and_replays_the_engine(tmp_path):
     assert rt.state.get("n") == 3  # state was reset, not added to
     # No state_version on the engine: the version records only the index it was built on.
     assert json.loads(rt.state.version()) == [None, fingerprint(db, 0.5, model="table")]
-    assert [i.id for i in db.knowledge.all()] == ["k1"]  # knowledge is kept
-    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1"]
-    assert emb.calls == []  # every passage came from the cache
+    # The reset cleared the knowledge base: the replay decides it again, and this
+    # engine promotes nothing, so k1 (promoted under the old grouping) is gone.
+    assert db.knowledge.all() == []
+    assert list(db.vectors.vectors("knowledge")) == []
+    assert emb.calls == []  # nothing new to embed
 
 
 def test_rebuild_keeps_the_engines_state_version():
@@ -565,6 +569,37 @@ def test_a_failing_text_in_a_batch_stops_only_its_own_event():
     assert (rt.state.cursor(), db.vectors.indexed(), rt.skipped) == (1, 1, [])
     emb.fail_on.clear()
     assert rt.sync() == 2
+
+
+class RefusingEmbedder(CountingEmbedder):
+    """Refuses the given texts: alone with EmbeddingRejected, in a batch with
+    EmbeddingError (as the Upstage embedder does)."""
+
+    def __init__(self, refuse):
+        super().__init__()
+        self.refuse = set(refuse)
+
+    def embed(self, texts, kind):
+        if any(t in self.refuse for t in texts):
+            if len(texts) == 1:
+                raise EmbeddingRejected("the embedding API refused this text")
+            raise EmbeddingError("the embedding API refused the request")
+        return super().embed(texts, kind)
+
+
+def test_a_refused_text_is_delivered_without_a_group_and_holds_nothing_back():
+    db = InMemoryDatabase()
+    engine = ProbeEngine()
+    rt = runtime(engine, db, RefusingEmbedder({"huge"}))
+    rt.sync()
+    for e in [ev("e1", "fine"), ev("e2", "huge"), ev("e3", "fine too")]:
+        db.events.append(e)
+
+    assert rt.sync() == 3
+    assert engine.seen == ["e1", "e2", "e3"]
+    assert engine.groups["e2"] is None and engine.groups["e3"] is not None
+    assert (rt.state.cursor(), db.vectors.indexed(), rt.skipped) == (3, 3, [])
+    assert rt.handoff("huge", caller(), "personal") == []  # a refused query finds nothing
 
 
 # ── every engine on one store follows the index version ─────────────────────
@@ -1272,10 +1307,11 @@ def test_two_rebuilds_back_to_back_cost_one_generation(store, tmp_path, request)
 
 
 @pytest.mark.parametrize("store", STORES)
-def test_items_promoted_during_our_own_rebuild_get_vectors(store, tmp_path, request):
+def test_knowledge_vectors_follow_the_reset_that_follows_our_own_rebuild(store, tmp_path, request):
     """This Runtime rebuilds the index (another config had it) after it had
-    already reconciled once; an item promoted after the rebuild's snapshot
-    gets its vector from the full compare that follows the rebuild."""
+    already reconciled once, and an item is put after the rebuild's snapshot.
+    The rebuild resets the engine, which empties the knowledge base; the full
+    compare that follows leaves no vector behind for any of it."""
     open_db = reopener(store, tmp_path, request)
     db = open_db()
     db.knowledge.put(item("k1", ("e1",), body="hello world"))
@@ -1295,7 +1331,8 @@ def test_items_promoted_during_our_own_rebuild_get_vectors(store, tmp_path, requ
     rt.sync()
 
     assert db.vectors.meta() == rt.index.want()
-    assert db.vectors.vector("knowledge", "k2") is not None
+    assert db.knowledge.all() == []
+    assert list(db.vectors.vectors("knowledge")) == []
 
 
 @pytest.mark.parametrize("store", STORES)
