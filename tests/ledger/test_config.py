@@ -92,6 +92,7 @@ def test_bad_value_names_the_key():
         {"trust.observation": "-0.1"},
         {"alpha": "-1"},
         {"beta": "-1"},
+        {"alpha": "0", "beta": "0"},
         {"gate.team.min_sources": "-1"},
         {"gate.personal.alt_verified": "-1"},
         {"gate.team.max_contra_ratio": "-0.1"},
@@ -117,3 +118,8 @@ def test_mappings_are_read_only():
         cfg.status_weights["candidate"] = 9
     with pytest.raises(TypeError):
         cfg.gates["team"] = cfg.gates["personal"]
+
+
+def test_one_zero_prior_is_allowed():
+    assert LedgerConfig.from_mapping({"alpha": "0"}).alpha == 0.0
+    assert LedgerConfig.from_mapping({"beta": "0"}).beta == 0.0

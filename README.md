@@ -108,7 +108,7 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 엔진 경로는 `cortex_mem.engines.ledger:LedgerEngine`이다. 생성자는 `Mapping[str, str]` 설정만 받고(없으면 기본값), 키가 틀리거나 값이 범위를 벗어나면 `ValueError`로 멈춘다. 서버의 `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`은 팩토리를 빈 설정(`{}`)으로 부르므로 기본값만 쓰인다. 설정을 바꾸려면 코드에서 `LedgerEngine({...})`로 만든다.
 
-`ctx.similar`(임베딩을 켰을 때)가 있으면 core 묶음으로 같은 주장을 찾고, 없으면 글자 비교(토큰 자카드)로 대신한다.
+`ctx.similar`(임베딩을 켰을 때)가 있으면 core 묶음으로 같은 주장을 찾고, 없으면 글자 비교(토큰 자카드)로 대신한다. 토큰은 문자 체계와 상관없이 글자·숫자 묶음이고, 띄어 쓰지 않는 문자(한글, 한자, 가나)는 묶음 뒤에 글자 2-gram을 더한다. 토큰이 하나도 없는 기록(이모지·구두점뿐)은 서명을 만들지 않는다. 글자 비교 경로는 검색 결과를 `match_pool`의 16배까지만 넓힌다.
 
 ### 동작
 
@@ -134,7 +134,7 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 
 **건넬 때(`handoff`).** 지식 검색·기록 검색(임베딩을 켜면 의미 검색 두 목록도)을 RRF로 합쳐 주장 단위로 모으고, 상태 가중·최신성을 곱해 순위를 낸다. deprecated·archived와 조건이 호출자의 `context`와 다른 주장은 뺀다. 항목 하나가 주장 하나이고, 본문 아래에 `[established · human 1, test 1 · 2 sources · since 2026-10-03]` 같은 출처 줄을 붙이며, `sources`에는 지지 이벤트가 모두 들어간다. `status`는 승격된 established만 `knowledge`, 나머지는 `memory`다.
 
-**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "1"`). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`).
+**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "1"`). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`). 같은 이벤트가 다시 전달돼도 한 번만 센다.
 
 설정 키(값은 모두 문자열이다. 기본값은 `config.py`와 같다):
 
@@ -157,9 +157,9 @@ uv run python scripts/sqlite_to_pg.py ~/.cortex-mem/cortex.db postgresql://user:
 | `own_candidate_weight` | `0.7` | 호출자 본인의 candidate 가중 |
 | `review_after_days` | `0` | 이 기간 지지가 없는 established를 보관 처리한다. 0이면 끈다 |
 | `half_life_days` | `0` | 건넬 때 최신성 가중의 반감기. 0이면 끈다 |
-| `high_risk_terms` | 빈 값 | 쉼표로 나눈 단어(공백 제거, 소문자). 본문에 들어 있으면 사람 확인이 필요하다 |
+| `high_risk_terms` | 빈 값 | 쉼표로 나눈 단어(공백 제거, 소문자). 본문에 단어로 들어 있으면 사람 확인이 필요하다. 영문 등은 단어 경계가 맞아야 하고(`key`는 `monkey`에 걸리지 않음), 띄어 쓰지 않는 문자 안에서는 어디든 걸린다(`비밀번호를`은 `비밀번호`에 걸림) |
 
-가중, 신뢰, `alpha`, `beta`, 상태 가중, `own_candidate_weight`, `*_days`, `min_sources`, `alt_verified`는 0 이상이어야 한다.
+가중, 신뢰, `alpha`, `beta`, 상태 가중, `own_candidate_weight`, `*_days`, `min_sources`, `alt_verified`는 0 이상이어야 한다. `alpha`와 `beta`가 둘 다 0일 수는 없다(지지와 반박이 모두 0이면 신뢰도가 0/0이 된다).
 
 한계:
 

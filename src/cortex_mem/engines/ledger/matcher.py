@@ -15,6 +15,9 @@ from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import jaccard, signature
 
+# The lexical search widens to at most this many times `match_pool` hits.
+_WIDEN_LIMIT = 16
+
 # Claims taken down (spec 9): they take no new records and are not re-judged,
 # until verified support dated after `invalid_since` revives them.
 DOWN = ("deprecated", "archived")
@@ -141,7 +144,8 @@ class LexicalMatcher:
         the highest token Jaccard at or above `same_threshold` (ties by claim
         id, then event id). None if nothing qualifies."""
         owner = owner_for(event)
-        cid = store.claim_by_signature(event.scope, owner, signature(event.text))
+        sig = signature(event.text)
+        cid = None if sig is None else store.claim_by_signature(event.scope, owner, sig)
         if cid is not None:
             claim = store.claim(cid)
             if claim is not None and eligible(claim, event):
@@ -173,8 +177,12 @@ class LexicalMatcher:
         `ctx.similar` (spec 13): records later in the log take pool slots
         during a batched sync or a rebuild. Skipping them and widening the
         search (doubling k) until the pool is full or the search runs out
-        keeps a replay matching like live delivery."""
+        keeps a replay matching like live delivery. The widening stops at
+        `_WIDEN_LIMIT` x `match_pool` hits, so one record never searches the
+        whole log: a replay can then miss a match that more than that many
+        later records crowd out."""
         pool = self._cfg.match_pool
+        limit = pool * _WIDEN_LIMIT
         k = pool
         while True:
             hits = ctx.events.search(
@@ -189,9 +197,9 @@ class LexicalMatcher:
                     observed.append((other, memory))
                     if len(observed) == pool:
                         return observed
-            if len(hits) < k:
+            if len(hits) < k or k >= limit:
                 return observed
-            k *= 2
+            k = min(k * 2, limit)
 
 
 def group_of(event: Event, ctx: EngineContext) -> str | None:

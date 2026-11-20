@@ -137,9 +137,12 @@ def test_idempotent_writes() -> None:
 def test_skip_counts() -> None:
     s = LedgerStore(FakeState())
     assert s.skipped() == {}
-    s.skip("unknown_ref")
-    s.skip("unknown_ref")
-    assert s.skipped() == {"unknown_ref": 2}
+    s.skip("unknown_ref", "e1", "x")
+    s.skip("unknown_ref", "e1", "y")
+    s.skip("unknown_ref", "e1", "x")  # the same event and ref again
+    s.skip("org_scope", "e2")
+    s.skip("org_scope", "e2")
+    assert s.skipped() == {"unknown_ref": 2, "org_scope": 1}
 
 
 def test_key_rules() -> None:
@@ -151,7 +154,7 @@ def test_key_rules() -> None:
     s.mark_seen("sess", "c-e1", T0)
     s.add_to_group("g", "c-e1")
     s.index_signature("team", "t", "sg", "c-e1")
-    s.skip("r")
+    s.skip("r", "e1")
     assert set(st.data) == {
         "mem:e1",
         "claim:c-e1",
@@ -159,6 +162,7 @@ def test_key_rules() -> None:
         "seen:sess:c-e1",
         "grp:g:c-e1",
         "sig:team:t:sg",
+        "skip:r:e1:",
         "ledger:skipped",
     }
     assert st.data["grp:g:c-e1"] is True

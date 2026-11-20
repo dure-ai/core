@@ -368,3 +368,28 @@ def test_a_disputed_claim_does_not_take_a_high_risk_canonical_either():
     rt.append(ev("e5", RISKY, user="u5", signal="test", minutes=4))
     assert state(db).claim("c-e1").canonical == "e1"
     assert len(decisions_of(rt, Promote)) == 1
+
+
+def test_skipped_events_are_counted_once_when_observed_again():
+    rt, db = runtime()
+    rt.append(ev("e1", FACT))
+    events = [
+        ev("o1", FACT, scope="org", minutes=1),
+        judgment("j1", "u2", refs=("nope", "e1"), minutes=2),
+        judgment("j2", "u2", outcome="unknown", minutes=3),
+        org_judgment("j3", "u9", "t2", signal="test", outcome="failure", minutes=4),
+        judgment("j4", "u2", kind="human_confirm", signal=None, scope="personal", minutes=5),
+    ]
+    for event in events:
+        rt.append(event)
+    expected = {"org_scope": 2, "unknown_ref": 1, "unknown_outcome": 1,
+                "out_of_scope_evidence": 1}
+    assert state(db).skipped() == expected
+
+    staged = _Writable(db.state(ENGINE))
+    ctx = EngineContext(events=rt.events, knowledge=rt.knowledge, state=staged, similar=None)
+    engine = LedgerEngine()
+    for event in events:
+        engine.observe(event, ctx)
+
+    assert LedgerStore(staged).skipped() == expected

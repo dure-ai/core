@@ -62,8 +62,9 @@ class World:
                 promoted=False, use_success=0, use_failure=0))
             if group:
                 self.store.add_to_group(group, cid)
-            self.store.index_signature(event.scope, owner_for(event),
-                                       signature(event.text), cid)
+            sig = signature(event.text)
+            assert sig is not None
+            self.store.index_signature(event.scope, owner_for(event), sig, cid)
         else:
             self.store.put_evidence(Evidence(
                 claim_id=cid, event_id=event.id, stance="support",
@@ -238,3 +239,30 @@ def test_match_claim_with_port():
     ctx = w.ctx({"e1": "g", "e2": "g"})
     m, grp = match_claim(e2, ctx, w.store, CFG)
     assert m is not None and m.claim_id == "c-e1" and grp == "e1"
+
+
+class CountingEvents:
+    """Delegates to an event log and records the k of every search."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.ks = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def search(self, query, caller, scope, k=20, kinds=None):
+        self.ks.append(k)
+        return self._inner.search(query, caller, scope, k=k, kinds=kinds)
+
+
+def test_lexical_search_widening_stops_at_a_cap():
+    w = World()
+    for i in range(300):  # in the log but not observed yet, as in a replay
+        w.db.events.append(rec(f"x{i:03d}", LONG))
+    new = rec("new", LONG)
+    w.db.events.append(new)
+    events = CountingEvents(w.db.events)
+
+    assert LexicalMatcher(CFG).match(new, Ctx(events, w.db.knowledge, w.state), w.store) is None
+    assert events.ks == [10, 20, 40, 80, 160]

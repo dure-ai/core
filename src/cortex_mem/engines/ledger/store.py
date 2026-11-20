@@ -63,6 +63,12 @@ def _p_grp(group_id: str) -> str:
     return f"grp:{_enc(group_id)}:"
 
 
+def _k_skip(reason: str, event_id: str, detail: str) -> str:
+    """`skip:<reason>:<event>:<detail>`: a skip already counted, so a redelivered
+    event is not counted again (`detail` names the ref or claim, or is empty)."""
+    return f"skip:{_enc(reason)}:{_enc(event_id)}:{_enc(detail)}"
+
+
 def _k_sig(scope: Scope, owner: str, signature: str) -> str:
     """`sig:<scope>:<owner>:<signature>`: the claim a text fingerprint
     (`text.signature`) points at."""
@@ -163,9 +169,16 @@ class LedgerStore:
         if replace or self._s.get(key) is None:
             self._s.put(key, claim_id)
 
-    def skip(self, reason: str) -> None:
+    def skip(self, reason: str, event_id: str, detail: str = "") -> None:
         """Count one event the engine passed over, under `reason`
-        (`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`)."""
+        (`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`).
+        `detail` tells apart several skips of one event (the unknown ref, the
+        claim out of scope). The same (reason, event, detail) counts once, so
+        observing an event again does not change the counts."""
+        marker = _k_skip(reason, event_id, detail)
+        if self._s.get(marker) is not None:
+            return
+        self._s.put(marker, True)
         counts = self.skipped()
         counts[reason] = counts.get(reason, 0) + 1
         self._s.put(_SKIPPED, counts)

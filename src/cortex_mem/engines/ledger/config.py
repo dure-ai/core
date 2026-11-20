@@ -131,6 +131,12 @@ class LedgerConfig:
             for st in _STATUSES
         }
 
+        alpha = _non_negative("alpha", get("alpha", _float, 1.0))
+        beta = _non_negative("beta", get("beta", _float, 1.0))
+        if alpha + beta == 0:
+            # confidence (S + alpha) / (S + C + alpha + beta) is 0/0 with no strength
+            raise ValueError("alpha and beta must not both be 0")
+
         terms: tuple[str, ...] = ()
         if "high_risk_terms" in raw:
             parts = (t.strip().lower() for t in raw["high_risk_terms"].split(","))
@@ -147,8 +153,8 @@ class LedgerConfig:
             trust_observation=_non_negative(
                 "trust.observation", get("trust.observation", _float, 0.7)
             ),
-            alpha=_non_negative("alpha", get("alpha", _float, 1.0)),
-            beta=_non_negative("beta", get("beta", _float, 1.0)),
+            alpha=alpha,
+            beta=beta,
             status_weights=MappingProxyType(status_weights),
             own_candidate_weight=_non_negative(
                 "own_candidate_weight", get("own_candidate_weight", _float, 0.7)

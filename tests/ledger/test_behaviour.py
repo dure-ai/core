@@ -203,7 +203,7 @@ def test_another_state_version_rebuilds_the_same_knowledge_base(db, port):
     claims = [(c.id, c.status) for c in state(db).claims()]
     assert before
 
-    edit_state(db, lambda st: st.skip("sentinel"))  # must not survive the reset
+    edit_state(db, lambda st: st.skip("sentinel", "x"))  # must not survive the reset
     assert "sentinel" in state(db).skipped()
 
     class Next(LedgerEngine):

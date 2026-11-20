@@ -68,7 +68,7 @@ class LedgerEngine:
         if event.kind in ("outcome", "human_confirm"):
             return self._judge(event, ctx, store)
         if event.kind == "recall":
-            for claim_id in self._resolve(event.refs, store, count_unknown=False):
+            for claim_id in self._resolve(event, store, count_unknown=False):
                 store.mark_seen(event.session, claim_id, event.at)
         return []
 
@@ -121,7 +121,7 @@ class LedgerEngine:
         """Spec section 6, `record`: find or open the claim, write the memory
         and its support evidence, then re-evaluate the claim."""
         if event.scope == "org":
-            store.skip("org_scope")  # v0.1 covers personal and team only
+            store.skip("org_scope", event.id)  # v0.1 covers personal and team only
             return []
         if store.memory(event.id) is not None:
             return []  # delivered again: this record is already in the ledger
@@ -191,6 +191,8 @@ class LedgerEngine:
         taken over by the record's claim, so the next restatement joins it
         instead of opening yet another claim (spec 7)."""
         sig = signature(event.text)
+        if sig is None:
+            return  # no words to sign: matching falls back to search
         current = store.claim_by_signature(claim.scope, claim.owner, sig)
         stale = (
             current is not None
@@ -201,18 +203,18 @@ class LedgerEngine:
 
     @staticmethod
     def _resolve(
-        refs: Sequence[str], store: LedgerStore, *, count_unknown: bool = True
+        event: Event, store: LedgerStore, *, count_unknown: bool = True
     ) -> list[str]:
-        """Claim ids the refs name: a claim id as it is, an event id through
-        its memory. Unique, in order; unknown refs are counted."""
+        """Claim ids the event's refs name: a claim id as it is, an event id
+        through its memory. Unique, in order; unknown refs are counted."""
         found: dict[str, None] = {}
-        for ref in refs:
+        for ref in event.refs:
             if store.claim(ref) is not None:
                 found[ref] = None
             elif (memory := store.memory(ref)) is not None:
                 found[memory.claim_id] = None
             elif count_unknown:
-                store.skip("unknown_ref")
+                store.skip("unknown_ref", event.id, ref)
         return list(found)
 
     def _judge(
@@ -223,17 +225,17 @@ class LedgerEngine:
         if event.scope == "org":
             # v0.1 covers personal and team only: an org judgment would let
             # other teams vote and hide the claim from team-scope handoffs
-            store.skip("org_scope")
+            store.skip("org_scope", event.id)
             return []
         if event.outcome not in ("success", "failure"):
-            store.skip("unknown_outcome")
+            store.skip("unknown_outcome", event.id)
             return []
         out: list[Decision] = []
-        for claim_id in self._resolve(event.refs, store):
+        for claim_id in self._resolve(event, store):
             claim = store.claim(claim_id)
             assert claim is not None
             if not in_scope(event, claim):
-                store.skip("out_of_scope_evidence")
+                store.skip("out_of_scope_evidence", event.id, claim_id)
                 continue
             if store.judged(claim_id, event.id):
                 continue  # delivered again: this judgment is already counted

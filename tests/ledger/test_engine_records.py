@@ -542,3 +542,13 @@ def test_established_with_the_same_canonical_decides_nothing():
     assert decisions("established", "e1", claim, [_evidence("e1")], "x", trigger) == []
     claim = _claim(status="disputed", promoted=True)
     assert decisions("established", "e1", claim, [_evidence("e1")], "x", trigger) == []
+
+
+def test_records_without_latin_or_hangul_words_do_not_share_a_claim():
+    texts = ["配置文件在这里", "数据库密码已更换", "Порт 8080", "ポートは8080です", "🚀🚀", "🎉"]
+    rt, db = runtime()
+    for i, text in enumerate(texts):
+        rt.append(ev(f"e{i}", text, minutes=i))
+
+    assert [c.id for c in state(db).claims()] == [f"c-e{i}" for i in range(len(texts))]
+    assert count(db, "sig:") == 4  # the two emoji-only records have no words to sign

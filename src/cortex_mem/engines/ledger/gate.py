@@ -12,6 +12,7 @@ from typing import Any
 from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.evidence import Tally
 from cortex_mem.engines.ledger.model import Claim, ClaimStatus
+from cortex_mem.engines.ledger.text import contains_term
 
 # S and C are float sums of decimal weights (0.7 has no exact binary form), so a tie that is
 # exact in decimals can land a few ulps either side. Ties at a gate limit count as reached.
@@ -68,9 +69,8 @@ def evaluate(
     )
     total = t.S + t.C
     contradiction = total == 0 or t.C / total <= rule.max_contra_ratio + _TIE
-    lowered = text.lower()
     high_risk = (
-        not any(term in lowered for term in cfg.high_risk_terms)
+        not any(contains_term(text, term) for term in cfg.high_risk_terms)
         or human_fresh
     )
     checks = {

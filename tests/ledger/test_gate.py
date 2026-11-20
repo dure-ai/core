@@ -217,3 +217,12 @@ def test_verified_contradiction_equal_to_support_deprecates():
     assert t.C < t.S  # the float sums really do miss the tie
     r = evaluate(claim(status="established"), t, "text", CFG, human_fresh=False)
     assert r.decision == "deprecated"
+
+
+def test_high_risk_terms_match_words_not_parts_of_words():
+    c = replace(CFG, high_risk_terms=("key", "rm"))
+    two = tl(S=1.4, keys=2)
+    assert evaluate(claim(), two, "The monkey patch in form.py", c,
+                    human_fresh=False).checks["high_risk"] is True
+    assert evaluate(claim(), two, "Rotate the API key", c,
+                    human_fresh=False).checks["high_risk"] is False
