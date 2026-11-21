@@ -34,7 +34,7 @@ from collections.abc import Collection, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, LiteralString, cast
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from ..embed import float32
@@ -378,7 +378,7 @@ class PostgresDatabase:
         except Error:
             pass  # the connection died meanwhile; the caller's error is the one to see
 
-    def query(self, sql: str, params: Any = ()) -> list[tuple]:
+    def query(self, sql: str, params: Any = ()) -> list[tuple[Any, ...]]:
         """Run one statement and return its rows ([] when it returns none).
 
         Takes the in-process lock, so a call from another thread waits while this object
@@ -386,7 +386,7 @@ class PostgresDatabase:
         committed rows, inside one it also sees that transaction's own writes.
         """
         with self._lock:
-            cur = self.con.execute(sql, params)
+            cur = self.con.execute(_sql(sql), params)
             return cur.fetchall() if cur.description is not None else []
 
     def close(self) -> None:
@@ -431,7 +431,7 @@ CROSS JOIN corpus
 """
 
 
-def _row_to_event(row: tuple) -> Event:
+def _row_to_event(row: tuple[Any, ...]) -> Event:
     """An Event from a row of _EVENT_COLUMNS."""
     id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
     return Event(
@@ -457,9 +457,9 @@ class PgEventStore:
             if self.db.con.execute("SELECT 1 FROM events WHERE id = %s", (e.id,)).fetchone():
                 raise ValueError(f"duplicate event id: {e.id}")
             # Writers hold the database-wide lock, so max+1 is gap-free and in commit order.
-            seq = self.db.con.execute("SELECT coalesce(max(seq), 0) + 1 FROM events").fetchone()[0]
+            seq = _scalar(self.db.con.execute("SELECT coalesce(max(seq), 0) + 1 FROM events"))
             self.db.con.execute(
-                f"INSERT INTO events (seq, {_EVENT_COLUMNS}) VALUES ({', '.join(['%s'] * 17)})",
+                _sql(f"INSERT INTO events (seq, {_EVENT_COLUMNS}) VALUES ({', '.join(['%s'] * 17)})"),
                 (
                     seq, e.id, e.kind, e.at.isoformat(), e.user, e.team, e.session, e.scope, e.text,
                     e.agent, e.signal, e.outcome, json.dumps(dict(e.conditions)),
@@ -544,7 +544,7 @@ ORDER BY score DESC, k.id COLLATE "C" LIMIT %(k)s
 """
 
 
-def _row_to_knowledge(row: tuple) -> Knowledge:
+def _row_to_knowledge(row: tuple[Any, ...]) -> Knowledge:
     """A Knowledge item from a row of _KNOWLEDGE_COLUMNS."""
     id, kind, title, body, scope, owner, sources, conditions = row
     return Knowledge(
@@ -564,10 +564,12 @@ class PgKnowledgeStore:
         con = self.db.con
         with self.db.transaction():
             con.execute(
-                f"INSERT INTO knowledge ({_KNOWLEDGE_COLUMNS}) VALUES ({', '.join(['%s'] * 8)}) "
-                "ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, "
-                "body = excluded.body, scope = excluded.scope, owner = excluded.owner, "
-                "sources = excluded.sources, conditions = excluded.conditions",
+                _sql(
+                    f"INSERT INTO knowledge ({_KNOWLEDGE_COLUMNS}) VALUES ({', '.join(['%s'] * 8)}) "
+                    "ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, title = excluded.title, "
+                    "body = excluded.body, scope = excluded.scope, owner = excluded.owner, "
+                    "sources = excluded.sources, conditions = excluded.conditions"
+                ),
                 (
                     item.id, item.kind, item.title, item.body, item.scope, item.owner,
                     json.dumps(list(item.sources)), json.dumps(dict(item.conditions)),
@@ -716,6 +718,24 @@ _HNSW_TABLES = ("event_vectors", "knowledge_vectors")
 _KINDS = {"event": "event_vectors", "knowledge": "knowledge_vectors"}
 
 
+def _sql(text: str) -> LiteralString:
+    """Mark a statement built in this module as one psycopg may send as is.
+
+    psycopg's types accept only literal strings, so that values cannot be pasted into SQL.
+    The statements here interpolate only this module's own names (tables, columns, index
+    names it created), integers and placeholder lists; every value goes in as a parameter.
+    """
+    return cast(LiteralString, text)
+
+
+def _scalar(cursor: Any) -> Any:
+    """The first column of a statement that always returns exactly one row (an aggregate, EXISTS)."""
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("expected one row from an aggregate query")
+    return row[0]
+
+
 def _literal(vector: list[float]) -> str:
     """pgvector's text form. repr() of a float32-rounded value parses back to that same
     float32 (pgvector reads components with strtof)."""
@@ -807,16 +827,16 @@ class PgVectorBackend:
             (key, value),
         )
 
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         value = self._get_meta("meta")
         return json.loads(value) if value is not None else None
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         encoded = json.dumps(meta)
         with self.db.transaction():
             con = self.db.con
             for name in self._hnsw_indexes():
-                con.execute(f'DROP INDEX IF EXISTS "{name}"')
+                con.execute(_sql(f'DROP INDEX IF EXISTS "{name}"'))
             for table in ("event_vectors", "knowledge_vectors", "vector_groups"):
                 con.execute(f"DELETE FROM {table}")
             con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
@@ -832,7 +852,7 @@ class PgVectorBackend:
         value = self._get_meta("indexed")
         return int(value) if value is not None else 0
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         found = dict(self.db.query("SELECT key, value FROM vector_meta WHERE key IN ('meta', 'generation', 'indexed')"))
         meta = found.get("meta")
         return (
@@ -915,10 +935,12 @@ class PgVectorBackend:
             name = _hnsw_name(table, dim)
             if name in have:
                 continue
-            overflow = self.db.con.execute(
-                f"SELECT EXISTS (SELECT 1 FROM {table} v, unnest(v.emb::real[]) x WHERE abs(x) > %s)",
-                (HALFVEC_MAX,),
-            ).fetchone()[0]
+            overflow = _scalar(
+                self.db.con.execute(
+                    f"SELECT EXISTS (SELECT 1 FROM {table} v, unnest(v.emb::real[]) x WHERE abs(x) > %s)",
+                    (HALFVEC_MAX,),
+                )
+            )
             if overflow:
                 log.warning(
                     "%s holds components beyond halfvec range (|x| > %g); no HNSW index, "
@@ -927,8 +949,7 @@ class PgVectorBackend:
                 )  # fmt: skip
                 continue
             self.db.con.execute(
-                f"CREATE INDEX IF NOT EXISTS {name} ON {table} "
-                f"USING hnsw ((emb::halfvec({dim})) halfvec_cosine_ops)"
+                _sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} USING hnsw ((emb::halfvec({dim})) halfvec_cosine_ops)")
             )
 
     # Vectors
@@ -959,8 +980,10 @@ class PgVectorBackend:
                 )
             else:
                 self.db.con.execute(
-                    f"INSERT INTO {table} (id, emb, digest) VALUES (%s, %s::vector, %s) "
-                    "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb, digest = EXCLUDED.digest",
+                    _sql(
+                        f"INSERT INTO {table} (id, emb, digest) VALUES (%s, %s::vector, %s) "
+                        "ON CONFLICT (id) DO UPDATE SET emb = EXCLUDED.emb, digest = EXCLUDED.digest"
+                    ),
                     (id, _literal(values), digest),
                 )
 
@@ -994,7 +1017,7 @@ class PgVectorBackend:
     def delete_vectors(self, kind: str, ids: Collection[str]) -> None:
         key = "event_id" if kind == "event" else "id"
         with self.db.transaction():
-            self.db.con.execute(f"DELETE FROM {_KINDS[kind]} WHERE {key} = ANY(%s)", (list(ids),))
+            self.db.con.execute(_sql(f"DELETE FROM {_KINDS[kind]} WHERE {key} = ANY(%s)"), (list(ids),))
 
     # Groups
 
@@ -1073,7 +1096,7 @@ class PgVectorBackend:
 
     def _ranked(
         self, table: str, candidates: str, ties: str, params: dict[str, Any], k: int, dim: int | None
-    ) -> list:
+    ) -> list[tuple[Any, ...]]:
         """(id, score) of the best k rows of ``candidates``, a SELECT of ``id``, its tie
         columns and ``dist`` (already limited to dist < 1, i.e. score > 0) whose FROM has
         ``table`` as ``v``. Exact unless ``table`` has its HNSW index: then the index picks
@@ -1092,13 +1115,13 @@ class PgVectorBackend:
         with self.db._lock:
             if self.db._depth > 0:  # inside a write transaction: SET LOCAL lasts until it ends
                 self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
-                return self.db.con.execute(sql, params).fetchall()
+                return self.db.con.execute(_sql(sql), params).fetchall()
             # A read-only transaction of its own, so SET LOCAL has one to live in; it takes
             # no advisory lock, so a search never waits for writers.
             self.db.con.execute("BEGIN READ ONLY")
             try:
                 self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
-                rows = self.db.con.execute(sql, params).fetchall()
+                rows = self.db.con.execute(_sql(sql), params).fetchall()
             finally:
                 self.db._rollback()
             return rows

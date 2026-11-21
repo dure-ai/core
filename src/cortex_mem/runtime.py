@@ -345,14 +345,16 @@ class Runtime:
         try:
             with self.transaction():
                 moved = self._moved(epoch, cursor, generation, seq)
-                if moved is None:
-                    touched, verdicts = self._commit(decisions, staged, cursor, epoch, seq, event.at)
+                committed = None if moved is not None else self._commit(
+                    decisions, staged, cursor, epoch, seq, event.at
+                )
         except CursorConflict:
             return 0, []  # another process delivered, skipped or reset first; read again
         if moved == "version":
             raise _VersionMoved(seq)
-        if moved is not None:
+        if committed is None:  # moved: nothing was committed
             return 0, []
+        touched, verdicts = committed
         self.verdicts.extend(verdicts)
         self._failures.pop(seq, None)
         return 1, touched

@@ -20,6 +20,7 @@ import logging
 import math
 from collections.abc import Callable, Collection, Iterable
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 from .access import event_visible, owner_for
 from .contract import (
@@ -96,7 +97,7 @@ class Index:
         # follows takes them from here instead of reading the cache back.
         self._fresh: dict[str, list[float]] = {}
 
-    def want(self) -> dict:
+    def want(self) -> dict[str, Any]:
         """The index version this Index builds. It names the store, because
         stores may score in the last float32 digits differently: moving to
         another store rebuilds the index."""
@@ -106,7 +107,7 @@ class Index:
             "store": self._backend.kind,
         }
 
-    def fingerprint(self, generation: int | None = None) -> dict:
+    def fingerprint(self, generation: int | None = None) -> dict[str, Any]:
         """want() plus the stored index's generation: what an engine's state
         built on this index depends on. `generation` is one the caller has
         read already; None reads it now. A rebuild, by any process and with

@@ -121,12 +121,12 @@ class VectorBackend(Protocol):
     Part of the index version, so moving to another store rebuilds the index."""
 
     # Index state
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         """{"model": str, "group_threshold": float, "store": str} as the Index
         passed it to reset(), None until reset() is called."""
         ...
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         """Drop every vector (and the knowledge digests) and group, move the cursor
         to 0, record meta and add 1 to generation(), all in one step. The embedding
         cache stays."""
@@ -141,7 +141,7 @@ class VectorBackend(Protocol):
         """Position of the last event indexed (0 = none)."""
         ...
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         """(meta(), generation(), indexed()) read together, in one step on a
         durable store, so the three come from one moment."""
         ...

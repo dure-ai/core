@@ -34,7 +34,11 @@ class Embedder(Protocol):
     """Port for anything that turns texts into vectors."""
 
     model: str
-    dim: int
+
+    @property
+    def dim(self) -> int:
+        """Vector length; read-only, since an embedder may learn it from its first response."""
+        ...
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
         """One vector per text, in order, each `dim` long. kind says whether the
@@ -234,6 +238,7 @@ class UpstageEmbedder:
         differ from each other or from `dim`)."""
         body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
         unsendable: str | None = None
+        raw = b""  # set by the request; every path that leaves it unset raises below
         try:
             request = urllib.request.Request(
                 f"{self.base_url}/embeddings",

@@ -14,9 +14,10 @@ Needs pytest; import it from tests only.
 import threading
 import time
 from array import array
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -424,7 +425,7 @@ class VectorBackendContract(_Contract):
         assert got == expected
 
     def test_search_events_respects_kinds_upto_exclude_k_and_drops_nonpositive(self, db, vb):
-        rows = [("a", "record", [1.0, 0.0]), ("b", "recall", [0.8, 0.6]), ("c", "record", [0.0, 1.0]),
+        rows: list[tuple[str, Kind, list[float]]] = [("a", "record", [1.0, 0.0]), ("b", "recall", [0.8, 0.6]), ("c", "record", [0.0, 1.0]),
                 ("d", "record", [-1.0, 0.0]), ("e", "record", [0.8, 0.6]), ("f", "record", [1.0, 0.0])]  # fmt: skip
         for seq, (id, kind, vector) in enumerate(rows, start=1):
             self.index_event(db, ev(id, kind=kind), vector, seq)
@@ -453,7 +454,7 @@ class VectorBackendContract(_Contract):
         assert search(k=-1) == []
 
     def test_search_knowledge_visibility_and_id_ties(self, db, vb):
-        rows = [("k1", "personal", "u1", [1.0, 0.0]), ("k2", "personal", "u2", [1.0, 0.0]),
+        rows: list[tuple[str, Scope, str, list[float]]] = [("k1", "personal", "u1", [1.0, 0.0]), ("k2", "personal", "u2", [1.0, 0.0]),
                 ("k3", "team", "t1", [1.0, 0.0]), ("k4", "team", "t2", [1.0, 0.0]),
                 ("k5", "org", "*", [1.0, 0.0]), ("k6", "org", "*", [0.6, 0.8]),
                 ("k7", "org", "*", [0.0, 1.0])]  # fmt: skip
@@ -759,7 +760,7 @@ class _Ticking(_Counting):
     def __init__(self, name):
         super().__init__([])
         self.name = name
-        self.meanwhile = None
+        self.meanwhile: Callable[[], object] | None = None
 
     def tick(self, now, ctx):
         meanwhile, self.meanwhile = self.meanwhile, None
@@ -986,10 +987,11 @@ class DatabaseContract:
     def test_duplicate_ticks_apply_once(self, open_db):
         """Two processes tick from the same cursor and epoch; both engines decide,
         only the first commit lands (the epoch moved), the other is dropped."""
-        a = self.runtime(open_db, _Ticking("a"))
+        ticking_a = _Ticking("a")
+        a = self.runtime(open_db, ticking_a)
         b = self.runtime(open_db, _Ticking("b"))
         a.append(ev("e1", "one"))
-        a.engine.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
+        ticking_a.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
         before = len(a.verdicts)  # e1's delivery
 
         a.tick(T0)
@@ -1039,7 +1041,8 @@ class DatabaseContract:
         worker = pool.submit(old.sync)
         try:
             assert entered.wait(10), "observe never started"
-            new = self.runtime(open_db, _Counting([], state_version="2", fail=True))
+            failing = _Counting([], state_version="2", fail=True)
+            new = self.runtime(open_db, failing)
             with pytest.raises(RuntimeError, match="boom"):
                 new.sync()  # resets the state to "2", then its observe fails
         finally:
@@ -1054,7 +1057,7 @@ class DatabaseContract:
             return state.version(), keys
 
         assert consistent() == ("1", ["1/e1"])  # A re-checked its version and delivered on its own
-        new.engine.fail = False
+        failing.fail = False
         assert new.sync() == 1  # B resets again and replays
         assert consistent() == ("2", ["2/e1"])
 
@@ -1088,7 +1091,7 @@ class DatabaseContract:
         assert rt.sync() == 1
 
         assert [k.id for k in open_db().knowledge.all()] == ["k-attempt2"]
-        assert [v.decision.item.id for v in rt.verdicts] == ["k-attempt2"]
+        assert [cast(Promote, v.decision).item.id for v in rt.verdicts] == ["k-attempt2"]
 
     def test_two_engine_versions_resetting_each_other_end_in_state_version_changed(self, open_db):
         """Another version of the engine resets the state each time this one

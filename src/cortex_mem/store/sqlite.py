@@ -422,11 +422,11 @@ class SqliteVectorBackend:
     def __init__(self, db: SqliteDatabase) -> None:
         self.db = db
 
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'meta'")
         return json.loads(rows[0][0]) if rows else None
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM vectors")
             self.db.con.execute("DELETE FROM vector_groups")
@@ -449,7 +449,7 @@ class SqliteVectorBackend:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
         return int(rows[0][0]) if rows else 0
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         found = dict(self.db.query("SELECT key, value FROM vector_meta WHERE key IN ('meta', 'generation', 'indexed')"))
         meta = found.get("meta")
         return (

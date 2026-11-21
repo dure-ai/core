@@ -208,14 +208,14 @@ class InMemoryVectorBackend:
         self._cells: dict[tuple[Scope, str], list[tuple[int, str]]] = {}
         self._cache: dict[tuple[str, str], list[float]] = {}
         self._digests: dict[str, str] = {}
-        self._meta: dict | None = None
+        self._meta: dict[str, Any] | None = None
         self._indexed = 0
         self._generation = 0
 
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         return None if self._meta is None else dict(self._meta)
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         for table in self._vectors.values():
             table.clear()
         self._groups.clear()
@@ -231,7 +231,7 @@ class InMemoryVectorBackend:
     def indexed(self) -> int:
         return self._indexed
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         return self.meta(), self._generation, self._indexed
 
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:
