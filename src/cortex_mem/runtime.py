@@ -12,7 +12,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from .access import audience_sees, event_visible, knowledge_visible
 from .contract import (
@@ -564,7 +564,7 @@ class Runtime:
     def _current(self, id: str, pending: dict[str, Knowledge | None]) -> Knowledge | None:
         found = pending.get(id, _ABSENT)
         if found is not _ABSENT:
-            return found  # type: ignore[return-value]
+            return cast("Knowledge | None", found)
         items = self.knowledge.get([id])
         return items[0] if items else None
 

@@ -4,7 +4,16 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from ..access import owner_for
-from ..contract import Caller, Decision, EngineContext, Event, Handoff, Knowledge, Promote, Scope
+from ..contract import (
+    Caller,
+    Decision,
+    EngineContext,
+    Event,
+    Handoff,
+    Knowledge,
+    Promote,
+    Scope,
+)
 from ..kit import handoff_from_knowledge
 
 

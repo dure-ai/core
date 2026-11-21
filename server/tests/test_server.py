@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 import anyio
@@ -110,10 +111,10 @@ def test_report_outcome_refs_judged_ids():
     m = service(db)
     rid = m.record("deploy uses release tags")["id"]
 
-    oid = m.report_outcome("failure", [rid], text="tag missing", signal="test")["id"]
+    oid = m.report_outcome("failure", [rid], text="tag missing")["id"]
 
     [event] = db.events.get([oid])
-    assert (event.kind, event.outcome, event.signal, event.refs) == ("outcome", "failure", "test", (rid,))
+    assert (event.kind, event.outcome, event.signal, event.refs) == ("outcome", "failure", "self", (rid,))
 
 
 def test_outcome_on_team_knowledge_is_seen_by_the_team_and_demotes_it():
@@ -256,7 +257,7 @@ class DemoteOnFailure:
 class ClockedEngine:
     """Records every tick it gets."""
 
-    ticks: list[datetime] = []
+    ticks: ClassVar[list[datetime]] = []
 
     def __init__(self, config):
         pass
@@ -661,3 +662,18 @@ def test_postgres_service_records_events_and_groups(monkeypatch, tmp_path, pg_sc
         assert group is not None and len(group.members) == 2
     finally:
         svc.db.close()
+
+
+def test_agent_cannot_claim_an_outside_signal(tmp_path):
+    # An agent's report is its own judgement whatever signal it names: a claimed
+    # "test" success would otherwise lift a memory no test ever checked.
+    db = tmp_path / "cortex.db"
+    rid = call(db, "record_episode", {"text": "deploy uses release tags"})["id"]
+
+    report = call(db, "report_outcome", {"outcome": "success", "refs": [rid], "signal": "test"})
+
+    assert report["signal"] == "self"
+    store = SqliteDatabase(db)
+    [event] = store.events.get([report["id"]])
+    store.con.close()
+    assert event.signal == "self"

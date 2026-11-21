@@ -5,7 +5,8 @@ A durable implementation (SQLite, PostgreSQL) passes the contract when it
 passes the suites in cortex_mem.testing.
 """
 
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
@@ -74,7 +75,7 @@ class EngineStateBackend(Protocol):
         expected: int,
         cursor: int,
         writes: Mapping[str, Any],
-        deletes: Set[str],
+        deletes: AbstractSet[str],
         *,
         epoch: int,
     ) -> None:

@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import get_args
+from typing import Any, cast, get_args
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -83,7 +83,7 @@ def _narrow(requested: Scope | None, default: Scope) -> Scope:
 def _scope(value: str) -> Scope:
     if value not in get_args(Scope):
         raise ValueError(f"unknown scope: {value!r}")
-    return value  # type: ignore[return-value]
+    return cast(Scope, value)
 
 
 @dataclass(frozen=True)
@@ -211,7 +211,7 @@ class Service:
         refs: Sequence[str] = (),
         repo: str | None = None,
         rev: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered, pending = self._append(
@@ -227,7 +227,7 @@ class Service:
         k: int = 6,
         repo: str | None = None,
         context: Mapping[str, str] | None = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         caller = self._caller(repo, context)
         handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
         return [
@@ -240,10 +240,9 @@ class Service:
         outcome: Outcome,
         refs: Sequence[str],
         text: str = "",
-        signal: Signal = "self",
         scope: Scope | None = None,
         repo: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
         # The judgement must reach whoever sees the judged item, but the agent's
@@ -251,10 +250,13 @@ class Service:
         redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
         id, delivered, pending = self._append(
             caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
+            # An agent's report is its own judgement, like its records: a test,
+            # review or person must report through another path to count as one.
+            signal="self", refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
         )
         return {
-            "id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered, "pending": pending,
+            "id": id, "scope": effective, "signal": "self", "text_redacted": redacted, "delivered": delivered,
+            "pending": pending,
         }
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
@@ -417,7 +419,7 @@ def record_episode(
     refs: list[str] | None = None,
     repo: str | None = None,
     rev: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Record something learned while working (a fix, a cause, a convention) so
     future sessions can recall it. Who may see it is set by the server for the
     repo; scope can only narrow that (e.g. "personal" for a private note).
@@ -440,7 +442,7 @@ def recall(
     k: int = 6,
     repo: str | None = None,
     context: dict[str, str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Recall memories relevant to the current task. Call before starting work
     that past sessions may have covered. By default searches everything you may
     see (your own, your team's, the org's); scope narrows it. repo and context
@@ -458,19 +460,22 @@ def report_outcome(
     signal: Signal = "self",
     scope: Scope | None = None,
     repo: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Report whether recalled memories (refs = their ids, at least one) helped:
-    "success", "failure", or "unknown". signal says who judged it: "self", "test",
-    "review", "human", or "doc". This is how memories earn or lose trust.
-    By default the judgement (outcome, signal, refs) is visible to whoever can
-    see the judged memories, e.g. the whole org for an org memory; scope can
-    only narrow that. If that is wider than this repo's policy, text is not
-    stored (text_redacted: true). Returns the id, the scope actually used,
-    text_redacted, delivered and pending (delivered false: stored, reaches
-    memory later, pending events wait; do not report it again). pending is an
-    integer, or null when it could not be read (delivered is then false)."""
+    "success", "failure", or "unknown". This is how memories earn or lose trust.
+    The report is stored as your own judgement (signal "self") whatever signal
+    you pass; test, review and human results count only when they report
+    themselves. By default the judgement (outcome, signal, refs) is visible to
+    whoever can see the judged memories, e.g. the whole org for an org memory;
+    scope can only narrow that. If that is wider than this repo's policy, text
+    is not stored (text_redacted: true). Returns the id, the scope and signal
+    actually used, text_redacted, delivered and pending (delivered false:
+    stored, reaches memory later, pending events wait; do not report it again).
+    pending is an integer, or null when it could not be read (delivered is then
+    false)."""
+    del signal  # kept so clients that send it still work; the server sets the signal
     try:
-        return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+        return get_service().report_outcome(outcome, refs, text, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
         raise ToolError(str(exc)) from exc
 

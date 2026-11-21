@@ -6,7 +6,8 @@ import bisect
 import json
 import math
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -159,7 +160,7 @@ class InMemoryStateBackend:
         expected: int,
         cursor: int,
         writes: Mapping[str, Any],
-        deletes: Set[str],
+        deletes: AbstractSet[str],
         *,
         epoch: int,
     ) -> None:

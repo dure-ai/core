@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,7 +14,7 @@ from cortex_mem.testing import (
     f32,
 )
 
-T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
 class TestSqliteEventStore(EventStoreContract):
@@ -355,3 +355,30 @@ def test_a_schema_5_file_without_knowledge_digests_opens(tmp_path):
         db.vectors.put_vector("knowledge", "k1", [0.5], digest="d1")
         assert db.vectors.knowledge_digests() == {"k1": "d1"}
         db.con.close()
+
+
+def test_with_block_closes_the_connection():
+    import sqlite3
+
+    with SqliteDatabase() as db:
+        db.events.append(ev("e1", "x"))
+    with pytest.raises(sqlite3.ProgrammingError):
+        db.con.execute("SELECT 1")
+
+
+def test_old_schema_error_closes_the_connection(tmp_path, monkeypatch):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE events (seq INTEGER PRIMARY KEY, id)")
+    con.commit()
+    con.close()
+    opened = []
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: opened.append(real_connect(*a, **kw)) or opened[-1])
+
+    with pytest.raises(RuntimeError, match="schema"):
+        SqliteDatabase(path)
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")

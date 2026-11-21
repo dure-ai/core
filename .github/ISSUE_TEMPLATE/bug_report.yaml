@@ -1,0 +1,60 @@
+name: Bug report
+description: The engine, a store or the MCP server errors out or gives a wrong result
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        How you ran it (MCP server, the harness, or the library directly), which engine and store,
+        and the calls that lead to the problem. A failing test or a short script is best.
+      placeholder: |
+        1. Start the server with CORTEX_TEAM=payments
+        2. Call record_episode with ...
+        3. Call recall with ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full error message or the result you got. This is rendered as a code block.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The core commit you ran (see `git rev-parse --short HEAD`).
+      placeholder: e.g. daaba07
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version and operating system (see `uv run python --version` and `uname -orsm`).
+      placeholder: e.g. Python 3.12.6, macOS 15 arm64
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps, such as a suspected cause or related issues and PRs.
+    validations:
+      required: false
