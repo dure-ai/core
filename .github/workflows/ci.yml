@@ -23,4 +23,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - run: uv run pytest -q
+      # Lint and type checks run once, on the lowest supported version (pyproject targets 3.12).
+      - if: matrix.python == '3.12'
+        run: uv run ruff check src server/src tests server/tests conftest.py
+      - if: matrix.python == '3.12'
+        run: uv run basedpyright src server/src
+      - run: uv run pytest -q -W error

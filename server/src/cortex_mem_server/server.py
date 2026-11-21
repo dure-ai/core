@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import get_args
+from typing import Any, cast, get_args
 from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
@@ -61,7 +61,7 @@ def _narrow(requested: Scope | None, default: Scope) -> Scope:
 def _scope(value: str) -> Scope:
     if value not in get_args(Scope):
         raise ValueError(f"unknown scope: {value!r}")
-    return value  # type: ignore[return-value]
+    return cast(Scope, value)
 
 
 @dataclass(frozen=True)
@@ -177,7 +177,7 @@ class Service:
         refs: Sequence[str] = (),
         repo: str | None = None,
         rev: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered = self._append(
@@ -193,7 +193,7 @@ class Service:
         k: int = 6,
         repo: str | None = None,
         context: Mapping[str, str] | None = None,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         caller = self._caller(repo, context)
         handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
         return [
@@ -209,7 +209,7 @@ class Service:
         signal: Signal = "self",
         scope: Scope | None = None,
         repo: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
         # The judgement must reach whoever sees the judged item, but the agent's
@@ -287,7 +287,7 @@ def record_episode(
     refs: list[str] | None = None,
     repo: str | None = None,
     rev: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Record something learned while working (a fix, a cause, a convention) so
     future sessions can recall it. Who may see it is set by the server for the
     repo; scope can only narrow that (e.g. "personal" for a private note).
@@ -307,7 +307,7 @@ def recall(
     k: int = 6,
     repo: str | None = None,
     context: dict[str, str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Recall memories relevant to the current task. Call before starting work
     that past sessions may have covered. By default searches everything you may
     see (your own, your team's, the org's); scope narrows it. repo and context
@@ -325,7 +325,7 @@ def report_outcome(
     signal: Signal = "self",
     scope: Scope | None = None,
     repo: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Report whether recalled memories (refs = their ids, at least one) helped:
     "success", "failure", or "unknown". signal says who judged it: "self", "test",
     "review", "human", or "doc". This is how memories earn or lose trust.

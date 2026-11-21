@@ -1,13 +1,25 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from cortex_mem.contract import Caller, Demote, Engine, EngineFactory, Event, Handoff, Knowledge
+from cortex_mem.contract import (
+    Caller,
+    Demote,
+    Engine,
+    EngineFactory,
+    Event,
+    Handoff,
+    Knowledge,
+)
 from cortex_mem.engines.baseline import NoMemoryEngine, PromoteAllEngine
 from cortex_mem.runtime import Runtime
-from cortex_mem.store.memory import InMemoryEventStore, InMemoryKnowledgeBase, InMemoryStateBackend
+from cortex_mem.store.memory import (
+    InMemoryEventStore,
+    InMemoryKnowledgeBase,
+    InMemoryStateBackend,
+)
 
-T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 19, tzinfo=UTC)
 FACTORIES: list[EngineFactory] = [NoMemoryEngine, PromoteAllEngine]
 
 

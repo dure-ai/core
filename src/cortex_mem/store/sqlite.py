@@ -17,11 +17,12 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Collection, Iterator, Mapping, Set
+from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
 from os import PathLike
-from typing import Any
+from typing import Any, Self
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from .base import CursorConflict
@@ -63,7 +64,7 @@ def _match(query: str) -> str | None:
     return " OR ".join(terms) or None
 
 
-def _row_to_event(row: tuple) -> Event:
+def _row_to_event(row: tuple[Any, ...]) -> Event:
     id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
     return Event(
         id=id, kind=kind, at=datetime.fromisoformat(at), user=user, team=team, session=session,
@@ -73,7 +74,7 @@ def _row_to_event(row: tuple) -> Event:
     )
 
 
-def _row_to_knowledge(row: tuple) -> Knowledge:
+def _row_to_knowledge(row: tuple[Any, ...]) -> Knowledge:
     id, kind, title, body, scope, owner, sources, conditions = row
     return Knowledge(
         id=id, kind=kind, title=title, body=body, scope=scope, owner=owner,
@@ -87,10 +88,24 @@ class SqliteDatabase:
         self.con = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._lock = threading.RLock()
         self._depth = 0
-        self.con.execute("PRAGMA busy_timeout = 5000")
-        self._create()
+        try:
+            self.con.execute("PRAGMA busy_timeout = 5000")
+            self._create()
+        except BaseException:
+            self.con.close()  # e.g. an old schema: do not leave the file open
+            raise
         self.events = SqliteEventStore(self)
         self.knowledge = SqliteKnowledgeBase(self)
+
+    def close(self) -> None:
+        """Close the connection; the stores cannot be used afterwards."""
+        self.con.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _create(self) -> None:
         version = self.con.execute("PRAGMA user_version").fetchone()[0]
@@ -142,7 +157,7 @@ class SqliteDatabase:
             if outer:
                 self.con.execute("COMMIT")
 
-    def query(self, sql: str, params: Any = ()) -> list[tuple]:
+    def query(self, sql: str, params: Any = ()) -> list[tuple[Any, ...]]:
         with self._lock:
             return self.con.execute(sql, params).fetchall()
 
@@ -304,7 +319,7 @@ class SqliteStateBackend:
         return rows[0][0] if rows else 0
 
     def commit(
-        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: Set[str]
+        self, expected: int, cursor: int, writes: Mapping[str, Any], deletes: AbstractSet[str]
     ) -> None:
         encoded = {key: json.dumps(value) for key, value in writes.items()}
         with self.db.transaction():

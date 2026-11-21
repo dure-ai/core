@@ -11,19 +11,19 @@ DatabaseContract runs the runtime over a whole Database, so delivery
 Needs pytest; import it from tests only.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
-from .contract import Caller, Event, Knowledge, Promote
+from .contract import Caller, Event, Kind, Knowledge, Promote, Scope
 from .runtime import Runtime
 from .store.base import CursorConflict
 
-T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
-def ev(id, text="", kind="record", user="u1", team="t1", scope="personal"):
+def ev(id, text="", kind: Kind = "record", user="u1", team="t1", scope: Scope = "personal"):
     return Event(id=id, kind=kind, at=T0, user=user, team=team, session="s1", scope=scope, text=text)
 
 
@@ -31,7 +31,7 @@ def caller(user="u1", team="t1"):
     return Caller(user=user, team=team, session="s2", at=T0)
 
 
-def item(id, body="deploy uses tags", scope="team", owner="t1"):
+def item(id, body="deploy uses tags", scope: Scope = "team", owner="t1"):
     return Knowledge(id=id, kind="knowledge", title=id, body=body, scope=scope, owner=owner, sources=("e1",))
 
 
