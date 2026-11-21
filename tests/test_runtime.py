@@ -179,6 +179,52 @@ def test_max_failures_must_allow_one_attempt(max_failures):
                 max_failures=max_failures)
 
 
+class _FailsOn(Scripted):
+    def __init__(self, bad):
+        super().__init__()
+        self.bad = bad
+
+    def observe(self, event, ctx):
+        super().observe(event, ctx)
+        if event.id == self.bad:
+            raise RuntimeError("boom")
+        return []
+
+
+def test_skip_is_recorded_only_after_its_commit_succeeds():
+    state = InMemoryStateBackend()
+    rt = Runtime(_FailsOn("e1"), InMemoryEventStore(), InMemoryKnowledgeBase(), state, max_failures=1)
+    real_commit = state.commit
+
+    def down(*args, **kw):
+        raise OSError("store is down")
+
+    state.commit = down
+    with pytest.raises(OSError, match="store is down"):
+        rt.append(ev("e1"))
+    assert (state.cursor(), rt.skipped) == (0, [])  # not skipped, so not reported as skipped
+
+    state.commit = real_commit
+    rt.sync()
+    assert state.cursor() == 1
+    assert [(s.event_id, s.attempts) for s in rt.skipped] == [("e1", 2)]
+
+
+def test_skip_lost_to_another_process_is_not_reported():
+    state = InMemoryStateBackend()
+    rt = Runtime(_FailsOn("e1"), InMemoryEventStore(), InMemoryKnowledgeBase(), state, max_failures=1)
+    real_commit = state.commit
+
+    def first(expected, *args, **kw):
+        state.commit = real_commit
+        real_commit(expected, 1, {}, set(), epoch=kw["epoch"])  # another process moves past e1 first
+        return real_commit(expected, *args, **kw)
+
+    state.commit = first
+    rt.append(ev("e1"))
+    assert (state.cursor(), rt.skipped) == (1, [])
+
+
 def test_oversized_state_value_is_refused():
     class Hoarder(Scripted):
         def observe(self, event, ctx):
@@ -375,8 +421,8 @@ def test_each_delivery_runs_in_its_own_transaction():
     rt.events.append(ev("e2"))
     rt.sync()
 
-    # two deliveries, then one more transaction that finds nothing to deliver
-    assert log == ["begin", "commit", "begin", "commit", "begin", "commit"]
+    # two deliveries; finding nothing more to deliver is a read without a transaction
+    assert log == ["begin", "commit", "begin", "commit"]
 
 
 def test_event_delivered_by_another_process_is_not_applied_twice():
@@ -396,3 +442,100 @@ def test_event_delivered_by_another_process_is_not_applied_twice():
 
     assert [i.id for i in kb.all()] == ["k-e1"]  # only the winner's decision
     assert state.cursor() == 1 and rt.rejections == []
+
+
+def test_runtime_looking_keys_are_ordinary_without_an_index():
+    class Peeks(Scripted):
+        def observe(self, event, ctx):
+            self.keys = [k for k, _ in ctx.state.scan()]
+            self.value = ctx.state.get("_runtime/index")
+            ctx.state.put("_runtime/index", "mine")
+            ctx.state.delete("_runtime/other")
+            ctx.state.put("n", 1)
+            return []
+
+    state = InMemoryStateBackend()
+    state.commit(0, 0, {"_runtime/index": "theirs", "_runtime/other": 2}, set(), epoch=state.epoch())
+    engine = Peeks()
+    rt = runtime(engine, state=state)
+    rt.append(ev("e1"))
+    assert engine.keys == ["_runtime/index", "_runtime/other"] and engine.value == "theirs"
+    assert dict(rt.state.scan()) == {"_runtime/index": "mine", "n": 1}
+
+
+def test_a_tick_with_nothing_to_commit_does_not_move_the_epoch():
+    rt = runtime(Scripted())
+    rt.append(ev("e1"))
+    epoch = rt.state.epoch()
+
+    rt.tick(T0)
+    assert rt.state.epoch() == epoch  # no decisions, no state writes: no commit
+
+    class Writes(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.put("ticked", True)
+            return []
+
+    writer = runtime(Writes(), rt.events, rt.knowledge, rt.state)
+    writer.tick(T0)
+    assert rt.state.epoch() == epoch + 1 and rt.state.get("ticked") is True
+
+
+def test_failure_counts_for_events_delivered_elsewhere_are_dropped():
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    flaky = Runtime(_FailsOn("e1"), events, kb, state, max_failures=3)
+    with pytest.raises(RuntimeError):
+        flaky.append(ev("e1"))
+    assert flaky._failures == {1: 1}
+
+    runtime(Scripted(), events, kb, state).sync()  # another process delivers e1
+    flaky.sync()
+
+    assert flaky._failures == {}
+
+
+def test_a_tick_that_only_deletes_state_commits():
+    class Forgets(Scripted):
+        def tick(self, now, ctx):
+            ctx.state.delete("old")
+            return []
+
+    state = InMemoryStateBackend()
+    state.commit(0, 0, {"old": 1}, set(), epoch=state.epoch())
+    rt = runtime(Forgets(), state=state)
+    epoch = state.epoch()
+
+    rt.tick(T0)
+
+    assert state.get("old") is None and state.epoch() == epoch + 1
+
+
+# ── a new engine version replays into an emptied knowledge base ─────────────
+
+
+def test_a_new_engine_version_replays_into_an_emptied_knowledge_base():
+    class V1(Scripted):
+        state_version = "1"
+
+    class V2(Scripted):
+        state_version = "2"
+
+    def mine(id, source, body="deploy uses tags"):
+        return item(id, (source,), scope="personal", owner="u1", body=body)
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    rt = runtime(V1({"e1": [Promote(mine("k1", "e1"))], "e2": [Promote(mine("k2", "e2"))]}), events, kb, state)
+    rt.append(ev("e1"))
+    rt.append(ev("e2"))
+    assert [k.id for k in kb.all()] == ["k1", "k2"]
+
+    # The new version no longer promotes k2: without emptying, k2 would stay
+    # with no engine state left to demote it. The store empties in one step.
+    removed = []
+    real_remove = kb.remove
+    kb.remove = lambda id: (removed.append(id), real_remove(id))
+    v2 = V2({"e1": [Promote(mine("k1", "e1", body="restated"))]})
+    assert runtime(v2, events, kb, state).sync() == 2
+    assert removed == []
+    assert v2.seen == ["e1", "e2"]
+    assert [(k.id, k.body) for k in kb.all()] == [("k1", "restated")]

@@ -13,8 +13,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+
 [dependency-groups]
-dev = ["pytest>=8", "cortex-mem-server", "ruff==0.17.4", "basedpyright==1.40.2"]
+dev = ["pytest>=8", "cortex-mem-server", "psycopg[binary]>=3.2,<4", "ruff==0.17.4", "basedpyright==1.40.2"]
 
 [build-system]
 requires = ["hatchling"]
@@ -31,6 +34,7 @@ cortex-mem-server = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "server/tests"]
+pythonpath = ["tests"]
 
 # Check against the lowest supported Python so newer-only syntax is caught.
 [tool.ruff]

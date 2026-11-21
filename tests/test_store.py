@@ -11,6 +11,7 @@ from cortex_mem.testing import (
     EngineStateBackendContract,
     EventStoreContract,
     KnowledgeStoreContract,
+    VectorBackendContract,
 )
 
 
@@ -29,7 +30,14 @@ class TestInMemoryStateBackend(EngineStateBackendContract):
         return InMemoryStateBackend()
 
 
+class TestInMemoryVectorBackend(VectorBackendContract):
+    def make(self):
+        return InMemoryDatabase()
+
+
 class TestInMemoryDatabase(DatabaseContract):
+    rolls_back = False  # one process, transaction() is nullcontext
+
     def make(self, tmp_path):
         db = InMemoryDatabase()
         return lambda: db

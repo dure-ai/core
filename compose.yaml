@@ -1,0 +1,11 @@
+# Local PostgreSQL + pgvector for the store tests:
+#   docker compose up -d pg
+#   CORTEX_TEST_PG_URL=postgresql://postgres:cortex@localhost:54329/postgres uv run python -m pytest -q
+services:
+  pg:
+    image: pgvector/pgvector:pg17
+    ports:
+      - "127.0.0.1:54329:5432"
+    environment:
+      # Local tests only. Never reuse this value anywhere real.
+      POSTGRES_PASSWORD: cortex
