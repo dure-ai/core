@@ -185,7 +185,6 @@ class UpstageEmbedder:
         self.timeout = timeout
         self.batch = max(1, batch)
         self._dim: int | None = None
-        self._working: set[str] = set()  # models that have answered in this process
 
     @property
     def dim(self) -> int:
@@ -202,9 +201,10 @@ class UpstageEmbedder:
         """Embed texts in batches with the model matching kind.
 
         A single text answered with a status in REJECTING raises
-        EmbeddingRejected once the model is known to work: it has answered
-        before in this process, or it answers the PROBE text now. Otherwise,
-        and for a batch of several texts, the error is an EmbeddingError."""
+        EmbeddingRejected only if the model answers the PROBE text right
+        after: a model that answered before can be retired, or the request
+        format change, and then every text would be refused. Otherwise, and
+        for a batch of several texts, the error is an EmbeddingError."""
         model = self.passage_model if kind == "passage" else self.query_model
         out: list[list[float]] = []
         for i in range(0, len(texts), self.batch):
@@ -218,9 +218,7 @@ class UpstageEmbedder:
         return out
 
     def _works(self, model: str) -> bool:
-        """Whether `model` has embedded something in this process, or embeds PROBE now."""
-        if model in self._working:
-            return True
+        """Whether `model` embeds PROBE now."""
         try:
             self._post(model, [self.PROBE])
         except EmbeddingError:
@@ -287,7 +285,6 @@ class UpstageEmbedder:
             raise EmbeddingError("embedding response has empty or inconsistent vector lengths")
         if self._dim is None and vectors:
             self._dim = width
-        self._working.add(model)
         return vectors
 
 
