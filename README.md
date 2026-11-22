@@ -61,10 +61,21 @@ claude mcp add cortex-mem -s local -e CORTEX_REPO=acme/api -e CORTEX_TEAM=paymen
 
 ## 예시: 테스트 실패가 기억을 강등한다
 
-[examples/failure_demotes.py](examples/failure_demotes.py)는 서버 프로세스 셋(세션 셋)이 SQLite 파일 하나를 함께 쓰며, 낡은 명령을 담은 기억이 테스트 실패 뒤 다음 `recall`에서 빠지는 흐름을 보인다. 에이전트는 `recall`만 하고, 기억에 대한 판정(`report_outcome`, `signal="test"`)은 에이전트가 아니라 테스트 단계가 보고한다.
+[examples/failure_demotes.py](examples/failure_demotes.py)는 서버 프로세스 셋(세션 셋)이 SQLite 파일 하나를 함께 쓰며, 낡은 명령을 담은 기억이 테스트 실패 뒤 다음 `recall`에서 빠지는 흐름을 보인다.
+
+1. alice가 낡은 명령(`dure cache --purge`)과 아직 맞는 팁(`dure cache stats`)을 기록한다.
+2. bob의 에이전트가 `recall`로 둘 다 받고, 낡은 명령으로 답한 뒤 `record_episode`로 답을 기록한다. 이때 `refs`에 따른 기억의 id를 적는다.
+3. 테스트 단계가 그 답을 실행하고, 실패를 답 기록과 `refs`의 기억에만 `report_outcome`으로 보고한다. 에이전트는 판정하지 않는다.
+4. carol이 다시 `recall`하면 낡은 명령은 빠지고, 인용되지 않은 팁은 남는다.
+
+데모의 테스트 단계는 MCP 서버를 거쳐 보고하므로 판정은 `signal="self"`로 저장된다. 엔진은 실패 보고면 신호와 상관없이 강등한다. 진짜 `test` 신호는 MCP 밖의 입력 경로(CI 명령 등)가 생기면 쓴다.
+
+core 폴더에서 실행한다. 마지막 줄이 `RESULT: PASS ...`이면 성공이다.
 
 ```bash
 uv run python examples/failure_demotes.py                       # 모델 없이
 OPENAI_API_KEY=... OPENAI_BASE_URL=https://api.upstage.ai/v1 \
   uv run --with openai python examples/failure_demotes.py --mode llm --model solar-pro4
 ```
+
+모델 모드(`--mode llm`)만 API 키와 `--with openai`가 필요하고, 호출 비용이 든다. solar-pro4로 한 번 돌리면 3턴, 입력 약 3,300 / 출력 약 100 토큰이다.
