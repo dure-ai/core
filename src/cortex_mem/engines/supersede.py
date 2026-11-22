@@ -16,12 +16,12 @@ and a verdict's text is not an item.
 Nothing is demoted for losing: the loser may be right again under another
 query or after the winner fails, and handoff is the only place it shows.
 
-Topic grouping is a stand-in until embedding similarity (pgvector) replaces
-`_same_topic`: the share of the shorter item's words found in the other. BM25
-does not work here, because words both items share get a low IDF and only the
-words that differ score. On the harness dev set, records within one scenario
-had a median overlap of 0.35-0.50 and records from different scenarios 0.14
-(p90 0.29), hence 0.3. Different topics in one repo will overlap more.
+With embeddings enabled, records compete only when the Core index puts their
+source events in the same group. A source without a group does not compete.
+Without embeddings, the topic test is the share of the shorter item's words
+found in the other. On the harness dev set, records within one scenario had
+a median overlap of 0.35-0.50 and those from different scenarios 0.14
+(p90 0.29), hence 0.3. Different topics in one repo can overlap more.
 """
 
 import re
@@ -45,7 +45,12 @@ class SupersedeEngine(EvidenceEngine):
         ]
         rank = {item.id: ctx.state.get(_rank_key(item.id)) or SELF for item in hits}
         at = {e.id: e.at for e in ctx.events.get([item.sources[0] for item in hits])}
-        words = {item.id: set(_WORD.findall(item.body.lower())) for item in hits}
+        similar = ctx.similar
+        groups = {
+            item.id: group.id for item in hits
+            if (group := similar.group(item.sources[0])) is not None
+        } if similar is not None else {}
+        words = {item.id: set(_WORD.findall(item.body.lower())) for item in hits} if similar is None else {}
 
         def hides(winner: Knowledge, other: Knowledge) -> bool:
             if rank[winner.id] == SELF or other.id == winner.id or other.conditions != winner.conditions:
@@ -54,6 +59,8 @@ class SupersedeEngine(EvidenceEngine):
                 rank[other.id] <= rank[winner.id] and at[other.sources[0]] < at[winner.sources[0]]
             ):
                 return False
+            if similar is not None:
+                return winner.id in groups and groups[winner.id] == groups.get(other.id)
             return _same_topic(words[winner.id], words[other.id])
 
         kept = [item for item in hits if not any(hides(winner, item) for winner in hits)]
