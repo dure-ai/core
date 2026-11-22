@@ -114,14 +114,14 @@ def test_schema_2_file_gains_text_redacted(tmp_path):
 
     db = SqliteDatabase(path)
 
-    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 6
     [old] = db.events.get(["e1"])
     assert (old.text, old.text_redacted) == ("old", False)
     db.events.append(ev("e2", "new"))
     assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
 
 
-def test_schema_3_file_migrates_to_5_and_keeps_events(tmp_path):
+def test_schema_3_file_migrates_to_6_and_keeps_events(tmp_path):
     import sqlite3
 
     path = tmp_path / "old.db"
@@ -148,7 +148,7 @@ def test_schema_3_file_migrates_to_5_and_keeps_events(tmp_path):
 
     db = SqliteDatabase(path)
 
-    assert db.query("PRAGMA user_version")[0][0] == 5
+    assert db.query("PRAGMA user_version")[0][0] == 6
     assert [e.id for e in db.events.get(["e1"])] == ["e1"]
     db.vectors.put_vector("event", "e1", [1.0])
     assert db.vectors.vector("event", "e1") == [1.0]
@@ -166,7 +166,7 @@ def test_schema_4_file_drops_its_float64_vectors_and_cache_and_reembeds(tmp_path
     from cortex_mem.runtime import Runtime
 
     path = tmp_path / "v4.db"
-    SqliteDatabase(path).con.close()  # the tables are the same in 4 and 5; only the BLOB format changed
+    SqliteDatabase(path).con.close()  # the tables are those of this layout of 4; only the BLOB format changed
     text = "deploy uses tags"
     old = HashEmbedder().embed([text], "passage")[0]
     con = sqlite3.connect(path)
@@ -189,7 +189,7 @@ def test_schema_4_file_drops_its_float64_vectors_and_cache_and_reembeds(tmp_path
 
     db = SqliteDatabase(path)
 
-    assert db.query("PRAGMA user_version")[0][0] == 5
+    assert db.query("PRAGMA user_version")[0][0] == 6
     for table in ("embed_cache", "vectors", "vector_groups", "vector_meta"):
         assert db.query(f"SELECT count(*) FROM {table}") == [(0,)], table
     assert [e.id for e in db.events.get(["e1"])] == ["e1"]  # events stay
@@ -382,3 +382,76 @@ def test_old_schema_error_closes_the_connection(tmp_path, monkeypatch):
         SqliteDatabase(path)
     with pytest.raises(sqlite3.ProgrammingError):
         opened[0].execute("SELECT 1")
+
+
+def test_schema_3_file_is_reindexed_with_the_current_tokens(tmp_path):
+    path = tmp_path / "v3.db"
+    db = SqliteDatabase(path)
+    db.events.append(ev("e1", "pytest가 실패했다"))
+    db.knowledge.put(Knowledge(id="k1", kind="knowledge", title="t", body="pytest가 실패했다",
+                               scope="personal", owner="u1", sources=("e1",)))
+    # Rewrite the index rows the way schema 3 tokenized them: a Latin word kept its Korean particle.
+    db.con.execute("UPDATE events_fts SET words = 'pytest가 실패했다'")
+    db.con.execute("UPDATE knowledge_fts SET words = 't pytest가 실패했다'")
+    db.con.execute("PRAGMA user_version = 3")
+    db.con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert [e.id for e, _ in db.events.search("pytest", caller(), "personal")] == ["e1"]
+    assert [k.id for k, _ in db.knowledge.search("pytest", caller(), "personal")] == ["k1"]
+    db.con.close()
+
+
+def _write_old_tokens(path, version: int) -> None:
+    """A file of `version` whose search rows hold words tokenized the old way: a Latin word kept its
+    Korean particle."""
+    db = SqliteDatabase(path)
+    db.events.append(ev("e1", "pytest가 실패했다"))
+    db.knowledge.put(Knowledge(id="k1", kind="knowledge", title="t", body="pytest가 실패했다",
+                               scope="personal", owner="u1", sources=("e1",)))
+    db.con.execute("UPDATE events_fts SET words = 'pytest가 실패했다'")
+    db.con.execute("UPDATE knowledge_fts SET words = 't pytest가 실패했다'")
+    db.con.execute(f"PRAGMA user_version = {version}")
+    db.con.close()
+
+
+def test_a_schema_4_file_from_main_opens_as_6_and_is_reindexed(tmp_path):
+    """main's schema 4 is a reindexed schema-3 file with no vector tables: it opens, gains them,
+    and its search rows are rebuilt with the current tokens."""
+    import sqlite3
+
+    path = tmp_path / "main-v4.db"
+    _write_old_tokens(path, 3)
+    con = sqlite3.connect(path)
+    for table in ("vectors", "vector_groups", "embed_cache", "vector_meta"):
+        con.execute(f"DROP TABLE {table}")
+    con.execute("PRAGMA user_version = 4")
+    con.commit()
+    con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert [e.id for e, _ in db.events.search("pytest", caller(), "personal")] == ["e1"]
+    assert [k.id for k, _ in db.knowledge.search("pytest", caller(), "personal")] == ["k1"]
+    db.vectors.put_vector("event", "e1", [1.0])
+    assert db.vectors.vector("event", "e1") == [1.0]
+    db.con.close()
+
+
+def test_a_schema_5_file_keeps_its_float32_vectors_and_is_reindexed(tmp_path):
+    path = tmp_path / "v5.db"
+    _write_old_tokens(path, 5)
+    db = SqliteDatabase(path)
+    db.vectors.put_vector("event", "e1", [0.5, 0.25])
+    db.con.execute("PRAGMA user_version = 5")
+    db.con.close()
+
+    db = SqliteDatabase(path)
+
+    assert db.con.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert db.vectors.vector("event", "e1") == [0.5, 0.25]
+    assert [e.id for e, _ in db.events.search("pytest", caller(), "personal")] == ["e1"]
+    db.con.close()

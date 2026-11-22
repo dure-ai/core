@@ -29,7 +29,7 @@ from ..embed import QueryScorer, float32, top_by_cosine
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's write lock
 
 _EVENT_COLUMNS = (
@@ -96,17 +96,19 @@ class SqliteDatabase:
                 self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
                 self.con.execute("PRAGMA user_version = 3")
             version = 3
-        if has_tables and version == 4:
-            # 4 -> 5: vectors and the embedding cache became float32 BLOBs (contract
-            # 0.3.0). The float64 ones would read back as garbage of twice the length,
-            # so drop them all; the next sync rebuilds the index and embeds again.
+        # Schema 4 means two layouts. On main it is a schema-3 file reindexed with words split at
+        # Hangul boundaries, with no vector tables. On feat/core-embedding before 5 it held float64
+        # vector BLOBs, which would read back as float32 garbage of twice the length; only that
+        # layout has a `vectors` table, so only then are the vector tables emptied and re-embedded.
+        if has_tables and version == 4 and self._has_table("vectors"):
             with self.transaction():
                 for table in ("embed_cache", "vectors", "vector_groups", "vector_meta"):
-                    self.con.execute(f"DELETE FROM {table}")
-                self.con.execute("PRAGMA user_version = 5")
-            version = 5
-        # 3 -> 5 only adds the vector tables (3 has none), which the CREATE IF NOT EXISTS below makes.
-        if has_tables and version not in (3, SCHEMA_VERSION):
+                    if self._has_table(table):
+                        self.con.execute(f"DELETE FROM {table}")
+        # 3, 4 and 5 -> 6: search words split at Hangul boundaries, so the search indexes are
+        # rebuilt below once the tables exist. Files without vector tables gain them there.
+        reindex = has_tables and version in (3, 4, 5)
+        if has_tables and version not in (3, 4, 5, SCHEMA_VERSION):
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
             self.con.execute(
@@ -148,6 +150,8 @@ class SqliteDatabase:
             # vectors.digest. CREATE IF NOT EXISTS keeps an old table as it is.
             self._add_column("engine_cursor", "epoch", "INTEGER NOT NULL DEFAULT 0")
             self._add_column("vectors", "digest", "TEXT")
+            if reindex:
+                self._reindex()
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _add_column(self, table: str, column: str, definition: str) -> None:
@@ -155,6 +159,25 @@ class SqliteDatabase:
         columns = {row[1] for row in self.con.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             self.con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _has_table(self, name: str) -> bool:
+        return self.con.execute("SELECT count(*) FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0] > 0
+
+    def _reindex(self) -> None:
+        """Rebuild both search indexes from the stored text with the current tokens."""
+        self.con.execute("DELETE FROM events_fts")
+        for seq, text in self.con.execute("SELECT seq, text FROM events").fetchall():
+            self.con.execute(
+                "INSERT INTO events_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (seq, " ".join(words(text)), " ".join(bigrams(text))),
+            )
+        self.con.execute("DELETE FROM knowledge_fts")
+        for rowid, title, body in self.con.execute("SELECT rowid, title, body FROM knowledge").fetchall():
+            text = f"{title} {body}"
+            self.con.execute(
+                "INSERT INTO knowledge_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (rowid, " ".join(words(text)), " ".join(bigrams(text))),
+            )
 
     def state(self, engine: str) -> "SqliteStateBackend":
         return SqliteStateBackend(self, engine)
