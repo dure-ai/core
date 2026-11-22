@@ -16,4 +16,4 @@ commit body, so write the title as `type(scope): description` (for example
 
 - [ ] Tests added or updated
 - [ ] Docs updated (if behavior or the port contract changed)
-- [ ] AI assistance was used to create this PR (tool: )
+- [ ] AI assistance was used to create this PR (tool: ) ([AI policy](https://github.com/dure-ai/core/blob/main/CONTRIBUTING.md#use-of-ai))
