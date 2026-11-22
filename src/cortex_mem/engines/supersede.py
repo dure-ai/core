@@ -6,8 +6,9 @@ item and every older item of its rank or lower. A newer checked record pushes
 out an older one without anyone naming it, which is how a rule goes stale when
 nobody says so. Self records never hide anything, since who wrote last is not
 evidence, and an older item never hides a newer one, even when it is better
-checked: a confirmed rule can go stale too. Items with different conditions
-never compete; the caller's context already filters those. What is left is
+checked: a confirmed rule can go stale too. Items with different conditions,
+or a different scope or owner, never compete: a personal record must not hide
+a team one from the rest of the team. What is left is
 ranked and cut to k as in EvidenceEngine.
 
 Verdicts work as in EvidenceEngine: refs name what was judged (contract 3-2),
@@ -54,6 +55,8 @@ class SupersedeEngine(EvidenceEngine):
 
         def hides(winner: Knowledge, other: Knowledge) -> bool:
             if rank[winner.id] == SELF or other.id == winner.id or other.conditions != winner.conditions:
+                return False
+            if (other.scope, other.owner) != (winner.scope, winner.owner):
                 return False
             if rank[other.id] != SELF and not (
                 rank[other.id] <= rank[winner.id] and at[other.sources[0]] < at[winner.sources[0]]

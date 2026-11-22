@@ -225,3 +225,11 @@ def test_known_limit_a_short_checked_note_does_not_hide_the_answer():
     rt.append(ev("flaky", "the tests are flaky on CI", signal="test", minutes=5))
 
     assert "k-howto" in ask(rt, "how to run the backend tests")
+
+
+def test_words_do_not_allow_a_personal_record_to_hide_a_team_record():
+    rt = runtime()
+    rt.append(ev("team", OLD, signal="test"))
+    rt.append(ev("personal", NEW, user="u9", scope="personal", signal="test", minutes=1))
+
+    assert set(ask(rt, "how to run the backend tests")) == {"k-team", "k-personal"}
