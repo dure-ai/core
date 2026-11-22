@@ -188,7 +188,7 @@ class InMemoryStateBackend:
     def position(self) -> tuple[int, int, str | None]:
         return self._epoch, self._cursor, self._version
 
-    def reset(self, version: str) -> None:
+    def reset(self, version: str | None) -> None:
         self._data.clear()
         self._cursor = 0
         self._epoch += 1

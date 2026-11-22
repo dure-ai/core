@@ -421,8 +421,13 @@ def test_each_delivery_runs_in_its_own_transaction():
     rt.events.append(ev("e2"))
     rt.sync()
 
-    # two deliveries; finding nothing more to deliver is a read without a transaction
-    assert log == ["begin", "commit", "begin", "commit"]
+    # the knowledge base's owner is recorded once, then two deliveries; finding nothing more to
+    # deliver is a read without a transaction
+    assert log == ["begin", "commit", "begin", "commit", "begin", "commit"]
+    log.clear()
+    rt.events.append(ev("e3"))
+    rt.sync()
+    assert log == ["begin", "commit"]  # later syncs do not record the owner again
 
 
 def test_event_delivered_by_another_process_is_not_applied_twice():
@@ -464,19 +469,24 @@ def test_runtime_looking_keys_are_ordinary_without_an_index():
 
 
 def test_a_tick_with_nothing_to_commit_does_not_move_the_epoch():
-    rt = runtime(Scripted())
+    class MayWrite(Scripted):
+        writes = False
+
+        def tick(self, now, ctx):
+            if self.writes:
+                ctx.state.put("ticked", True)
+            return []
+
+    rt = runtime(MayWrite())
     rt.append(ev("e1"))
     epoch = rt.state.epoch()
 
     rt.tick(T0)
     assert rt.state.epoch() == epoch  # no decisions, no state writes: no commit
 
-    class Writes(Scripted):
-        def tick(self, now, ctx):
-            ctx.state.put("ticked", True)
-            return []
-
-    writer = runtime(Writes(), rt.events, rt.knowledge, rt.state)
+    engine = MayWrite()
+    engine.writes = True
+    writer = runtime(engine, rt.events, rt.knowledge, rt.state)  # the same engine in another process
     writer.tick(T0)
     assert rt.state.epoch() == epoch + 1 and rt.state.get("ticked") is True
 
@@ -488,7 +498,7 @@ def test_failure_counts_for_events_delivered_elsewhere_are_dropped():
         flaky.append(ev("e1"))
     assert flaky._failures == {1: 1}
 
-    runtime(Scripted(), events, kb, state).sync()  # another process delivers e1
+    runtime(_FailsOn("none"), events, kb, state).sync()  # another process, same engine, delivers e1
     flaky.sync()
 
     assert flaky._failures == {}

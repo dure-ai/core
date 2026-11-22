@@ -108,9 +108,9 @@ class EngineStateBackend(Protocol):
         before it commits, at the cost of one round trip."""
         ...
 
-    def reset(self, version: str) -> None:
-        """Drop every key, move the cursor back to 0, record `version` and
-        add 1 to the epoch."""
+    def reset(self, version: str | None) -> None:
+        """Drop every key, move the cursor back to 0, record `version` (None:
+        an engine with no state_version) and add 1 to the epoch."""
         ...
 
 

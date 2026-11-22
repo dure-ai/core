@@ -710,7 +710,7 @@ class PgStateBackend:
         rows = self.db.query("SELECT epoch, cursor, version FROM engine_cursor WHERE engine = %s", (self.engine,))
         return (rows[0][0], rows[0][1], rows[0][2]) if rows else (0, 0, None)
 
-    def reset(self, version: str) -> None:
+    def reset(self, version: str | None) -> None:
         with self.db.transaction():
             con = self.db.con
             con.execute("DELETE FROM engine_state WHERE engine = %s", (self.engine,))

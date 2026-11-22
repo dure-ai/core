@@ -784,10 +784,11 @@ def test_an_engine_without_a_state_version_is_checked_when_an_index_is_present()
     assert runtime(replayed, db, threshold=0.5).sync() == 1
     assert json.loads(db.state("probe").version()) == [None, fingerprint(db, 0.5)]
 
-    # Without an index and without a state_version nothing is checked, as before.
-    unchecked = ProbeEngine()
-    assert runtime(unchecked, db, with_index=False).sync() == 0
-    assert unchecked.seen == []
+    # Turning the index off replays it too: its state was built on an index it no longer reads, and
+    # the knowledge base is recorded as owned under the indexed version.
+    unindexed = ProbeEngine()
+    assert runtime(unindexed, db, with_index=False).sync() == 1
+    assert unindexed.seen == ["e1"] and db.state("probe").version() is None
 
 
 def test_rebuild_by_another_process_with_the_same_config_replays_this_engine():

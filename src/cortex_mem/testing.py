@@ -279,6 +279,8 @@ class EngineStateBackendContract(_Contract):
         state.reset("2")
 
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
+        state.reset(None)  # an engine with no state_version
+        assert state.version() is None
 
     def test_epoch_starts_at_zero_and_commit_bumps_it(self, state):
         assert state.epoch() == 0
@@ -972,15 +974,20 @@ class DatabaseContract:
         assert [k for k, _ in again.state.scan()] == ["v0/e1"]
         assert [k.id for k in again.knowledge.all()] == ["k-e1"]
 
-    def test_switching_engines_and_back_leaves_only_the_running_engines_knowledge(self, open_db):
+    @pytest.mark.parametrize("a_version", ["1", None], ids=["versioned", "unversioned"])
+    @pytest.mark.parametrize("b_version", ["1", None], ids=["b-versioned", "b-unversioned"])
+    def test_switching_engines_and_back_leaves_only_the_running_engines_knowledge(
+        self, open_db, a_version, b_version
+    ):
         """The knowledge base is shared by the store. A -> B -> A must not leave A believing in items
-        B's reset removed, nor leave B's items with no engine to demote them."""
-        self.runtime(open_db, _Counting([], state_version="1"), name="A").append(ev("e1"))
-        self.runtime(open_db, _OtherIds([], state_version="1"), name="B").sync()
+        B's reset removed, nor leave B's items with no engine to demote them, whether or not the
+        engines declare a state_version (the server default, promote_all with no index, does not)."""
+        self.runtime(open_db, _Counting([], state_version=a_version), name="A").append(ev("e1"))
+        self.runtime(open_db, _OtherIds([], state_version=b_version), name="B").sync()
         assert [k.id for k in open_db().knowledge.all()] == ["B-e1"]
 
         seen: list[str] = []
-        self.runtime(open_db, _Counting(seen, state_version="1"), name="A").append(ev("e2"))
+        self.runtime(open_db, _Counting(seen, state_version=a_version), name="A").append(ev("e2"))
 
         assert seen == ["e1", "e2"]  # A starts over on the emptied knowledge base
         assert [k.id for k in open_db().knowledge.all()] == ["k-e1", "k-e2"]

@@ -716,3 +716,25 @@ def test_agent_cannot_claim_an_outside_signal(tmp_path):
     [event] = store.events.get([report["id"]])
     store.con.close()
     assert event.signal == "self"
+
+
+def test_switching_engines_and_back_keeps_the_first_engines_knowledge(tmp_path):
+    """The server default (promote_all, no embedder) has no state_version: switching away and back
+    must still give the knowledge back."""
+    path = tmp_path / "cortex.db"
+
+    def open_service(engine):
+        return Service(SqliteDatabase(path), engine, user="u1", team="t1", session="s1", clock=lambda: T0)
+
+    first = open_service("promote_all")
+    first.record("deploy uses release tags")
+    [hit] = first.recall("deploy tags")
+    first.report_outcome("failure", [hit["id"]])
+    first.report_outcome("failure", [hit["id"]])
+    # EvidenceEngine replays the log and demotes on the failures: it must start from an emptied
+    # knowledge base, and promote_all must start over when it comes back.
+    assert open_service("cortex_mem.engines.evidence:EvidenceEngine").recall("deploy tags") == []
+
+    back = open_service("promote_all")
+
+    assert [h["content"] for h in back.recall("deploy tags")] == ["deploy uses release tags"]
