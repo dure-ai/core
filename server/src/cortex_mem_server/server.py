@@ -172,8 +172,9 @@ class Service:
     def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
         """Append an event; returns its id, whether the engine has taken this
         event in (false while it waits: behind an earlier event, an embedding
-        outage or a failing engine) and how many events still wait, this one
-        or others (None when that could not be read).
+        outage or a failing engine; and false when it was skipped after
+        max_failures failed deliveries) and how many events still wait, this
+        one or others (None when that could not be read).
         Once stored, the event is not lost if delivery fails: it is retried
         later, so the agent must not record it again."""
         event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
@@ -193,7 +194,17 @@ class Service:
             # agent would answer by recording it again.
             log.exception("event %s stored, but its delivery could not be checked", event.id)
             return event.id, False, None
-        return event.id, event.id not in waiting, len(waiting)
+        skipped = any(s.event_id == event.id for s in self.runtime.skipped)
+        return event.id, event.id not in waiting and not skipped, len(waiting)
+
+    def pending(self) -> int | None:
+        """How many events wait to be delivered, from any session; None when
+        that could not be read."""
+        try:
+            return self.runtime.pending()
+        except Exception:
+            log.exception("could not count the waiting events")
+            return None
 
     def _log_skipped(self) -> None:
         for skipped in self.runtime.skipped[self._skipped_logged:]:
@@ -428,7 +439,9 @@ def record_episode(
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, delivered and
     pending: delivered false means it is stored and will reach memory later
-    (it is among the pending events that wait), so do not record it again.
+    (it is among the pending events that wait), so do not record it again;
+    rarely, it was skipped after repeated engine failures, which the server
+    logs.
     pending counts every event that waits, from any session, as an integer,
     or null when it could not be read (delivered is then false; the record is
     still stored)."""
@@ -448,8 +461,12 @@ def recall(
     see (your own, your team's, the org's); scope narrows it. repo and context
     say where you are working (e.g. context={"service": "api"}), so facts that
     hold only elsewhere can be left out; repo defaults to the project's
-    configured repo. Returns up to k memories, best first."""
-    return {"memories": get_service().recall(query, scope, k, repo, context)}
+    configured repo. Returns up to k memories, best first, and pending: how
+    many recorded events have not reached memory yet (an integer, or null when
+    it could not be read). While pending is above 0, the answer may miss them,
+    for example during an embedding outage; they arrive on later calls."""
+    service = get_service()
+    return {"memories": service.recall(query, scope, k, repo, context), "pending": service.pending()}
 
 
 @mcp.tool()
@@ -470,7 +487,8 @@ def report_outcome(
     scope can only narrow that. If that is wider than this repo's policy, text
     is not stored (text_redacted: true). Returns the id, the scope and signal
     actually used, text_redacted, delivered and pending (delivered false:
-    stored, reaches memory later, pending events wait; do not report it again).
+    stored, reaches memory later, pending events wait; do not report it again;
+    rarely, skipped after repeated engine failures, which the server logs).
     pending is an integer, or null when it could not be read (delivered is then
     false)."""
     del signal  # kept so clients that send it still work; the server sets the signal

@@ -352,6 +352,44 @@ def test_record_during_an_embedding_outage_is_recorded_but_pending():
     assert m.runtime.state.cursor() == 2 and m.runtime.skipped == []
 
 
+def test_recall_during_an_embedding_outage_answers_from_what_was_delivered():
+    from cortex_mem.embed import EmbeddingError, HashEmbedder
+
+    class Flaky(HashEmbedder):
+        down = False
+
+        def embed(self, texts, kind):
+            if self.down:
+                raise EmbeddingError("embedding backend is down")
+            return super().embed(texts, kind)
+
+    db = SqliteDatabase()
+    emb = Flaky()
+    m = Service(db, "promote_all", user="u1", team="t1", session="s1", clock=lambda: T0, max_failures=3,
+                index=Index(db.vectors, emb, 0.9, transaction=db.transaction))
+    m.record("deploy uses release tags")
+    emb.down = True
+    waiting = m.record("payments need vendor v2")
+
+    hits = m.recall("deploy tags")
+
+    assert waiting["delivered"] is False
+    assert [h["content"] for h in hits] == ["deploy uses release tags"]
+    assert m.pending() == 2  # the record and the recall event wait for the outage to end
+    emb.down = False
+    assert m.recall("vendor") and m.pending() == 0
+
+
+def test_a_skipped_event_is_not_reported_as_delivered():
+    m = Service(SqliteDatabase(), f"{__name__}:FailsOnBoom", user="u1", team="t1", session="s1",
+                clock=lambda: T0, max_failures=1)
+
+    skipped = m.record("boom")
+
+    assert [s.event_id for s in m.runtime.skipped] == [skipped["id"]]
+    assert skipped["delivered"] is False and skipped["pending"] == 0
+
+
 def test_delivered_responses_say_how_many_events_wait():
     m = service(SqliteDatabase())
     recorded = m.record("x")
@@ -435,9 +473,10 @@ def test_stdio_session_b_recalls_what_session_a_recorded(tmp_path):
     recorded = call(db, "record_episode", {"text": "cloud sql needs the auth proxy"})
     assert recorded["scope"] == "personal"
 
-    hits = call(db, "recall", {"query": "cloud sql proxy"})["memories"]
+    answer = call(db, "recall", {"query": "cloud sql proxy"})
 
-    assert [h["content"] for h in hits] == ["cloud sql needs the auth proxy"]
+    assert [h["content"] for h in answer["memories"]] == ["cloud sql needs the auth proxy"]
+    assert answer["pending"] == 0
 
 
 def test_stdio_outcome_without_refs_tells_the_agent_why(tmp_path):
