@@ -50,7 +50,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from cortex_mem.access import knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
-from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder
+from cortex_mem.embed import (
+    Embedder,
+    EmbeddingError,
+    HashEmbedder,
+    OutageBreaker,
+    UpstageEmbedder,
+)
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
@@ -154,20 +160,44 @@ class Service:
         self.policy = policy
         self.clock = clock
         self._skipped_logged = 0
+        self._outage = False  # an embedding outage has been logged and has not ended yet
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
+        return self._caught_up(repo, context)[0]
+
+    def _caught_up(self, repo: str | None, context: Mapping[str, str] | None) -> tuple[Caller, bool]:
+        """The caller, after delivering what other sessions appended and letting
+        time pass; and whether that failed on an embedding outage, so the rest
+        of the tool call does not wait on another failing request."""
         caller = Caller(
             user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent,
             repo=repo or self.repo, context=context or {},
         )
+        down = False
         try:
-            self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
+            self.runtime.tick(caller.at)
+        except EmbeddingError as exc:
+            down = True
+            self._embedding_failed(exc)
         except Exception:
             # An engine failure must not stop the tool call; the runtime retries
             # the event next time and skips it after max_failures attempts.
             log.exception("engine failed while catching up; continuing")
+        else:
+            self._embedding_works()
         self._log_skipped()
-        return caller
+        return caller, down
+
+    def _embedding_failed(self, exc: EmbeddingError) -> None:
+        """Log an outage once, when it begins: every tool call meets it until it ends."""
+        if not self._outage:
+            log.warning("embedding failed; delivery waits and recall answers from what was delivered: %s", exc)
+            self._outage = True
+
+    def _embedding_works(self) -> None:
+        if self._outage:
+            log.warning("embedding works again; delivery resumes")
+            self._outage = False
 
     def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
         """Append an event; returns its id, whether the engine has taken this
@@ -181,10 +211,13 @@ class Service:
                       session=caller.session, agent=caller.agent, **fields)
         try:
             self.runtime.append(event)
-        except Exception:
+        except Exception as exc:
             if not self.runtime.events.get([event.id]):
                 raise  # refused before it was stored (e.g. missing refs)
-            log.exception("event %s stored, but the engine failed to take it in", event.id)
+            if isinstance(exc, EmbeddingError):
+                self._embedding_failed(exc)
+            else:
+                log.exception("event %s stored, but the engine failed to take it in", event.id)
         finally:
             self._log_skipped()
         try:
@@ -239,8 +272,8 @@ class Service:
         repo: str | None = None,
         context: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
-        caller = self._caller(repo, context)
-        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
+        caller, down = self._caught_up(repo, context)
+        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
             for h in handoffs
@@ -330,7 +363,8 @@ def _embedder() -> Embedder | None:
         if missing:
             raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER=upstage also needs {', '.join(missing)}")
         try:
-            return UpstageEmbedder(key, passage, query, timeout=UPSTAGE_TIMEOUT_S)
+            # During an outage, fail at once for a while instead of waiting for a timeout on every call.
+            return OutageBreaker(UpstageEmbedder(key, passage, query, timeout=UPSTAGE_TIMEOUT_S))
         except ValueError:
             pass  # exit after the handler, so nothing is chained; the message names no value
 

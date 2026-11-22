@@ -173,7 +173,7 @@ class Engine(Protocol):
    - `sync()`는 이번 호출이 전달한 수(정수)를 돌려주고, 커서 뒤에 남은 이벤트 수는 `Runtime.pending()`이 준다.
 3. 이벤트는 `append` 뒤에 전달되므로, 엔진은 `observe` 안에서 그 이벤트를 `ctx.events.get`할 수 있다.
 4. `handoff` 직전에 런타임이 밀린 이벤트를 먼저 전달한다. 그래서 세션 B도 세션 A가 남긴 기록을 반영한 상태로 답한다.
-   - **임베딩 장애 중에도 읽기는 답한다**: 밀린 이벤트를 색인하다 `EmbeddingError`가 나면 그 이벤트들은 기다리게 두고, 지금까지 전달된 상태로 답한다. 이때 엔진은 `ctx.similar`가 None인 채로 불린다(색인을 설정하지 않았을 때와 같은 텍스트 검색). 장애가 이미 드러났으니 질의 임베딩을 다시 기다리지 않기 위해서다. 전달은 성공했지만 엔진의 유사도 검색이 질의를 임베딩하지 못해 `EmbeddingError`를 올리면, 런타임은 `ctx.similar`를 None으로 해서 엔진에 한 번 더 묻는다. 그래서 `ctx.similar`를 쓰는 엔진도 None인 경우를 처리해야 한다(§2의 `EngineContext`). 장애 중 recall 이벤트는 저장만 되고 다른 이벤트처럼 기다린다. MCP 서버의 `recall` 응답에는 아직 전달되지 않은 이벤트 수 `pending`이 들어 있다.
+   - **임베딩 장애 중에도 읽기는 답한다**: 밀린 이벤트를 색인하다 `EmbeddingError`가 나면 그 이벤트들은 기다리게 두고, 지금까지 전달된 상태로 답한다. 이때 엔진은 `ctx.similar`가 None인 채로 불린다(색인을 설정하지 않았을 때와 같은 텍스트 검색). 장애가 이미 드러났으니 질의 임베딩을 다시 기다리지 않기 위해서다. 전달은 성공했지만 엔진의 유사도 검색이 질의를 임베딩하지 못해 `EmbeddingError`를 올리면, 런타임은 `ctx.similar`를 None으로 해서 엔진에 한 번 더 묻는다. 그래서 `ctx.similar`를 쓰는 엔진도 None인 경우를 처리해야 한다(§2의 `EngineContext`). 장애 중 recall 이벤트는 저장만 되고 다른 이벤트처럼 기다린다. MCP 서버의 `recall` 응답에는 아직 전달되지 않은 이벤트 수 `pending`이 들어 있다. 서버는 도구 호출 첫머리의 따라잡기(`tick`)에서 장애를 보면 그 호출의 recall에서 다시 시도하지 않는다(`Runtime.recall(..., embedding_down=True)`: 전달도 질의 임베딩도 하지 않고 답한다). Upstage 임베더는 `cortex_mem.embed.OutageBreaker`로 감싸, 장애 뒤 잠시(5초부터 두 배씩, 최대 60초) 요청 없이 바로 `EmbeddingError`를 낸다. `EmbeddingError`는 실패 횟수에 세지 않으므로 이벤트를 건너뛰지 않는다.
 5. recall 한 번은 이렇게 흐른다(`Runtime.recall`).
    ```
    handoffs = runtime.handoff(query, caller, scope, k)        # 필터 통과분

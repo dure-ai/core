@@ -7,10 +7,12 @@ import http.client
 import json
 import math
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from array import array
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Literal, Protocol
 
 from cortex_mem.store.text import bigrams, words
@@ -285,6 +287,62 @@ class UpstageEmbedder:
             raise EmbeddingError("embedding response has empty or inconsistent vector lengths")
         if self._dim is None and vectors:
             self._dim = width
+        return vectors
+
+
+class OutageBreaker:
+    """Wraps an embedder so a long outage costs one timeout, not one per call.
+
+    After an outage (EmbeddingError; a refused text, EmbeddingRejected, is not
+    one), calls fail at once for a cooldown, `first` seconds and doubling after
+    each failed retry up to `maximum`. The first call after the cooldown tries
+    the backend again, and a success resets it. Delivery never skips an event
+    for an EmbeddingError, so failing fast only makes the wait cheaper; the
+    cost is noticing recovery up to `maximum` seconds late."""
+
+    def __init__(
+        self,
+        inner: Embedder,
+        first: float = 5.0,
+        maximum: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.inner = inner
+        self.model = inner.model
+        self.first = first
+        self.maximum = maximum
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._wait: float | None = None  # the current cooldown; None while the backend answers
+        self._until = 0.0
+        self._last = ""
+
+    @property
+    def dim(self) -> int:
+        return self.inner.dim
+
+    def __repr__(self) -> str:
+        return f"OutageBreaker({self.inner!r})"
+
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
+        with self._lock:
+            now = self._clock()
+            if self._wait is not None and now < self._until:
+                raise EmbeddingError(
+                    f"embedding is unavailable; retrying in {self._until - now:.0f}s (last error: {self._last})"
+                )
+        try:
+            vectors = self.inner.embed(texts, kind)
+        except EmbeddingRejected:
+            raise
+        except EmbeddingError as exc:
+            with self._lock:
+                self._wait = self.first if self._wait is None else min(self._wait * 2, self.maximum)
+                self._until = self._clock() + self._wait
+                self._last = str(exc)
+            raise
+        with self._lock:
+            self._wait = None
         return vectors
 
 

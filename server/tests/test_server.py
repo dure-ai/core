@@ -13,7 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from cortex_mem.contract import Demote
-from cortex_mem.embed import UpstageEmbedder
+from cortex_mem.embed import OutageBreaker, UpstageEmbedder
 from cortex_mem.index import Index
 from cortex_mem.store.sqlite import SqliteDatabase
 
@@ -557,7 +557,7 @@ def test_upstage_needs_models_and_key(monkeypatch):
 
     monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
     built = srv._embedder()  # builds the client; makes no request
-    assert isinstance(built, UpstageEmbedder)
+    assert isinstance(built, OutageBreaker) and isinstance(built.inner, UpstageEmbedder)
     assert "sk-secret-value" not in repr(built)
 
 
@@ -613,7 +613,9 @@ def test_upstage_timeout_is_shorter_than_sqlites_busy_timeout(monkeypatch):
     monkeypatch.setenv("CORTEX_EMBED_QUERY_MODEL", "query-m")
     monkeypatch.setenv("UPSTAGE_API_KEY", "sk-secret-value")
     # A promoted item is embedded while the write lock is held (spec §7).
-    assert srv._embedder().timeout < BUSY_TIMEOUT_MS / 1000
+    built = srv._embedder()
+    assert isinstance(built, OutageBreaker) and isinstance(built.inner, UpstageEmbedder)
+    assert built.inner.timeout < BUSY_TIMEOUT_MS / 1000
 
 
 # ── PostgreSQL config ───────────────────────────────────────────────────────
@@ -738,3 +740,61 @@ def test_switching_engines_and_back_keeps_the_first_engines_knowledge(tmp_path):
     back = open_service("promote_all")
 
     assert [h["content"] for h in back.recall("deploy tags")] == ["deploy uses release tags"]
+
+
+class _CountingFlaky:
+    """HashEmbedder that counts its calls and fails each one while `down`."""
+
+    def __init__(self):
+        from cortex_mem.embed import HashEmbedder
+
+        self.inner = HashEmbedder()
+        self.model, self.dim = self.inner.model, self.inner.dim
+        self.down = False
+        self.calls = 0
+
+    def embed(self, texts, kind):
+        from cortex_mem.embed import EmbeddingError
+
+        self.calls += 1
+        if self.down:
+            raise EmbeddingError("embedding backend is down")
+        return self.inner.embed(texts, kind)
+
+
+def test_recall_during_an_outage_tries_embedding_once_and_logs_one_line(caplog):
+    db = SqliteDatabase()
+    emb = _CountingFlaky()
+    m = Service(db, "promote_all", user="u1", team="t1", session="s1", clock=lambda: T0, max_failures=3,
+                index=Index(db.vectors, emb, 0.9, transaction=db.transaction))
+    m.record("deploy uses release tags")
+    emb.down = True
+    m.record("payments need vendor v2")  # waits for the outage
+    caplog.clear()
+    emb.calls = 0
+
+    hits = m.recall("deploy tags")
+    m.recall("deploy tags")
+
+    assert [h["content"] for h in hits] == ["deploy uses release tags"]
+    assert emb.calls == 2  # one failed attempt per recall: catching up, not again for the answer
+    assert "Traceback" not in caplog.text
+    emb.down = False
+    m.recall("vendor")
+    assert "embedding works again" in caplog.text and m.pending() == 0
+
+
+def test_the_first_failure_of_an_outage_is_logged_once(caplog):
+    db = SqliteDatabase()
+    emb = _CountingFlaky()
+    m = Service(db, "promote_all", user="u1", team="t1", session="s1", clock=lambda: T0, max_failures=3,
+                index=Index(db.vectors, emb, 0.9, transaction=db.transaction))
+    emb.down = True
+    caplog.clear()
+
+    m.record("a")
+    m.record("b")
+    m.recall("a")
+
+    assert caplog.text.count("embedding failed; delivery waits") == 1
+    assert "Traceback" not in caplog.text

@@ -529,19 +529,26 @@ class Runtime:
         self.verdicts.extend(verdicts)
         self._sync_knowledge(touched)
 
-    def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
+    def handoff(
+        self, query: str, caller: Caller, scope: Scope, k: int = 6, *, embedding_down: bool = False
+    ) -> list[Handoff]:
         """Deliver what waits, then ask the engine. During an embedding outage
         reads still answer, from what was delivered (see _handoff)."""
-        return self._handoff(query, caller, scope, k)[0]
+        return self._handoff(query, caller, scope, k, embedding_down)[0]
 
-    def _handoff(self, query: str, caller: Caller, scope: Scope, k: int) -> tuple[list[Handoff], bool]:
+    def _handoff(
+        self, query: str, caller: Caller, scope: Scope, k: int, embedding_down: bool = False
+    ) -> tuple[list[Handoff], bool]:
         """handoff, and whether embedding was down. Events that cannot be indexed
         stay waiting for a later sync. When embedding is down, or the engine's
         similarity search cannot embed the query, the engine answers with
-        `ctx.similar` None, as when no index is configured (text search only)."""
-        down = False
+        `ctx.similar` None, as when no index is configured (text search only).
+        `embedding_down`: the caller has just seen an EmbeddingError (a tick in
+        the same tool call), so nothing is tried again before answering."""
+        down = embedding_down
         try:
-            self.sync()
+            if not down:
+                self.sync()
         except EmbeddingError:
             down = True
         staged = self._staged(read_only=True)
@@ -558,7 +565,7 @@ class Runtime:
         return [h for h in handoffs if self._may_see(h, caller, scope)][:k], down
 
     def recall(
-        self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6
+        self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6, *, embedding_down: bool = False
     ) -> list[Handoff]:
         """handoff, then record what was handed off as a recall event (refs = ids,
         repo and conditions = the caller's repo and context). The recall event
@@ -566,7 +573,7 @@ class Runtime:
         working on, and is not shared by searching widely. An embedding outage
         does not fail it: the answer comes from what was delivered, and the
         recall event is stored and waits like any other."""
-        handoffs, down = self._handoff(query, caller, scope, k)
+        handoffs, down = self._handoff(query, caller, scope, k, embedding_down)
         event = Event(
             id=event_id, kind="recall", at=caller.at, user=caller.user, team=caller.team,
             session=caller.session, scope="personal", text=query, agent=caller.agent,
