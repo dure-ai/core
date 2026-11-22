@@ -37,6 +37,10 @@ class EventStore(EventReader, Protocol):
         positions. Positions start at 1 and only grow; since(0) is everything."""
         ...
 
+    def count_since(self, seq: int) -> int:
+        """How many events since(seq) would give, without reading them."""
+        ...
+
 
 class KnowledgeStore(KnowledgeReader, Protocol):
     """The knowledge base. In production the Git wiki is the copy people read."""

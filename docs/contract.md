@@ -297,6 +297,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 class EventStore(EventReader, Protocol):
     def append(self, event) -> str: ...
     def since(self, seq) -> Iterator[tuple[int, Event]]: ...   # 위치는 1부터, 커밋 순서대로 늘어나기만
+    def count_since(self, seq) -> int: ...                      # since(seq)의 개수, 이벤트를 읽지 않고
 
 class KnowledgeStore(KnowledgeReader, Protocol):
     def put(self, item) -> None: ...

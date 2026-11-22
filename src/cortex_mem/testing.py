@@ -93,6 +93,13 @@ class EventStoreContract(_Contract):
         assert positions == sorted(positions) and positions[0] >= 1
         assert [e.id for _, e in store.since(positions[1])] == ["c"]
 
+    def test_count_since_counts_without_reading_the_events(self, store):
+        assert store.count_since(0) == 0
+        for id in ["b", "a", "c"]:
+            store.append(ev(id, "x"))
+        positions = [seq for seq, _ in store.since(0)]
+        assert [store.count_since(p) for p in [0, *positions]] == [3, 2, 1, 0]
+
     def test_search_ranks_better_match_first(self, store):
         store.append(ev("weak", "deploy"))
         store.append(ev("strong", "deploy uses release tags"))

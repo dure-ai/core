@@ -231,6 +231,9 @@ class SqliteEventStore:
             raise ValueError(f"duplicate event id: {e.id}") from None
         return e.id
 
+    def count_since(self, seq: int) -> int:
+        return self.db.query("SELECT count(*) FROM events WHERE seq > ?", (seq,))[0][0]
+
     def since(self, seq: int, page: int = 256) -> Iterator[tuple[int, Event]]:
         # Paged: the runtime usually takes only the next event.
         while True:

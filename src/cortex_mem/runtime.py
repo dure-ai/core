@@ -302,8 +302,9 @@ class Runtime:
             self._sync_knowledge(touched)
 
     def pending(self) -> int:
-        """How many events wait after the engine's cursor (read now, no lock)."""
-        return sum(1 for _ in self.events.since(self.state.cursor()))
+        """How many events wait after the engine's cursor (read now, no lock),
+        counted by the store without reading them."""
+        return self.events.count_since(self.state.cursor())
 
     def waiting(self) -> list[str]:
         """Ids of the events that wait after the engine's cursor, in order

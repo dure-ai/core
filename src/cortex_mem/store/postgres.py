@@ -477,6 +477,9 @@ class PgEventStore:
             )
         return e.id
 
+    def count_since(self, seq: int) -> int:
+        return self.db.query("SELECT count(*) FROM events WHERE seq > %s", (seq,))[0][0]
+
     def since(self, seq: int, page: int = 256) -> Iterator[tuple[int, Event]]:
         while True:
             rows = self.db.query(

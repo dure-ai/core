@@ -83,6 +83,9 @@ class InMemoryEventStore:
         for i in range(seq, len(self._log)):
             yield i + 1, self._log[i]
 
+    def count_since(self, seq: int) -> int:
+        return max(0, len(self._log) - seq)
+
     def get(self, ids: Collection[str]) -> list[Event]:
         return [self._events[i] for i in ids if i in self._events]
 
