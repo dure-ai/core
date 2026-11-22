@@ -107,6 +107,7 @@ class InMemoryEventStore:
 class InMemoryKnowledgeBase:
     def __init__(self) -> None:
         self._items: dict[str, Knowledge] = {}
+        self._owner: str | None = None
 
     def put(self, item: Knowledge) -> None:
         self._items[item.id] = item
@@ -116,6 +117,12 @@ class InMemoryKnowledgeBase:
 
     def clear(self) -> None:
         self._items.clear()
+
+    def owner(self) -> str | None:
+        return self._owner
+
+    def set_owner(self, owner: str) -> None:
+        self._owner = owner
 
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         return [self._items[i] for i in ids if i in self._items]

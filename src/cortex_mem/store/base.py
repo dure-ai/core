@@ -50,7 +50,18 @@ class KnowledgeStore(KnowledgeReader, Protocol):
         ...
 
     def clear(self) -> None:
-        """Remove every item at once (an engine reset empties the knowledge base)."""
+        """Remove every item at once (an engine reset empties the knowledge base).
+        The owner stays."""
+        ...
+
+    def owner(self) -> str | None:
+        """Which engine state the knowledge base belongs to, as the runtime
+        recorded it with set_owner (None = never recorded)."""
+        ...
+
+    def set_owner(self, owner: str) -> None:
+        """Record the owner. Durable stores keep it with the knowledge base,
+        and a transaction that rolls back undoes it."""
         ...
 
 

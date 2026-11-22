@@ -539,3 +539,25 @@ def test_a_new_engine_version_replays_into_an_emptied_knowledge_base():
     assert removed == []
     assert v2.seen == ["e1", "e2"]
     assert [(k.id, k.body) for k in kb.all()] == [("k1", "restated")]
+
+
+def test_a_knowledge_base_without_an_owner_is_adopted_without_starting_over():
+    """A store written before owners were recorded keeps its state and knowledge."""
+
+    class V1(Scripted):
+        state_version = "1"
+
+    def mine(id, source):
+        return item(id, (source,), scope="personal", owner="u1")
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    rt = runtime(V1({"e1": [Promote(mine("k1", "e1"))]}), events, kb, state)
+    rt.append(ev("e1"))
+    kb._owner = None  # as written before owners existed
+    epoch = state.epoch()
+
+    again = V1({})
+    runtime(again, events, kb, state).sync()
+
+    assert again.seen == [] and state.epoch() == epoch and [k.id for k in kb.all()] == ["k1"]
+    assert kb.owner() is not None

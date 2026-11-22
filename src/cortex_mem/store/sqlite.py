@@ -145,6 +145,7 @@ class SqliteDatabase:
                 "PRIMARY KEY (model, digest))"
             )
             self.con.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT)")
+            self.con.execute("CREATE TABLE IF NOT EXISTS knowledge_meta (key TEXT PRIMARY KEY, value TEXT)")
             # Columns added without a version bump: main's schema-3 files have no
             # engine_cursor.epoch, feat/core-embedding's schema-5 files no
             # vectors.digest. CREATE IF NOT EXISTS keeps an old table as it is.
@@ -309,6 +310,18 @@ class SqliteKnowledgeBase:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM knowledge_fts")
             self.db.con.execute("DELETE FROM knowledge")
+
+    def owner(self) -> str | None:
+        rows = self.db.query("SELECT value FROM knowledge_meta WHERE key = 'owner'")
+        return rows[0][0] if rows else None
+
+    def set_owner(self, owner: str) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO knowledge_meta (key, value) VALUES ('owner', ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (owner,),
+            )
 
     def remove(self, id: str) -> None:
         with self.db.transaction():

@@ -198,6 +198,9 @@ class Runtime:
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
+        # The version this Runtime found the knowledge base owned under. Engines are switched by
+        # restarting the server, so a Runtime reads the owner once per version, not on every sync.
+        self._owned_under: str | None = None
 
     @property
     def rejections(self) -> list[Verdict]:
@@ -464,18 +467,43 @@ class Runtime:
         store. The same transaction empties the knowledge base: the replay
         promotes again what the engine still holds true, and an item it no
         longer promotes would otherwise stay with no engine state left to
-        demote it. Knowledge vectors follow on this sync."""
+        demote it. Knowledge vectors follow on this sync.
+
+        The knowledge base is shared by the store, so it records its owner
+        (_owner: the engine's class and version). When another engine, or
+        this one under another version, emptied it for itself, this engine
+        starts over too, even if its own state still has the right version."""
         if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
         want = self._want_version()
-        if want is None or self.state.version() == want:
+        if want is None:
+            return
+        if self.state.version() == want and (
+            self._owned_under == want or self.knowledge.owner() == self._owner(want)
+        ):
+            self._owned_under = want
             return  # the common case takes no lock
         with self.transaction():
             want = self._want_version()
-            if want is not None and self.state.version() != want:
+            if want is None:
+                return
+            owner = self.knowledge.owner()
+            # An owner of None is a knowledge base written before owners were recorded; with the
+            # state under `want` it is this engine's, and is only marked as such.
+            if self.state.version() != want or owner not in (None, self._owner(want)):
                 self.state.reset(want)
                 self.knowledge.clear()
                 self._knowledge_reconciled = False  # drop the vectors of what was removed
+            self.knowledge.set_owner(self._owner(want))
+        self._owned_under = None  # read it again once the transaction has committed
+
+    def _owner(self, want: str) -> str:
+        """The knowledge base's owner for this engine with its state under
+        `want`: the engine's class and that version. Another engine, or this
+        one under another version, emptied the knowledge base for itself, so
+        this engine's state no longer matches it."""
+        cls = type(self.engine)
+        return json.dumps([f"{cls.__module__}:{cls.__qualname__}", want], separators=(",", ":"))
 
     def tick(self, now: datetime) -> None:
         """Deliver what is pending, then let time pass: engine.tick runs with

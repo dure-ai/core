@@ -597,6 +597,18 @@ class PgKnowledgeStore:
             for table in ("knowledge", "knowledge_terms", "knowledge_stats"):
                 self.db.con.execute(f"DELETE FROM {table}")
 
+    def owner(self) -> str | None:
+        rows = self.db.query("SELECT value FROM cortex_meta WHERE key = 'knowledge_owner'")
+        return rows[0][0] if rows else None
+
+    def set_owner(self, owner: str) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO cortex_meta (key, value) VALUES ('knowledge_owner', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (owner,),
+            )
+
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         ids = list(ids)
         rows = self.db.query(

@@ -16,6 +16,7 @@ import time
 from array import array
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -175,6 +176,15 @@ class KnowledgeStoreContract(_Contract):
         assert kb.search("deploy tags", Caller("u1", "t1", "s1", T0), "org", 10) == []
         kb.put(item("d", "deploy uses tags"))  # usable again afterwards
         assert [k.id for k, _ in kb.search("deploy tags", Caller("u1", "t1", "s1", T0), "org", 10)] == ["d"]
+
+    def test_knowledge_owner_is_recorded_and_kept_by_clear(self, kb):
+        assert kb.owner() is None
+        kb.set_owner("engine A")
+        kb.put(item("a"))
+        kb.clear()
+        assert kb.owner() == "engine A"
+        kb.set_owner("engine B")
+        assert kb.owner() == "engine B"
 
     def test_knowledge_get_finds_nothing_for_ids_that_are_not_strings(self, kb):
         kb.put(item("1"))
@@ -747,6 +757,15 @@ class _Counting:
         return []
 
 
+class _OtherIds(_Counting):
+    """A different engine: promotes each event as B-<id>."""
+
+    def observe(self, event, ctx):
+        [promote] = super().observe(event, ctx)
+        assert isinstance(promote, Promote)
+        return [Promote(replace(promote.item, id=f"B-{event.id}"))]
+
+
 class _Blocking(_Counting):
     """_Counting that, the first time it observes `block_on`, sets `entered`
     and waits for `release`: a slow observe a test controls."""
@@ -952,6 +971,30 @@ class DatabaseContract:
         assert seen == []
         assert [k for k, _ in again.state.scan()] == ["v0/e1"]
         assert [k.id for k in again.knowledge.all()] == ["k-e1"]
+
+    def test_switching_engines_and_back_leaves_only_the_running_engines_knowledge(self, open_db):
+        """The knowledge base is shared by the store. A -> B -> A must not leave A believing in items
+        B's reset removed, nor leave B's items with no engine to demote them."""
+        self.runtime(open_db, _Counting([], state_version="1"), name="A").append(ev("e1"))
+        self.runtime(open_db, _OtherIds([], state_version="1"), name="B").sync()
+        assert [k.id for k in open_db().knowledge.all()] == ["B-e1"]
+
+        seen: list[str] = []
+        self.runtime(open_db, _Counting(seen, state_version="1"), name="A").append(ev("e2"))
+
+        assert seen == ["e1", "e2"]  # A starts over on the emptied knowledge base
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1", "k-e2"]
+
+    def test_knowledge_owner_survives_reopening_and_rolls_back(self, open_db):
+        db = open_db()
+        db.knowledge.set_owner("engine A")
+        assert open_db().knowledge.owner() == "engine A"
+        if not self.rolls_back:
+            return
+        with pytest.raises(RuntimeError), db.transaction():
+            db.knowledge.set_owner("engine B")
+            raise RuntimeError("roll back")
+        assert open_db().knowledge.owner() == "engine A"
 
     def test_changed_state_version_drops_state_and_redelivers(self, open_db):
         rt = self.runtime(open_db, _Counting([], state_version="1"))
