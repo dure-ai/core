@@ -62,11 +62,11 @@ def _column_type(db: PostgresDatabase, table: str, column: str) -> str | None:
 
 
 def test_fresh_schema_is_created_and_versioned(pg_schema):
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     with closing(PostgresDatabase(pg_schema)) as db:
         assert db.kind == "postgres"
         assert _tables(db) == TABLES
-        assert db.query("SELECT value FROM cortex_meta WHERE key = 'schema_version'") == [("1",)]
+        assert db.query("SELECT value FROM cortex_meta WHERE key = 'schema_version'") == [("2",)]
         assert _column_type(db, "events", "user") == "text"
         assert _column_type(db, "events", "seq") == "int8"
         assert _column_type(db, "events", "text_redacted") == "bool"
@@ -101,7 +101,16 @@ def test_generation_survives_reopening(pg_schema):
 def test_unknown_schema_version_refuses_to_start(pg_schema):
     with closing(PostgresDatabase(pg_schema)) as db:
         db.query("UPDATE cortex_meta SET value = '99' WHERE key = 'schema_version'")
-    with pytest.raises(RuntimeError, match=r"99.*\b1\b"):
+    with pytest.raises(RuntimeError, match=r"99.*\b2\b"):
+        PostgresDatabase(pg_schema)
+
+
+def test_a_schema_1_database_is_refused(pg_schema):
+    """Schema 1 stored search terms from the old tokens, with a Latin word kept whole when a Korean
+    particle followed it; new queries would not match them, so it must be started again."""
+    with closing(PostgresDatabase(pg_schema)) as db:
+        db.query("UPDATE cortex_meta SET value = '1' WHERE key = 'schema_version'")
+    with pytest.raises(RuntimeError, match=r"schema 1 is not 2"):
         PostgresDatabase(pg_schema)
 
 

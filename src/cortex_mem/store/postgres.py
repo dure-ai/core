@@ -41,7 +41,7 @@ from ..embed import float32
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, pg_params, words
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: search terms split at Hangul boundaries; a schema-1 database is refused
 VECTOR_INDEXES = ("none", "hnsw")
 LOCK_TIMEOUT_SETTING = "CORTEX_DB_LOCK_TIMEOUT"
 # A PostgreSQL duration as lock_timeout takes it: a number with an optional unit (no unit
