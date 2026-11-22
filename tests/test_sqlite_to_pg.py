@@ -306,6 +306,22 @@ def test_a_schema_4_source_warns_and_migrates_without_a_cache(tmp_path, pg_schem
     assert sha(path) == before  # its cache is still there
 
 
+def test_a_schema_4_source_from_main_migrates_without_the_warning(tmp_path, pg_schema):
+    """main's schema 4 is a reindexed schema-3 file: it has no vector tables, so no float64 cache."""
+    path = tmp_path / "core.db"
+    build_source(path)
+    con = sqlite3.connect(path)
+    for table in ("vectors", "vector_groups", "embed_cache", "vector_meta"):
+        con.execute(f"DROP TABLE {table}")
+    con.execute("PRAGMA user_version = 4")
+    con.commit()
+    con.close()
+    result = run(str(path), pg_schema)
+    assert result.returncode == 0, result.stderr
+    assert "re-embed" not in result.stderr
+    assert pg_count(pg_schema, "events") == 5
+
+
 def test_a_non_finite_cache_vector_exits_2_naming_the_digest(tmp_path, pg_schema):
     path = tmp_path / "core.db"
     build_source(path)

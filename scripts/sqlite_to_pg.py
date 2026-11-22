@@ -114,6 +114,8 @@ def _snapshot(path: Path, into: Path) -> Path:
         try:
             has_events = ro.execute("SELECT 1 FROM sqlite_master WHERE name = 'events'").fetchone()
             version = ro.execute("PRAGMA user_version").fetchone()[0]
+            # main's schema 4 has no vector tables; only the older layout of 4 holds float64 vectors.
+            float64 = version == 4 and ro.execute("SELECT 1 FROM sqlite_master WHERE name = 'vectors'").fetchone()
             if not has_events:
                 raise MigrationError(f"{path} has no events table; it is not a cortex store")
             copy = into / "source.db"
@@ -126,9 +128,9 @@ def _snapshot(path: Path, into: Path) -> Path:
             raise MigrationError(f"cannot read {path}: {exc}") from None
     finally:
         ro.close()
-    if version == 4:
+    if float64:
         print(
-            "warning: the source is schema 4, whose embedding cache is not usable; "
+            "warning: the source is schema 4 with float64 vectors, whose embedding cache is not usable; "
             "nothing is cached and the first sync will re-embed",
             file=sys.stderr,
         )
