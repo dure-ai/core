@@ -908,3 +908,140 @@ class TestPgDatabase(DatabaseContract):
                 max_failures=2, index=Index(other.vectors, HashEmbedder(), 0.9,
                                             transaction=other.transaction)).sync()
         assert later.seen == []
+
+
+# ── reconnect ───────────────────────────────────────────────────────────────
+
+
+def _kill(db: PostgresDatabase) -> None:
+    """End db's server session from another connection, as a restart or an idle timeout would."""
+    import psycopg
+
+    pid = db.con.info.backend_pid
+    with psycopg.connect(db._url, autocommit=True) as admin:  # pyright: ignore[reportPrivateUsage]
+        assert admin.execute("SELECT pg_terminate_backend(%s, 5000)", (pid,)).fetchone() == (True,)
+
+
+def test_a_read_after_the_session_is_lost_reconnects(pg_schema):
+    with closing(PostgresDatabase(pg_schema)) as db:
+        db.events.append(ev("e1", "deploy uses tags"))
+        before = db.con.info.backend_pid
+        _kill(db)
+        assert db.events.count_since(0) == 1
+        assert db.con.info.backend_pid != before
+
+
+def test_a_write_after_the_session_is_lost_reconnects(pg_schema):
+    with closing(PostgresDatabase(pg_schema)) as db:
+        db.events.append(ev("e1", "deploy uses tags"))
+        _kill(db)
+        db.events.append(ev("e2", "payments retry"))
+        assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
+
+
+def test_a_knowledge_put_after_the_session_is_lost_reconnects(pg_schema):
+    """put opens its own transaction, which replaces the lost session; it must write on the new one."""
+    with closing(PostgresDatabase(pg_schema)) as db:
+        db.knowledge.put(item("k0"))
+        _kill(db)
+        db.knowledge.put(item("k1"))
+        assert sorted(k.id for k in db.knowledge.all()) == ["k0", "k1"]
+
+
+def test_a_session_lost_inside_a_transaction_is_not_retried(pg_schema):
+    """A retry inside a transaction could repeat writes the server already dropped; the error is the
+    caller's to see, and the next operation reconnects."""
+    import psycopg
+
+    with closing(PostgresDatabase(pg_schema)) as db:
+        with pytest.raises(psycopg.OperationalError), db.transaction():
+            db.query("INSERT INTO vector_meta (key, value) VALUES ('lost', '1')")
+            _kill(db)
+            db.query("INSERT INTO vector_meta (key, value) VALUES ('after', '1')")
+        assert db.query("SELECT key FROM vector_meta") == []
+        db.events.append(ev("e1", "deploy uses tags"))
+        assert db.events.count_since(0) == 1
+
+
+def test_a_new_session_keeps_the_lock_timeout(pg_schema):
+    with closing(PostgresDatabase(pg_schema, lock_timeout="2s")) as db:
+        _kill(db)
+        assert db.query("SELECT current_setting('lock_timeout')") == [("2s",)]
+
+
+def test_reconnecting_backs_off_while_the_server_stays_down(pg_schema):
+    """Each failed attempt doubles the wait before the next, up to a cap, and calls in between fail at
+    once without trying; a successful attempt starts over from the first wait."""
+    now = [100.0]
+    with closing(PostgresDatabase(pg_schema, clock=lambda: now[0])) as db:
+        real_open = db._open  # pyright: ignore[reportPrivateUsage]
+        attempts: list[float] = []
+
+        def down() -> object:
+            attempts.append(now[0])
+            raise ConnectionError("cannot connect to PostgreSQL (host=x): server is down")
+
+        db._open = down  # pyright: ignore[reportPrivateUsage]
+        _kill(db)
+        with pytest.raises(ConnectionError, match="server is down"):
+            db.events.count_since(0)
+        for _ in range(3):
+            with pytest.raises(ConnectionError, match="unavailable"):
+                db.events.count_since(0)  # within the first wait: no attempt
+        now[0] = 100.6
+        with pytest.raises(ConnectionError, match=r"next attempt in 1s"):
+            db.events.count_since(0)  # 0.4 s left reads as 1 s, not 0 s
+        now[0] = 100.0
+        assert attempts == [100.0]
+
+        waits = []
+        for _ in range(8):
+            last = attempts[-1]
+            while len(attempts) == len(waits) + 1:
+                now[0] += 0.5
+                with pytest.raises(ConnectionError):
+                    db.events.count_since(0)
+            waits.append(attempts[-1] - last)
+        assert waits == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+        db._open = real_open  # pyright: ignore[reportPrivateUsage]
+        now[0] += 30.0
+        assert db.events.count_since(0) == 0  # the server is back
+        db._open = down  # pyright: ignore[reportPrivateUsage]
+        _kill(db)
+        with pytest.raises(ConnectionError, match="server is down"):
+            db.events.count_since(0)
+        now[0] += 1.0
+        with pytest.raises(ConnectionError, match="server is down"):
+            db.events.count_since(0)  # the wait started over at 1 s
+
+
+def test_an_hnsw_search_after_the_session_is_lost_reconnects(pg_schema):
+    """HNSW searches run in a read-only transaction of their own, outside the write path."""
+    with closing(PostgresDatabase(pg_schema, vector_index="hnsw")) as db:
+        db.vectors.reset({"model": "m1", "group_threshold": 0.8})
+        db.knowledge.put(item("k1", scope="team", owner="t1"))
+        db.vectors.put_vector("knowledge", "k1", [1.0, 0.0])
+        _kill(db)
+        assert [id for id, _ in db.vectors.search_knowledge([1.0, 0.0], caller("u1", "t1"), "team", 5)] == ["k1"]
+
+
+def test_a_closed_database_stays_closed(pg_schema):
+    """close() is the caller's choice: a later call must not open a new session behind its back."""
+    import psycopg
+
+    db = PostgresDatabase(pg_schema)
+    db.close()
+    with pytest.raises(psycopg.OperationalError, match="closed"):
+        db.events.count_since(0)
+    with pytest.raises(psycopg.OperationalError, match="closed"), db.transaction():
+        pass
+    assert db.con.closed
+
+
+def test_a_replaced_session_is_logged(pg_schema, caplog):
+    with closing(PostgresDatabase(pg_schema)) as db:
+        _kill(db)
+        with caplog.at_level("WARNING", logger="cortex_mem.store.postgres"):
+            db.events.count_since(0)
+        assert ["reconnected" in r.getMessage() for r in caplog.records] == [True]
