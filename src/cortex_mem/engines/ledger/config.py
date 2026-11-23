@@ -1,11 +1,13 @@
 """Validated configuration for the ledger engine."""
 
+import hashlib
+import json
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import timedelta
 from types import MappingProxyType
-from typing import TypeVar
+from typing import TypeVar, cast
 
 _T = TypeVar("_T")
 
@@ -77,9 +79,12 @@ class LedgerConfig:
         if pool < 1:
             raise ValueError("pool must be >= 1")
 
+        # Team knowledge needs a verified source by default: records in one claim are only known to
+        # be on one topic, not to agree (there is no judge yet), so a record with another value would
+        # otherwise supply the second vote.
         gate_defaults = {
             "personal": (2, 1, False, 0.0, 0.20),
-            "team": (2, 1, False, 0.0, 0.15),
+            "team": (2, 1, True, 0.0, 0.15),
         }
         gates = {}
         for scope in _SCOPES:
@@ -163,6 +168,27 @@ class LedgerConfig:
             half_life=_days("half_life_days", get("half_life_days", _float, 0.0)),
             high_risk_terms=terms,
         )
+
+    def fingerprint(self) -> str:
+        """A short digest of every parsed setting. Equal settings give equal
+        digests however they were written ("0.8" and "0.80")."""
+        text = json.dumps(_plain(self), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def _plain(value: object) -> object:
+    """`value` as JSON-ready data: dataclasses and mappings as dicts,
+    timedeltas as seconds, tuples as lists."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _plain(cast(object, getattr(value, f.name))) for f in fields(value)}
+    if isinstance(value, Mapping):
+        items = cast("Mapping[object, object]", value).items()
+        return {str(k): _plain(v) for k, v in items}
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, tuple):
+        return [_plain(v) for v in cast("tuple[object, ...]", value)]
+    return value
 
 
 def _known_keys() -> set[str]:

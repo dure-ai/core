@@ -96,7 +96,7 @@ claude mcp add cortex-mem -e CORTEX_TEAM=payments \
 
 ## LedgerEngine (증거 원장 엔진)
 
-기록을 주장(claim)으로 묶고, 주장마다 독립 출처별 증거를 쌓고, 게이트를 넘은 주장만 지식으로 올리고, 검증된 실패가 오면 근거와 함께 내린다. 독립 출처는 사람(팀 범위) 또는 세션(개인 범위) 단위로 세므로 한 사람의 반복은 한 표다. 건네받은 기억을 다시 말한 기록과 다른 사람의 글을 그대로 옮긴 기록은 표로 세지 않는다. 지식을 받아서 한 일이 성공한 것은 쓸모의 기록일 뿐 참의 표가 아니다. 판정 기록은 `ctx.state`에 두고, 같은 이벤트 순서와 같은 core 묶음이면 같은 결과가 나온다.
+기록을 주장(claim)으로 묶고, 주장마다 독립 출처별 증거를 쌓고, 게이트를 넘은 주장만 지식으로 올리고, 검증된 실패가 오면 근거와 함께 내린다. 팀 범위에서는 독립 출처를 사람 단위로 세므로 한 사람의 반복은 한 표다. 개인 범위의 주장은 본인만 보므로 세션을 독립 출처로 센다. 같은 사람이 세션 두 개에서 같은 기록을 남기면 표가 둘이 되어, 검증 없이도 개인 지식이 될 수 있다. 팀 지식은 기본으로 검증된 지지(리뷰·테스트·문서·사람 확인)가 하나 이상 있어야 한다. 한 주장에 묶인 기록은 같은 주제라는 것만 알 뿐 같은 말인지는 모르기 때문이다(아래 한계). 건네받은 기억을 다시 말한 기록과 다른 사람의 글을 그대로 옮긴 기록은 표로 세지 않는다. 지식을 받아서 한 일이 성공한 것은 쓸모의 기록일 뿐 참의 표가 아니다. 판정 기록은 `ctx.state`에 두고, 같은 이벤트 순서와 같은 core 묶음이면 같은 결과가 나온다.
 
 엔진 경로는 `cortex_mem.engines.ledger:LedgerEngine`이다. 생성자는 `Mapping[str, str]` 설정만 받고(없으면 기본값), 키가 틀리거나 값이 범위를 벗어나면 `ValueError`로 멈춘다. 서버의 `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`은 팩토리를 빈 설정(`{}`)으로 부르므로 기본값만 쓰인다. 설정을 바꾸려면 코드에서 `LedgerEngine({...})`로 만든다.
 
@@ -126,7 +126,7 @@ claude mcp add cortex-mem -e CORTEX_TEAM=payments \
 
 **건넬 때(`handoff`).** 지식 검색·기록 검색(임베딩을 켜면 의미 검색 두 목록도)을 RRF로 합쳐 주장 단위로 모으고, 상태 가중·최신성을 곱해 순위를 낸다. deprecated·archived와 조건이 호출자의 `context`와 다른 주장은 뺀다. 항목 하나가 주장 하나이고, 본문 아래에 `[established · human 1, test 1 · 2 sources · since 2026-10-03]` 같은 출처 줄을 붙이며, `sources`에는 지지 이벤트가 모두 들어간다. `status`는 승격된 established만 `knowledge`, 나머지는 `memory`다.
 
-**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다(`state_version = "2"`: 증거 줄이 기록에서 왔는지(`record`)를 함께 저장한다). 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`). 같은 이벤트가 다시 전달돼도 한 번만 센다.
+**상태와 다시 만들기.** 판정 기록은 모두 `ctx.state`에 있다. `state_version`은 상태 형식(`STATE_FORMAT = "2"`: 증거 줄이 기록에서 왔는지(`record`)를 함께 저장한다)과 설정의 해시를 합친 값이다(`2+<해시>`). 설정이 무엇이 지식이 되는지를 정하므로, 다른 설정으로 쌓인 저장소를 이어 쓰지 않고 처음부터 다시 받는다. 같은 값은 쓰는 방법이 달라도(`0.8`과 `0.80`) 같은 해시다. 버전이나 색인 지문이 바뀌면 런타임이 상태를 비우고 처음부터 다시 전달하고, 같은 지식 베이스가 다시 만들어진다. 주장을 만들지 않고 넘긴 이벤트 수는 `ledger:skipped` 키에 이유별로 남는다(`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`). 같은 이벤트가 다시 전달돼도 한 번만 센다.
 
 설정 키(값은 모두 문자열이다. 기본값은 `config.py`와 같다):
 
@@ -139,7 +139,7 @@ claude mcp add cortex-mem -e CORTEX_TEAM=payments \
 | `pool` | `50` | `handoff` 후보 수. 후보 목록마다(1 이상) |
 | `gate.<scope>.min_sources` | `2` | 지지하는 독립 출처 수. `<scope>`는 `personal`·`team` |
 | `gate.<scope>.alt_verified` | `1` | 출처가 모자랄 때 대신 채우는 검증된 지지 출처 수 |
-| `gate.<scope>.require_verified` | `false` | 검증된 지지가 반드시 있어야 하는가(`true`·`false`만) |
+| `gate.<scope>.require_verified` | `false`(personal), `true`(team) | 검증된 지지가 반드시 있어야 하는가(`true`·`false`만). team의 기본값이 `true`인 이유는 아래 한계 첫 줄 |
 | `gate.<scope>.min_span_days` | `0` | 첫 지지와 마지막 지지의 최소 간격(일) |
 | `gate.<scope>.max_contra_ratio` | `0.20`(personal), `0.15`(team) | 반박 점수 비율 C/(S+C)의 상한(0~1) |
 | `weight.<channel>` | observation `1.0`, review `1.5`, test `2.0`, doc `2.0`, human `3.0` | 채널별 증거 가중. `<channel>`은 `observation`·`review`·`test`·`doc`·`human` |
@@ -155,7 +155,7 @@ claude mcp add cortex-mem -e CORTEX_TEAM=payments \
 
 한계:
 
-- core 묶음은 경쟁하는 사실도 묶을 수 있다. 조건이 다른 기록과 내려간 주장에 붙는 기록만 나눈다. 묶음 안의 모순 판정은 작은 LLM 판정이 들어온 뒤에 한다.
+- core 묶음(임베딩이 없으면 글자 비교)은 경쟁하는 사실도 한 주장으로 묶을 수 있다. 조건이 다른 기록과 내려간 주장에 붙는 기록만 나눈다. 묶인 기록은 내용과 상관없이 지지 표가 되므로, 팀 범위는 기본으로 검증된 지지가 있어야 승격한다(`gate.team.require_verified`). 이것을 끄면 값만 다른 기록(포트 8080과 9090 같은)이 두 번째 표가 되어 먼저 쓴 본문이 지식이 될 수 있다. 묶음 안의 같음·갱신·모순 판정은 작은 LLM 판정이 들어온 뒤에 한다.
 - 임베딩이 없으면 서로 다른 사람의 기록을 글자만으로는 거의 묶지 못한다.
 - v0.1 범위는 personal·team이고 org 범위 기록은 주장을 만들지 않는다.
 - 고위험 단어가 든 본문은 그 본문이 대표가 된 뒤의 사람 확인이 있어야 지식이 된다.

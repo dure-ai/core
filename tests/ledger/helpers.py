@@ -18,6 +18,11 @@ from .fakes import FakeSimilarity
 T0 = datetime(2026, 10, 19, tzinfo=UTC)
 ENGINE = "ledger"  # name of the engine's state in the database
 
+# Most of these tests build team claims that two people's records establish, to test what happens
+# next. The default team gate also needs a verified source, so runtime() turns that off unless a
+# test passes its own engine. test_behaviour and test_config pin the default.
+UNVERIFIED_TEAM: Mapping[str, str] = {"gate.team.require_verified": "false"}
+
 
 def ev(
     id: str,
@@ -72,10 +77,11 @@ def runtime(
     db: InMemoryDatabase | None = None,
     groups: Mapping[str, str] | None = None,
 ) -> tuple[Runtime, InMemoryDatabase]:
-    """A runtime over `db`. With `groups` (event id -> label) ctx.similar is a
+    """A runtime over `db`, with a LedgerEngine using UNVERIFIED_TEAM unless
+    `engine` is given. With `groups` (event id -> label) ctx.similar is a
     FakeSimilarity; without, it is None and the engine takes the lexical path."""
     db = db if db is not None else InMemoryDatabase()
-    engine = engine if engine is not None else LedgerEngine()
+    engine = engine if engine is not None else LedgerEngine(UNVERIFIED_TEAM)
     args = (engine, db.events, db.knowledge, db.state(ENGINE))
     if groups is None:
         return Runtime(*args, transaction=db.transaction), db

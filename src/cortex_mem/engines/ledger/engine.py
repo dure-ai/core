@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from typing import ClassVar
 
 from cortex_mem.access import owner_for
 from cortex_mem.contract import (
@@ -47,13 +48,20 @@ class LedgerEngine:
     contradiction or long silence. Load it on the server with
     `CORTEX_ENGINE=cortex_mem.engines.ledger:LedgerEngine`."""
 
-    state_version = "2"  # 2: evidence rows carry `record`
+    STATE_FORMAT: ClassVar[str] = "2"  # 2: evidence rows carry `record`
 
     def __init__(self, config: Mapping[str, str] | None = None) -> None:
         """Parse `config` (string keys and values, see README); None or an
         empty mapping means the defaults. Raises ValueError on an unknown
         key or an out-of-range value."""
         self._cfg = LedgerConfig.from_mapping(config)
+
+    @property
+    def state_version(self) -> str:
+        """The state format and a digest of the settings. The settings decide
+        what becomes knowledge, so a store delivered under other settings is
+        replayed under these instead of continued (contract: state_version)."""
+        return f"{self.STATE_FORMAT}+{self._cfg.fingerprint()}"
 
     def observe(self, event: Event, ctx: EngineContext) -> Sequence[Decision]:
         """Apply one event and return the decisions it causes.

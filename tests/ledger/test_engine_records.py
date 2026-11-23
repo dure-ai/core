@@ -16,6 +16,7 @@ from cortex_mem.store.memory import InMemoryDatabase
 from .fakes import FakeSimilarity
 from .helpers import (
     T0,
+    UNVERIFIED_TEAM,
     count,
     edit_state,
     ev,
@@ -262,7 +263,7 @@ def test_personal_records_in_one_session_do_not_promote():
 def test_redelivery_does_not_count_twice(groups):
     """Review Focus 1: observe may run twice for one event on one state."""
     db = InMemoryDatabase()
-    engine = LedgerEngine()
+    engine = LedgerEngine(UNVERIFIED_TEAM)
     st = FakeState()
     e1 = ev("e1", FACT)
     e2 = ev("e2", OTHER if groups else NEAR, user="u2", minutes=1)
@@ -563,7 +564,34 @@ def test_evidence_rows_say_whether_they_come_from_a_record():
 
     rows = state(db).evidence("c-e1")
     assert [(e.event_id, e.record) for e in rows] == [("e1", True), ("j1", False), ("e2", True)]
-    assert LedgerEngine.state_version == "2"
+    assert LedgerEngine.STATE_FORMAT == "2"
+
+
+def test_the_settings_are_part_of_the_state_version():
+    default = LedgerEngine().state_version
+    assert default.startswith(LedgerEngine.STATE_FORMAT + "+")
+    assert LedgerEngine({}).state_version == default
+    assert LedgerEngine({"same_threshold": "0.80"}).state_version == default  # the same value
+    assert LedgerEngine({"gate.team.min_sources": "3"}).state_version != default
+    assert LedgerEngine(UNVERIFIED_TEAM).state_version != default
+
+
+def test_reopening_a_store_with_other_settings_replays_under_them():
+    """Settings decide what is knowledge, so a store delivered under one set must not be continued
+    under another: the version changes and the runtime replays."""
+    rt, db = runtime()
+    rt.append(ev("e1", FACT, user="u1"))
+    rt.append(ev("e2", NEAR, user="u2", minutes=1))
+    assert knowledge_ids(db) == ["c-e1"]
+
+    strict, _ = runtime(LedgerEngine({**UNVERIFIED_TEAM, "gate.team.min_sources": "3"}), db=db)
+    strict.sync()
+    assert knowledge_ids(db) == []
+    assert [c.status for c in state(db).claims()] == ["candidate"]  # two of three sources
+
+    again, _ = runtime(db=db)
+    again.sync()
+    assert knowledge_ids(db) == ["c-e1"]
 
 
 class _CountingState:

@@ -14,7 +14,7 @@ def test_defaults():
     assert cfg.match_pool == 10
     assert cfg.pool == 50
     assert cfg.gates["personal"] == GateRule(2, 1, False, timedelta(0), 0.20)
-    assert cfg.gates["team"] == GateRule(2, 1, False, timedelta(0), 0.15)
+    assert cfg.gates["team"] == GateRule(2, 1, True, timedelta(0), 0.15)
     assert dict(cfg.weights) == {
         "observation": 1.0,
         "review": 1.5,

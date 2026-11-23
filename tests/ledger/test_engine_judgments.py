@@ -9,6 +9,7 @@ from cortex_mem.engines.ledger.store import LedgerStore
 from .helpers import (
     ENGINE,
     T0,
+    UNVERIFIED_TEAM,
     _Writable,
     edit_state,
     ev,
@@ -246,11 +247,11 @@ def test_a_deprecated_claim_ignores_support_that_is_not_verified_or_not_later():
 
 
 def test_a_promoted_claim_keeps_its_status_when_the_checks_would_fail():
-    rt, db = runtime(engine=LedgerEngine())
+    rt, db = runtime(engine=LedgerEngine(UNVERIFIED_TEAM))
     two_observers(rt)
     assert state(db).claim("c-e1").status == "established"
     # a canonical with a high-risk term: re-evaluation alone must not demote
-    rt2, db2 = runtime(engine=LedgerEngine({"high_risk_terms": "migrations"}))
+    rt2, db2 = runtime(engine=LedgerEngine({**UNVERIFIED_TEAM, "high_risk_terms": "migrations"}))
     rt2.append(ev("e1", FACT, user="u1"))
     rt2.append(ev("e2", NEAR, user="u2", minutes=1))
     assert state(db2).claim("c-e1").status != "established"  # not promoted, high risk
@@ -277,7 +278,7 @@ def test_a_judgment_observed_twice_counts_once():
 
     staged = _Writable(db.state(ENGINE))  # committed state plus this run's writes
     ctx = EngineContext(events=rt.events, knowledge=rt.knowledge, state=staged, similar=None)
-    engine = LedgerEngine()
+    engine = LedgerEngine(UNVERIFIED_TEAM)
     for _ in range(2):
         engine.observe(success, ctx)
         engine.observe(failure, ctx)
@@ -301,7 +302,7 @@ def test_recall_marks_what_the_session_was_handed():
 
 
 RISKY = "always run database migrations first, then restart the api, using the admin password"
-RISK_CFG = {"high_risk_terms": "password"}
+RISK_CFG = {**UNVERIFIED_TEAM, "high_risk_terms": "password"}
 
 
 def risky_setup():
@@ -388,7 +389,7 @@ def test_skipped_events_are_counted_once_when_observed_again():
 
     staged = _Writable(db.state(ENGINE))
     ctx = EngineContext(events=rt.events, knowledge=rt.knowledge, state=staged, similar=None)
-    engine = LedgerEngine()
+    engine = LedgerEngine(UNVERIFIED_TEAM)
     for event in events:
         engine.observe(event, ctx)
 

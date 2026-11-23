@@ -12,7 +12,9 @@ from cortex_mem.engines.ledger.model import Claim, Evidence
 
 KST = timezone(timedelta(hours=9))
 T0 = datetime(2026, 11, 19, 10, 0, tzinfo=KST)
-CFG = LedgerConfig.from_mapping(None)
+# Two independent sources are enough here; the default team gate also needs a verified source,
+# which test_team_needs_a_verified_source_by_default pins.
+CFG = LedgerConfig.from_mapping({"gate.team.require_verified": "false"})
 
 
 def claim(status="candidate", scope="team") -> Claim:
@@ -51,6 +53,16 @@ def test_two_people_established():
 def test_one_person_with_test_established_by_alt_verified():
     r = evaluate(claim(), tl(S=2.0, keys=1, verified=1, by={"test": 1}), "text", CFG, human_fresh=False)
     assert r.decision == "established"
+
+
+def test_team_needs_a_verified_source_by_default():
+    default = LedgerConfig.from_mapping(None)
+    r = evaluate(claim(), tl(S=1.4, keys=2), "text", default, human_fresh=False)
+    assert r.decision == "provisional"
+    assert r.checks["verified"] is False
+    verified = tl(S=2.2, keys=2, verified=1, by={"observation": 1, "review": 1})
+    assert evaluate(claim(), verified, "text", default, human_fresh=False).decision == "established"
+    assert evaluate(claim(scope="personal"), tl(S=1.4, keys=2), "text", default, human_fresh=False).decision == "established"
 
 
 def test_require_verified_leaves_provisional():

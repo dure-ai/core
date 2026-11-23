@@ -5,7 +5,7 @@ from datetime import timedelta
 from cortex_mem.contract import Caller, Demote, Promote
 from cortex_mem.engines.ledger import LedgerEngine
 
-from .helpers import T0, ev, knowledge_ids, runtime, state
+from .helpers import T0, UNVERIFIED_TEAM, ev, knowledge_ids, runtime, state
 
 FACT = "the deploy script must run migrations before restarting the api server every time"
 NEAR = "the deploy script must run migrations before restarting the api server each time"
@@ -16,7 +16,7 @@ BETA_NEAR = "service beta invalidates cache entries after every schema change to
 GAMMA = "service gamma drains queue workers gracefully before any node reboot happens"
 GAMMA_NEAR = "service gamma drains queue workers gracefully before any node reboot occurs"
 
-REVIEW_90 = {"review_after_days": "90"}
+REVIEW_90 = {**UNVERIFIED_TEAM, "review_after_days": "90"}
 
 
 def decisions_of(rt, kind):

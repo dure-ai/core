@@ -14,7 +14,7 @@ from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.postgres import PostgresDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
-from .helpers import T0, edit_state, ev, knowledge_ids, runtime, state
+from .helpers import T0, UNVERIFIED_TEAM, edit_state, ev, knowledge_ids, runtime, state
 
 FACT = "the deploy script must run migrations before restarting the api server every time"
 # Jaccard with FACT is 11/13: the same claim on the lexical path, not a copy.
@@ -104,13 +104,41 @@ def test_two_people_confirming_promote_then_verified_failures_demote(db):
     assert rt.rejections == []
 
 
-def test_with_the_port_two_peoples_records_in_one_group_promote(db):
-    rt, _ = runtime(db=db, groups={"e1": "g", "e2": "g"})
+def test_with_the_port_two_peoples_records_in_one_group_wait_for_verified_support(db):
+    rt, _ = runtime(LedgerEngine(), db=db, groups={"e1": "g", "e2": "g"})
+    rt.append(ev("e1", FACT, user="u1"))
+    rt.append(ev("e2", OTHER, user="u2", minutes=1))
+    assert knowledge_ids(db) == []  # team knowledge needs a verified source by default
+    assert [c.status for c in state(db).claims()] == ["provisional"]
+
+    rt.append(judgment("e3", "u3", minutes=2))  # a review confirms it
+    assert knowledge_ids(db) == ["c-e1"]
+    assert len(decisions_of(rt, Promote)) == 1
+    assert rt.rejections == []
+
+
+def test_with_the_port_two_peoples_records_in_one_group_promote_without_the_verified_rule(db):
+    rt, _ = runtime(LedgerEngine(UNVERIFIED_TEAM), db=db, groups={"e1": "g", "e2": "g"})
     rt.append(ev("e1", FACT, user="u1"))
     rt.append(ev("e2", OTHER, user="u2", minutes=1))
     assert knowledge_ids(db) == ["c-e1"]
     assert len(decisions_of(rt, Promote)) == 1
-    assert rt.rejections == []
+
+
+@pytest.mark.parametrize("port", [False, True], ids=["lexical", "port"])
+def test_a_conflicting_record_does_not_promote_the_first_one_as_team_knowledge(db, port):
+    """Two people record the same setting with different values. A group can join them (there is no
+    judge yet), so the other value must not supply the second vote: nothing is promoted until a
+    verified source confirms one of them."""
+    first = "the staging api gateway listens on port 8080 and the health check path is /healthz behind the proxy"
+    other = "the staging api gateway listens on port 9090 and the health check path is /healthz behind the proxy"
+    rt, _ = runtime(LedgerEngine(), db=db, groups={"e1": "g", "e2": "g"} if port else None)
+    rt.append(ev("e1", first, user="ann"))
+    rt.append(ev("e2", other, user="bob", minutes=1))
+
+    assert knowledge_ids(db) == []
+    assert [c.status for c in state(db).claims()] == ["provisional"]
+    assert decisions_of(rt, Promote) == []
 
 
 def test_without_the_port_two_wordings_do_not_promote(db):
@@ -207,9 +235,9 @@ def test_another_state_version_rebuilds_the_same_knowledge_base(db, port):
     assert "sentinel" in state(db).skipped()
 
     class Next(LedgerEngine):
-        state_version = LedgerEngine.state_version + "-next"
+        state_version = LedgerEngine.STATE_FORMAT + "-next"
 
-    rt2, _ = runtime(engine=Next(), db=db, groups=groups)
+    rt2, _ = runtime(engine=Next(UNVERIFIED_TEAM), db=db, groups=groups)
     rt2.sync()
     # The reset happened: the old state is gone and the replay decided again.
     assert "sentinel" not in state(db).skipped()
@@ -251,9 +279,9 @@ def test_look_alike_records_later_in_the_log_do_not_change_what_a_batched_sync_b
     assert _outcome(another_db) == _outcome(db)
 
     class Next(LedgerEngine):
-        state_version = LedgerEngine.state_version + "-next"
+        state_version = LedgerEngine.STATE_FORMAT + "-next"
 
-    rebuilt, _ = runtime(engine=Next(), db=db)
+    rebuilt, _ = runtime(engine=Next(UNVERIFIED_TEAM), db=db)
     rebuilt.sync()
     assert [d.item.id for d in decisions_of(rebuilt, Promote)] == ["c-e1"]
     assert _outcome(db) == _outcome(another_db)
