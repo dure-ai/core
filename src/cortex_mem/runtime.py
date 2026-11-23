@@ -174,8 +174,10 @@ class Runtime:
     IndexConfigChanged or StateVersionChanged. Processes with another index
     config, or another engine state_version, on one store are not supported;
     they fail loudly instead of mixing. A failing observe whose epoch moved
-    is likewise restarted uncounted only MAX_CONFIG_RETRIES times per event;
-    after that its failures count toward max_failures.
+    is likewise restarted uncounted only MAX_CONFIG_RETRIES times per event
+    (counted by this Runtime until the event is passed, not per sync call);
+    after that its failures count toward max_failures. A failure while
+    another process passed the event is never counted.
 
     `sync()` returns how many events it delivered; `pending()` returns how
     many still wait after the engine's cursor.
@@ -341,9 +343,9 @@ class Runtime:
         engine's state and cursor (state.commit checks the epoch and cursor
         once more, atomically, and is the one place that raises
         CursorConflict) and applies the accepted decisions. A failure of the
-        engine is counted toward max_failures, except while the epoch moved
-        during observe (at most MAX_CONFIG_RETRIES times per event); nothing
-        else is: a store error while committing, an EmbeddingError or
+        engine is counted toward max_failures, except when another process
+        passed the event during observe, or while the epoch moved during
+        observe (at most MAX_CONFIG_RETRIES times per event); nothing else is: a store error while committing, an EmbeddingError or
         IndexConfigChanged is raised."""
         staged = self._staged()
         try:
@@ -352,7 +354,9 @@ class Runtime:
         except (EmbeddingError, IndexConfigChanged):
             raise  # not the engine's failure: retried, never counted
         except Exception as exc:
-            now = self.state.epoch()
+            now, now_cursor, _ = self.state.position()
+            if now_cursor >= seq:
+                return 0, []  # another process delivered or skipped it meanwhile: nothing to count
             if now != epoch:
                 # Reset or moved on meanwhile: not a failure on this state, so read again. A
                 # process that keeps moving the epoch without delivering this event (ticking,
