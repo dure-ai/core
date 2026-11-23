@@ -35,7 +35,9 @@ from .store.base import CursorConflict, EngineStateBackend, EventStore, Knowledg
 log = logging.getLogger(__name__)
 
 _ABSENT = object()
-MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
+# Per event: restarts after another config rebuilt the index or another version reset the engine,
+# and restarts of a failing observe because the engine's epoch moved meanwhile.
+MAX_CONFIG_RETRIES = 3
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 
 
@@ -171,7 +173,9 @@ class Runtime:
     MAX_CONFIG_RETRIES (3) restarts of one event, sync raises
     IndexConfigChanged or StateVersionChanged. Processes with another index
     config, or another engine state_version, on one store are not supported;
-    they fail loudly instead of mixing.
+    they fail loudly instead of mixing. A failing observe whose epoch moved
+    is likewise restarted uncounted only MAX_CONFIG_RETRIES times per event;
+    after that its failures count toward max_failures.
 
     `sync()` returns how many events it delivered; `pending()` returns how
     many still wait after the engine's cursor.
@@ -238,8 +242,9 @@ class Runtime:
         committed in a short checked transaction (_deliver_next). If the
         engine raises, that event stays undelivered and is retried next time,
         until `max_failures` attempts have failed; then it is skipped (see
-        `skipped`). A failure is counted only if the engine's epoch did not
-        move while it observed. With an index, each event is indexed before
+        `skipped`). A failure is not counted when the engine's epoch moved
+        while it observed (the event starts over), until that has happened
+        MAX_CONFIG_RETRIES times for the event. With an index, each event is indexed before
         it is observed, and an EmbeddingError while indexing it (or while
         embedding knowledge, or raised inside observe) is raised as is: the
         event stays undelivered and is never skipped for it.
@@ -336,8 +341,10 @@ class Runtime:
         engine's state and cursor (state.commit checks the epoch and cursor
         once more, atomically, and is the one place that raises
         CursorConflict) and applies the accepted decisions. A failure of the
-        engine is counted toward max_failures; nothing else is: a store error
-        while committing, an EmbeddingError or IndexConfigChanged is raised."""
+        engine is counted toward max_failures, except while the epoch moved
+        during observe (at most MAX_CONFIG_RETRIES times per event); nothing
+        else is: a store error while committing, an EmbeddingError or
+        IndexConfigChanged is raised."""
         staged = self._staged()
         try:
             # Materialized here: a generator would run engine code inside the commit.
@@ -373,8 +380,8 @@ class Runtime:
             return 0, []
         touched, verdicts = committed
         self.verdicts.extend(verdicts)
-        self._failures.pop(seq, None)
-        self._restarts.pop(seq, None)
+        _ = self._failures.pop(seq, None)
+        _ = self._restarts.pop(seq, None)
         return 1, touched
 
     def _moved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> str | None:
@@ -415,8 +422,8 @@ class Runtime:
             # also starts the count again: correct, only slower to skip.
             self._failures.pop(seq, None)
             return
-        self._failures.pop(seq, None)
-        self._restarts.pop(seq, None)
+        _ = self._failures.pop(seq, None)
+        _ = self._restarts.pop(seq, None)
         self.skipped.append(Skipped(seq, event_id, attempts, f"{type(error).__name__}: {error}"))
 
     def _sync_knowledge(self, touched: Collection[str]) -> None:
