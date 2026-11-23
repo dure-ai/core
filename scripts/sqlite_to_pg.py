@@ -1,9 +1,11 @@
 """Move a SQLite store into an empty PostgreSQL database.
 
 Moves events (same seq), knowledge and its owner, every engine's state, cursor and
-version, and the embedding cache. Vectors, groups and the index version are not moved: the first sync on
-PostgreSQL rebuilds the index (its version names the store) and finds every embedding in
-the cache. Everything happens in one transaction, so a failure leaves the target empty.
+version, and the embedding cache. Vectors, groups and the index version are not moved: with
+embeddings on, the first sync on PostgreSQL rebuilds the index (its version names the store),
+finds every embedding in the cache and replays the engines; without embeddings, the engines
+continue from their copied cursors. Everything happens in one transaction, so a failure leaves
+the target empty.
 
 Usage:
     python scripts/sqlite_to_pg.py SQLITE_PATH PG_URL
@@ -42,10 +44,11 @@ def _check_empty(pg) -> None:
     first tool call would otherwise outlive an ownerless source, and an engine would adopt another
     engine's knowledge base where the source would replay."""
     full = [t for t in (*TABLES, *DERIVED) if _count(pg, t)]
-    if pg.query("SELECT count(*) FROM cortex_meta WHERE key <> 'schema_version'")[0][0]:
-        full.append("cortex_meta")
+    keys = [k for (k,) in pg.query("SELECT key FROM cortex_meta WHERE key <> 'schema_version' ORDER BY key")]
+    if keys:
+        full.append(f"cortex_meta ({', '.join(keys)})")
     if full:
-        raise MigrationError(f"the target must be empty, but it already has rows in: {', '.join(full)}")
+        raise MigrationError(f"the target must be empty, but it already has rows in: {', '.join(full)}; use a new database")
 
 
 def _copy_events(src, pg) -> None:

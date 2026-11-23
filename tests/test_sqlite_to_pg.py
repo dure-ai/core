@@ -196,7 +196,7 @@ def test_a_target_with_only_a_knowledge_owner_exits_2_and_keeps_it(tmp_path, pg_
 
     result = run(str(path), pg_schema)
     assert result.returncode == 2
-    assert "cortex_meta" in result.stderr
+    assert "cortex_meta (knowledge_owner); use a new database" in result.stderr
     assert pg_count(pg_schema, "events") == 0
     pg = PostgresDatabase(pg_schema)
     try:
