@@ -380,8 +380,7 @@ class Runtime:
             return 0, []
         touched, verdicts = committed
         self.verdicts.extend(verdicts)
-        _ = self._failures.pop(seq, None)
-        _ = self._restarts.pop(seq, None)
+        self._forget_attempts(seq)
         return 1, touched
 
     def _moved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> str | None:
@@ -419,11 +418,11 @@ class Runtime:
         except CursorConflict:
             # Another process delivered or skipped it, or the engine was reset.
             # An epoch-only conflict (a tick or a reset, the event still pending)
-            # also starts the count again: correct, only slower to skip.
-            self._failures.pop(seq, None)
+            # also starts the count again: correct, only slower to skip. The
+            # restarts stay: clearing them would let a moving epoch loop again.
+            _ = self._failures.pop(seq, None)
             return
-        _ = self._failures.pop(seq, None)
-        _ = self._restarts.pop(seq, None)
+        self._forget_attempts(seq)
         self.skipped.append(Skipped(seq, event_id, attempts, f"{type(error).__name__}: {error}"))
 
     def _sync_knowledge(self, touched: Collection[str]) -> None:
@@ -454,6 +453,12 @@ class Runtime:
             ids = set(self._pending_knowledge)
             if self.index.sync_knowledge(self.knowledge, ids):  # else: the ids keep waiting
                 self._pending_knowledge -= ids
+
+    def _forget_attempts(self, seq: int) -> None:
+        """Drop what this process counted for the event at `seq`, its failures
+        and its uncounted restarts, once it is delivered or skipped."""
+        _ = self._failures.pop(seq, None)
+        _ = self._restarts.pop(seq, None)
 
     def _give_up(self, seq: int) -> int | None:
         """Count a failed attempt; the attempt count when the event is to be
