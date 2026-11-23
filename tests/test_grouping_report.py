@@ -93,8 +93,9 @@ def test_cli_prints_header_one_line_per_threshold_and_summary(tmp_path):
     assert [r[0] for r in rows] == ["0.5", "0.9", "1.0"]
     assert all(len(r) == 5 for r in rows)
     assert rows[-1][1] == "1.000"
-    assert len(lines) == 5
-    assert "0.01" in lines[-1]
+    assert len(lines) == 6
+    assert "0.01" in lines[-2]
+    assert "chain" in lines[-1]  # rival_rate counts direct matches only (#38)
 
 
 def test_cli_default_thresholds_are_seven(tmp_path):
@@ -102,7 +103,7 @@ def test_cli_default_thresholds_are_seven(tmp_path):
     result = _run([str(path), "--embedder", "hash"])
     assert result.returncode == 0, result.stderr
     lines = result.stdout.strip().splitlines()
-    assert len(lines) == 1 + 7 + 1
+    assert len(lines) == 1 + 7 + 2
 
 
 def test_cli_upstage_without_key_exits_2_with_message(tmp_path):

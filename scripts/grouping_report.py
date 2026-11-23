@@ -4,6 +4,11 @@ Input is JSON Lines, one object per line: {"a": str, "b": str, "same": bool}.
 A pair is grouped at threshold t when cosine(a, b) >= t. For each threshold the
 report prints the share of "same" pairs and "rival" pairs that are grouped.
 
+These are direct matches. The index groups by single link (a record joins the
+group of its closest earlier member), so two records can share a group through a
+third one even when their own cosine is below t. The real rival rate can be
+higher than rival_rate; measuring it is #38.
+
 Usage:
     python scripts/grouping_report.py PAIRS.jsonl --embedder hash
     UPSTAGE_API_KEY=... python scripts/grouping_report.py PAIRS.jsonl \
@@ -114,7 +119,8 @@ def _read_pairs(path: Path) -> list[dict[str, Any]]:
 
 def _format(rows: list[Row]) -> str:
     """The rows as a tab-separated table, then the lowest threshold whose
-    rival_rate is at most RIVAL_LIMIT (or a line saying none qualifies)."""
+    rival_rate is at most RIVAL_LIMIT (or a line saying none qualifies), then
+    a note that rival_rate misses groups formed through a chain."""
     lines = ["threshold\tsame_rate\trival_rate\tn_same\tn_rival"]
     for r in rows:
         lines.append(f"{r.threshold}\t{r.same_rate:.3f}\t{r.rival_rate:.3f}\t{r.n_same}\t{r.n_rival}")
@@ -123,6 +129,10 @@ def _format(rows: list[Row]) -> str:
         lines.append(f"lowest threshold with rival_rate <= {RIVAL_LIMIT}: {min(ok)}")
     else:
         lines.append(f"no threshold qualifies with rival_rate <= {RIVAL_LIMIT}")
+    lines.append(
+        "note: rival_rate compares each pair directly; the index also groups records through a chain"
+        " of similar ones, so it can group more rival pairs than this shows (#38)"
+    )
     return "\n".join(lines)
 
 
