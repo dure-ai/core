@@ -1011,3 +1011,24 @@ def test_an_hnsw_search_after_the_session_is_lost_reconnects(pg_schema):
         db.vectors.put_vector("knowledge", "k1", [1.0, 0.0])
         _kill(db)
         assert [id for id, _ in db.vectors.search_knowledge([1.0, 0.0], caller("u1", "t1"), "team", 5)] == ["k1"]
+
+
+def test_a_closed_database_stays_closed(pg_schema):
+    """close() is the caller's choice: a later call must not open a new session behind its back."""
+    import psycopg
+
+    db = PostgresDatabase(pg_schema)
+    db.close()
+    with pytest.raises(psycopg.OperationalError, match="closed"):
+        db.events.count_since(0)
+    with pytest.raises(psycopg.OperationalError, match="closed"), db.transaction():
+        pass
+    assert db.con.closed
+
+
+def test_a_replaced_session_is_logged(pg_schema, caplog):
+    with closing(PostgresDatabase(pg_schema)) as db:
+        _kill(db)
+        with caplog.at_level("WARNING", logger="cortex_mem.store.postgres"):
+            db.events.count_since(0)
+        assert ["reconnected" in r.getMessage() for r in caplog.records] == [True]

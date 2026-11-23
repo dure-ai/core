@@ -35,7 +35,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager, suppress
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, LiteralString, cast
+from typing import TYPE_CHECKING, Any, LiteralString, TypeVar, cast
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from ..embed import float32
@@ -53,6 +53,8 @@ LOCK_TIMEOUT_SETTING = "CORTEX_DB_LOCK_TIMEOUT"
 # doubles after each failed attempt up to RECONNECT_MAX, and a success starts it over.
 RECONNECT_FIRST = 1.0
 RECONNECT_MAX = 30.0
+
+_T = TypeVar("_T")
 # A PostgreSQL duration as lock_timeout takes it: a number with an optional unit (no unit
 # means milliseconds). PostgreSQL still checks the range when transaction() applies it.
 _DURATION = re.compile(r"\d+(\.\d+)?(us|ms|s|min|h|d)?")
@@ -214,17 +216,21 @@ class PostgresDatabase:
 
         A lost session (a server restart, an idle disconnect) is replaced on
         the next operation, but only where repeating it is safe: before a
-        read outside a transaction, and before a transaction begins. Inside a
-        transaction the error goes to the caller, since the server dropped
-        what the transaction wrote. While the server stays unreachable, calls
-        fail at once with ConnectionError between attempts, which are spaced
+        statement through query() outside a transaction, before a write
+        transaction begins, and before an HNSW search's read-only transaction
+        (read_only). Inside a write transaction the error goes to the caller,
+        since the server dropped what the transaction wrote. Each replaced
+        session is logged. While the server stays unreachable, calls fail at
+        once with ConnectionError between attempts, which are spaced
         RECONNECT_FIRST seconds apart and twice as far after each failure, up
-        to RECONNECT_MAX."""
+        to RECONNECT_MAX. After close(), nothing reconnects."""
         if vector_index not in VECTOR_INDEXES:
             raise ValueError(f"vector_index must be one of {VECTOR_INDEXES}, not {vector_index!r}")
         check_lock_timeout(lock_timeout)
         self._url: str = url
         # _describe imports psycopg, so a missing extra fails here with a clear error.
+        self._where: str
+        self._password: str | None
         self._where, self._password = _describe(url)
         self.lock_timeout = lock_timeout
         self.vector_index = vector_index  # read when the vector store builds its indexes
@@ -232,6 +238,7 @@ class PostgresDatabase:
         self._wait: float | None = None  # the current reconnect wait; None while connected
         self._until: float = 0.0
         self._last: str = ""
+        self._closed: bool = False  # close() was called: never reconnect
         self.con = self._open()
         # MCP servers may call tools from worker threads; one lock serializes them.
         self._lock = threading.RLock()
@@ -284,8 +291,9 @@ class PostgresDatabase:
         return con
 
     def _lost(self) -> bool:
-        """Whether the connection is closed or its session is gone."""
-        return bool(self.con.closed or self.con.broken)
+        """Whether the session is gone: the connection broke, or closed
+        without close() (a closed database stays closed)."""
+        return bool(self.con.broken or (self.con.closed and not self._closed))
 
     def _reconnect(self) -> None:
         """Replace the lost connection. While the last attempt failed less than
@@ -303,32 +311,34 @@ class PostgresDatabase:
             if self._wait == RECONNECT_FIRST:
                 log.warning("lost the PostgreSQL session (%s) and cannot reconnect: %s", self._where, exc)
             raise
-        if self._wait is not None:
-            log.warning("reconnected to PostgreSQL (%s)", self._where)
+        log.warning("lost the PostgreSQL session (%s); reconnected", self._where)
         self._wait = None
         old, self.con = self.con, con
         with suppress(Exception):  # the old session is gone either way
             old.close()
 
-    def read_only(self, read: "Callable[[Connection[TupleRow]], list[tuple[Any, ...]]]") -> list[tuple[Any, ...]]:
-        """Run `read` on the connection in a read-only transaction of its own, replacing a lost
-        session first, and once more when BEGIN finds it lost. Call it outside a write
-        transaction, with the in-process lock held."""
+    def read_only(self, read: "Callable[[Connection[TupleRow]], _T]") -> _T:
+        """Run `read` on the connection in a read-only transaction of its own, which takes
+        no write lock, replacing a lost session first, and once more when BEGIN finds it
+        lost. RuntimeError inside a write transaction, which a BEGIN cannot nest in."""
         from psycopg import OperationalError
 
-        if self._lost():
-            self._reconnect()
-        try:
-            self.con.execute("BEGIN READ ONLY")
-        except OperationalError:
-            if not self._lost():
-                raise
-            self._reconnect()
-            self.con.execute("BEGIN READ ONLY")
-        try:
-            return read(self.con)
-        finally:
-            self._rollback()
+        with self._lock:
+            if self._depth:
+                raise RuntimeError("read_only() cannot run inside a write transaction")
+            if self._lost():
+                self._reconnect()
+            try:
+                _ = self.con.execute("BEGIN READ ONLY")
+            except OperationalError:
+                if not self._lost():
+                    raise
+                self._reconnect()
+                _ = self.con.execute("BEGIN READ ONLY")
+            try:
+                return read(self.con)
+            finally:
+                self._rollback()
 
     def _start(self) -> None:
         """Begin the outermost transaction, first replacing a lost session.
@@ -488,6 +498,11 @@ class PostgresDatabase:
         Takes the in-process lock, so a call from another thread waits while this object
         has a transaction open. It takes no database lock: outside a transaction it sees
         committed rows, inside one it also sees that transaction's own writes.
+
+        Outside a transaction, a lost session is replaced first, and once more when the
+        statement itself finds it lost; the statement then runs again on the new session.
+        A write whose session was lost after the server committed it could therefore run
+        twice, so writes belong in transaction(), where nothing is retried.
         """
         from psycopg import OperationalError
 
@@ -506,7 +521,8 @@ class PostgresDatabase:
             return cur.fetchall() if cur.description is not None else []
 
     def close(self) -> None:
-        """Close the connection."""
+        """Close the connection for good: later calls fail instead of reconnecting."""
+        self._closed = True
         self.con.close()
 
 
@@ -1253,8 +1269,8 @@ class PgVectorBackend:
             return self.db.read_only(lambda con: self._hnsw_rows(con, sql, params))
 
     @staticmethod
-    def _hnsw_rows(con: "Connection[TupleRow]", sql: str, params: Mapping[str, Any]) -> list[tuple[Any, ...]]:
-        con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+    def _hnsw_rows(con: "Connection[TupleRow]", sql: str, params: Mapping[str, Any]) -> "list[TupleRow]":
+        _ = con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
         return con.execute(_sql(sql), params).fetchall()
 
     def search_events(
