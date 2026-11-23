@@ -166,3 +166,28 @@ def test_recall_event_stays_personal_whatever_scope_was_searched():
 
     assert rt.events.get(["r1"])[0].scope == "personal"
     assert rt.events.search("deploy tags", caller(user="u2"), "org", kinds={"recall"}) == []
+
+
+def test_engine_context_similar_defaults_to_none():
+    from cortex_mem.contract import EngineContext
+
+    events, knowledge, state = object(), object(), object()
+    ctx = EngineContext(events, knowledge, state)  # type: ignore[arg-type]
+    assert ctx.similar is None
+
+
+def test_group_is_frozen_and_keeps_member_order():
+    import dataclasses
+
+    from cortex_mem.contract import Group
+
+    group = Group(id="e1", scope="team", owner="t1", members=("e1", "e3", "e2"))
+    assert group.members == ("e1", "e3", "e2")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        group.owner = "t2"  # type: ignore[misc]
+
+
+def test_contract_version_is_0_4_0():
+    from cortex_mem.contract import CONTRACT_VERSION
+
+    assert CONTRACT_VERSION == "0.4.0"

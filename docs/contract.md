@@ -1,4 +1,4 @@
-# 엔진 포트 계약 v0.1.0
+# 엔진 포트 계약 v0.4.0
 
 > 상태: 초안 (PR #1 리뷰 2차 반영, D1~D7 합의). 코드 정본은 `src/cortex_mem/contract.py`(포트), `src/cortex_mem/access.py`(scope 규칙), `src/cortex_mem/runtime.py`(런타임).
 > 이 문서의 규칙 중 타입으로 표현되지 않는 것(호출 순서, id·scope 의미, 런타임 동작)도 계약의 일부다.
@@ -30,7 +30,7 @@ flowchart TB
 
 공용 저장소를 엔진에 넘기지 않는 이유: 같은 원본·같은 검색 위에서 승격 로직만 달라야 엔진 간 점수 차이가 승격 로직의 차이가 되고, 1등 엔진에 다른 엔진의 아이디어를 옮겨 붙일 수 있다.
 
-**결정 (통제 변인)**: 검색(`EventReader.search`, `KnowledgeReader.search`)은 공용으로 고정한다. 엔진은 검색 결과를 재정렬하거나 골라낼 수 있지만, 자기 검색 색인을 따로 두지 않는다. 공용 검색을 쓰지 않는 외부 시스템(§8 어댑터)의 결과는 하니스 리포트에서 따로 해석한다.
+**결정 (통제 변인)**: 검색(`EventReader.search`, `KnowledgeReader.search`)은 공용으로 고정한다. 엔진은 검색 결과를 재정렬하거나 골라낼 수 있지만, 자기 검색 색인을 따로 두지 않는다. 유사도 검색(`SimilarityReader`: 의미 검색과 묶기)도 같은 이유로 공용으로 고정한다. 엔진은 결과를 재정렬하거나 골라낼 수 있지만 자기 벡터 색인을 두지 않는다. 공용 검색을 쓰지 않는 외부 시스템(§8 어댑터)의 결과는 하니스 리포트에서 따로 해석한다.
 
 ## 2. 타입
 
@@ -128,6 +128,21 @@ class EngineContext:
     events: EventReader
     knowledge: KnowledgeReader
     state: StateStore
+    similar: SimilarityReader | None = None   # 임베딩이 설정되지 않으면 None. 엔진이 그 경우를 처리해야 한다
+
+@dataclass(frozen=True)
+class Group:                            # 같은 (scope, owner) 안에서 비슷하다고 묶인 record들
+    id: str                             # 첫 멤버의 이벤트 id
+    scope: Scope
+    owner: str                          # access.owner_for와 같은 규칙
+    members: tuple[str, ...]            # record 이벤트 id, append 순
+
+class SimilarityReader(Protocol):       # 코어가 만든 임베딩 색인, 읽기 전용
+    model: str                          # 색인을 만든 임베딩 모델(정보용)
+    def search(self, query, caller, scope, k=20, kinds=None) -> list[tuple[Event, float]]: ...
+    def neighbors(self, event_id, caller, scope, k=20) -> list[tuple[Event, float]]: ...
+    def knowledge(self, query, caller, scope, k=20) -> list[tuple[Knowledge, float]]: ...
+    def group(self, event_id) -> Group | None: ...
 
 class Engine(Protocol):
     state_version: str                  # 선택. 바뀌면 상태를 버리고 처음부터 다시 전달 (§3-8)
@@ -136,6 +151,12 @@ class Engine(Protocol):
     def handoff(self, query, caller, scope, ctx, k=6) -> list[Handoff]: ...
 ```
 
+- **점수**: `search`·`neighbors`·`knowledge`의 점수는 코사인 유사도(−1..1)이고 "높을수록 가깝다". 텍스트 검색 점수와 척도가 다르므로 섞지 않는다. 벡터는 float32로 저장되므로 같은 데이터라도 저장소(인메모리·SQLite·PostgreSQL)에 따라 점수가 마지막 자리(약 1e-6 이내, 차원이 커질수록 커진다)에서 다를 수 있다. 같은 저장소에서는 실행마다 같다.
+- **가시성**: 세 검색 모두 `access.event_visible`·`knowledge_visible`로 거른 집합 안에서만 찾는다(SQL 저장소는 같은 규칙의 SQL 조건으로 거른다, §5). `group()`은 호출자를 받지 않는다. 엔진은 모든 이벤트를 관찰하므로 묶음 정보가 엔진에게 새 노출이 아니고, 엔진이 내보내는 것은 결정 검증과 handoff 필터를 지난다(§3-5).
+- **묶음 멤버를 handoff에 쓰면 근거로 인용한다**: handoff 필터는 Handoff가 `sources`에 적은 이벤트만 검사한다. 엔진이 `group().members`(또는 `neighbors` 결과) 이벤트의 내용을 Handoff의 `content`에 넣으면 그 이벤트들을 모두 `sources`에 넣어야 한다. 빠뜨리면 호출자가 볼 수 없는 기록의 내용이 필터를 지나 나간다.
+- **엔진이 본 데까지만**: `similar`는 엔진이 이미 받은 이벤트까지만 읽는다. `observe` 중에는 지금 관찰하는 이벤트까지, `tick`·`handoff` 중에는 엔진의 커서까지다. 그 뒤의 이벤트는 `search`·`neighbors` 결과에도, `group().members`에도 나오지 않고, 그 뒤의 이벤트로 `group()`을 부르면 `None`이다. 그래서 처음부터 다시 전달할 때(§3-8)도 처음 전달 때와 같은 결과를 읽는다(§3-7). 지식(`knowledge`)은 지금의 지식 베이스다.
+- **recall 질의**: `search`·`knowledge`의 질의는 임베딩하되 저장하지 않는다(프로세스 메모리의 작은 LRU만).
+
 `Engine`은 `runtime_checkable`이라 하니스가 `isinstance`로 구현 여부를 확인한다. 위키를 검색해 건네는 기본 handoff는 `cortex_mem.kit.handoff_from_knowledge`로 제공한다(선택).
 
 ## 3. 규칙
@@ -143,12 +164,17 @@ class Engine(Protocol):
 ### 3-1. 런타임과 호출 순서
 
 1. 모든 이벤트는 `append` 순서대로 **정확히 한 번** `observe`에 전달된다. 커서는 런타임이 관리하고, 엔진은 재생이나 커서를 신경 쓰지 않는다.
-2. 이벤트 하나의 전달은 트랜잭션 하나다. `observe`가 반환하면 그 호출의 상태 쓰기, 결정 반영, 커서 이동이 함께 반영된다. `observe`가 예외를 던지면 아무것도 반영되지 않고, 그 이벤트는 다음 `sync` 때 다시 전달된다. 다른 프로세스가 먼저 전달했으면(`CursorConflict`) 이쪽 결과는 버리고 커서를 다시 읽는다.
-   - **계속 실패하는 이벤트**: `Runtime(..., max_failures=N)`이면 같은 이벤트에서 `observe`가 N번 실패했을 때 그 이벤트를 건너뛴다. 커서만 넘기고 그 호출의 쓰기는 남기지 않으며, `Runtime.skipped`(`seq`, `event_id`, `attempts`, `error`)에 남긴다. 이벤트 자체는 로그에 남는다. 기본값 `None`은 건너뛰지 않고 매번 예외를 던진다.
+2. 이벤트 하나의 전달은 이렇게 한다. `observe`는 **쓰기 트랜잭션 밖에서** 실행되고, 그 결과(엔진 상태 쓰기, 결정 반영, 커서 이동)는 **짧은 트랜잭션 하나**로 함께 커밋된다. `observe`가 예외를 던지면 아무것도 반영되지 않고(쓰기는 스테이징만 되어 있다), 그 이벤트는 다음 `sync` 때 다시 전달된다. 커밋 전에 런타임은 읽은 것이 그대로인지 넷을 확인한다: ① 엔진의 `epoch`와 커서(`state.commit`), ② 색인 세대, ③ `indexed() >= seq`(색인이 그 이벤트에 닿았는지), ④ 엔진 상태의 버전(이 프로세스가 기대하는 합성 버전과 같은지, §3-8). 하나라도 어긋나면 이번 결과를 버리고 이벤트를 처음부터 다시 읽어 전달한다(실패로 세지 않음). 다른 프로세스가 먼저 전달했으면(`CursorConflict`)도 같다.
+   - **계속 실패하는 이벤트**: `Runtime(..., max_failures=N)`이면 같은 이벤트에서 `observe`가 N번 실패했을 때 그 이벤트를 건너뛴다. 건너뛰기는 롤백이 아니라 **짧은 트랜잭션 하나로 커서만 넘기는 것**이다. 그 호출의 쓰기는 남기지 않고, 색인은 `observe` 전에 이미 그 이벤트까지 올라가 있으므로 다시 색인하지 않는다. `Runtime.skipped`(`seq`, `event_id`, `attempts`, `error`)에는 그 커밋이 성공한 뒤에만 남긴다(커밋이 실패하면 그 오류를 올리고 다음 시도에서 다시 건너뛴다). 엔진이 읽다가 낸 DB 오류도 엔진의 실패로 센다(`observe`는 트랜잭션 밖이라 PostgreSQL에서도 트랜잭션이 중단되지 않는다). 이벤트 자체는 로그에 남는다. 기본값 `None`은 건너뛰지 않고 매번 예외를 던진다.
    - 하니스는 `None`으로 쓴다. 엔진 실패를 조용히 넘기면 "엔진이 실패했는데 점수는 나온" 상태가 되기 때문이다. 서버는 한 이벤트가 모든 세션을 막지 않도록 `CORTEX_MAX_FAILURES`(기본 3)로 켠다.
    - 실패 횟수와 `skipped`는 `verdicts`처럼 프로세스 메모리에만 있다(영속화는 §6).
+   - **색인 뒤 전달**: 임베딩이 설정되어 있으면 색인은 전달 앞에서 별도 단계로 끝난다(`Index.advance`, 쓰기 트랜잭션 밖). 임베딩 실패(`EmbeddingError`)는 그 이벤트를 전달하지 않고 예외를 올린다. `max_failures`로 건너뛰지 않고, 기록(`append`)은 영향받지 않는다. 단, 서비스는 멀쩡한데 **그 텍스트만** 거부되면(`EmbeddingRejected`: Upstage는 한 텍스트에 400·413·422가 오고, 그 직후 짧은 시험 텍스트에는 응답할 때. 전에 응답한 모델이라도 거부될 때마다 다시 시험한다: 모델이 은퇴했거나 요청 형식이 바뀌면 모든 텍스트가 거부되고, 그 기록들이 벡터 없이 영구히 색인되면 안 되기 때문이다) 장애가 아니다: 그 기록은 벡터와 묶음 없이 색인되어 그대로 전달되고(`ctx.similar.group`은 None), 거부된 지식 본문은 벡터 없이 남으며(예전 벡터는 지운다), 거부된 질의는 결과 없음(`[]`)이 된다. 거부는 로그에 글자 수만 남긴다. 숫자가 아닌 값(NaN·무한대)이 섞인 벡터는 `EmbeddingError`다.
+   - **엔진이 알아야 할 것**: `observe`와 `tick`은 같은 이벤트·같은 커서에 대해 여러 번, 때로는 두 프로세스에서 동시에 실행될 수 있고, 그중 하나의 결과만 반영된다. 그러므로 엔진은 `ctx.state`의 스테이징된 쓰기와 반환값 말고는 바깥 상태를 바꾸면 안 된다. 인스턴스 필드는 캐시로만 쓰고, 버려진 실행이 남긴 값이 결과를 바꾸면 안 된다. `tick`의 결과는 충돌하면 조용히 버려진다(다음 호출이 다시 한다). 결정도 상태 쓰기도 없는 `tick`은 커밋하지 않는다(`epoch`가 오르지 않고 쓰기 잠금도 잡지 않는다).
+   - `sync()`는 이번 호출이 전달한 수(정수)를 돌려주고, 커서 뒤에 남은 이벤트 수는 `Runtime.pending()`이 준다.
 3. 이벤트는 `append` 뒤에 전달되므로, 엔진은 `observe` 안에서 그 이벤트를 `ctx.events.get`할 수 있다.
+   - **한계: `ctx.events`는 나중 이벤트도 본다.** 검색은 로그에 있는 것을 모두 보므로, 전달 중인 이벤트보다 뒤에 기록된 이벤트도 결과에 들어간다. 바로바로 전달될 때는 아직 없던 이벤트가, 처음부터 다시 받을 때(엔진 버전·색인 변경)나 임베딩 장애 뒤 밀린 이벤트를 몰아서 받을 때는 이미 검색된다. 그래서 `ctx.events`로 검색하는 엔진은 같은 로그에서도 전달 시점에 따라 다른 결정을 낼 수 있다(예: 앞 이벤트가 나중 이벤트에 밀려 상위 결과에서 빠짐). 특정 시점 기준의 읽기는 #19에서 다룬다.
 4. `handoff` 직전에 런타임이 밀린 이벤트를 먼저 전달한다. 그래서 세션 B도 세션 A가 남긴 기록을 반영한 상태로 답한다.
+   - **임베딩 장애 중에도 읽기는 답한다**: 밀린 이벤트를 색인하다 `EmbeddingError`가 나면 그 이벤트들은 기다리게 두고, 지금까지 전달된 상태로 답한다. 이때 엔진은 `ctx.similar`가 None인 채로 불린다(색인을 설정하지 않았을 때와 같은 텍스트 검색). 장애가 이미 드러났으니 질의 임베딩을 다시 기다리지 않기 위해서다. 전달은 성공했지만 엔진의 유사도 검색이 질의를 임베딩하지 못해 `EmbeddingError`를 올리면, 런타임은 `ctx.similar`를 None으로 해서 엔진에 한 번 더 묻는다. 그래서 `ctx.similar`를 쓰는 엔진도 None인 경우를 처리해야 한다(§2의 `EngineContext`). 장애 중 recall 이벤트는 저장만 되고 다른 이벤트처럼 기다린다. MCP 서버의 `recall` 응답에는 아직 전달되지 않은 이벤트 수 `pending`이 들어 있다. 서버는 도구 호출 첫머리의 따라잡기(`tick`)에서 장애를 보면 그 호출의 recall에서 다시 시도하지 않는다(`Runtime.recall(..., embedding_down=True)`: 전달도 질의 임베딩도 하지 않고 답한다). Upstage 임베더는 `cortex_mem.embed.OutageBreaker`로 감싸, 장애 뒤 잠시(5초부터 두 배씩, 최대 60초) 요청 없이 바로 `EmbeddingError`를 낸다. 텍스트 거부(`EmbeddingRejected`)는 백엔드가 응답한 것이므로 대기 시간을 처음(5초)으로 되돌린다. `EmbeddingError`는 실패 횟수에 세지 않으므로 이벤트를 건너뛰지 않는다.
 5. recall 한 번은 이렇게 흐른다(`Runtime.recall`).
    ```
    handoffs = runtime.handoff(query, caller, scope, k)        # 필터 통과분
@@ -201,7 +227,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 ### 3-5. handoff 필터
 
-런타임은 엔진이 건넨 항목 중 다음을 뺀다: `sources`가 비었거나, 없는 이벤트를 가리키거나, 호출자가 그 scope로 볼 수 없는 이벤트가 하나라도 있는 항목. 항목 id가 지식 항목이면 그 항목도 호출자에게 보여야 한다. 그 뒤 `k`개로 자른다.
+런타임은 엔진이 건넨 항목 중 다음을 뺀다: `sources`가 비었거나, 없는 이벤트를 가리키거나, 호출자가 그 scope로 볼 수 없는 이벤트가 하나라도 있는 항목. 항목 id가 지식 항목이면 그 항목도 호출자에게 보여야 한다. 그 뒤 `k`개로 자른다. 필터는 `sources`에 적힌 이벤트만 보므로, `content`에 쓴 이벤트(묶음 멤버 등)는 모두 `sources`에 적어야 한다(§2).
 
 누출을 막는 지점은 결정 검증(§3-4)과 이 필터 두 곳뿐이고, 둘 다 고정 부분에 있다. 엔진은 모든 이벤트를 관찰하지만, 나가는 것은 항상 검사된다.
 
@@ -211,11 +237,11 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 ### 3-7. 결정성
 
-같은 이벤트·tick 순서를 넣으면 같은 결정과 같은 `handoff`가 나와야 한다. 하니스가 재실행 뒤집힘률(목표 10% 이하)을 잰다. 엔진 안에서 난수를 쓰면 시드를 고정한다.
+같은 이벤트·tick 순서를 넣으면 같은 결정과 같은 `handoff`가 나와야 한다. 하니스가 재실행 뒤집힘률(목표 10% 이하)을 잰다. 엔진 안에서 난수를 쓰면 시드를 고정한다. 런타임도 이것을 돕는다: `ctx.similar`는 엔진이 받은 이벤트까지만 읽으므로(§2), 다른 엔진이 이미 뒤의 이벤트까지 색인해 두었든, 상태 버전이 바뀌어 처음부터 다시 받든 같은 이벤트에서 같은 묶음과 이웃을 본다.
 
 ### 3-8. 엔진 상태와 scope 기본값
 
-- 오래 남길 상태는 `ctx.state`에만 둔다. 인스턴스 필드는 캐시로만 쓴다. 서버 프로세스가 여러 개 떠서 같은 저장소를 쓸 수 있기 때문이다.
+- 오래 남길 상태는 `ctx.state`에만 둔다. 인스턴스 필드는 캐시로만 쓴다(서버 프로세스가 여러 개 떠서 같은 저장소를 쓸 수 있고, `observe`가 여러 번 실행될 수 있기 때문이다. §3-1).
 - `ctx.state`의 값은 JSON이고, 넣고 꺼낼 때 복사된다. 커밋 전의 값도 마찬가지다(런타임이 JSON 문자열로 들고 있다가 꺼낼 때마다 새로 만든다). `handoff`에서는 읽기 전용이다.
 - 값 하나는 JSON으로 64 KiB까지다(`MAX_STATE_VALUE_BYTES`). 넘으면 `put`이 `ValueError`를 던진다.
 - **권장: 대상 하나당 키 하나.** 상태 전체를 값 하나에 넣으면 이벤트마다 전체를 다시 쓰게 된다. 예시:
@@ -227,7 +253,16 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
   retrieval:<session>:<handoff_id>    이 세션에 건넨 항목 (자기강화 차단용)
   ```
   증거 키에 `event_id`를 넣으면 같은 이벤트를 다시 받아도 두 번 세지 않는다(재전달에 대한 안전장치).
-- **상태 형식 버전**: 엔진에 `state_version: str`을 두면, 저장된 버전과 다를 때 런타임이 상태를 지우고 커서를 0으로 돌려 이벤트 로그 처음부터 다시 전달한다. 마이그레이션 코드는 필요 없다. 지식 베이스는 지우지 않는다(다시 나온 Promote가 같은 id를 덮어쓴다). 버전이 다른 서버 프로세스를 동시에 띄우지 않는다.
+- **색인 버전**: 엔진 상태의 **기존 `version` 칸**에 `[엔진 state_version, 색인 지문]`을 JSON으로 합쳐 저장한다(색인 지문 = 모델, 묶음 문턱값, 저장소 종류 `store`, 세대 `generation`). 런타임은 `sync` 때마다 이 값을 확인하고, 다르면 엔진 상태를 비우고 이벤트 로그 처음부터 다시 전달한다. 엔진의 `state_version`이 바뀐 것과 같은 처리이고, 예약 키는 쓰지 않는다. 색인은 저장소(DB)에 하나지만 엔진 상태는 엔진마다 있으므로, 같은 저장소의 다른 엔진이 먼저 색인을 다시 만들었어도 이 엔진의 저장된 지문이 지금 것과 다르면 이 엔진도 처음부터 다시 받는다.
+  - 색인을 다시 만들면 세대가 1 오르므로(모델·문턱값이 그대로여도) 같은 설정으로 다시 만든 경우에도 모든 엔진이 다시 받는다. 색인을 켜거나 끌 때도 합성 버전이 바뀌어 한 번 다시 받는다.
+  - `state_version`이 없고 색인도 없는 엔진은 합성 버전이 None이다. 이 엔진도 색인을 켜거나 끌 때 한 번 다시 받고, 지식 베이스 소유자도 똑같이 확인한다(아래 상태 형식 버전).
+  - 이 합성 버전은 커밋 때에도 확인한다(§3-1). 그 사이에 다른 프로세스가 엔진 상태를 다른 버전으로 리셋했으면 이번 결과는 버려지고 이벤트를 처음부터 다시 한다.
+  - **주의: 저장소 하나에는 색인 설정 하나, 엔진 버전 하나.** 임베딩 모델이나 `CORTEX_GROUP_THRESHOLD`가 다른 프로세스, 또는 `state_version`이 다른 같은 엔진이 같은 DB(파일)를 쓰면 서로 상대의 결과를 무효로 만든다. 런타임은 이벤트 하나를 최대 3번까지 다시 시도한 뒤 `IndexConfigChanged`(색인 설정) 또는 `StateVersionChanged`(엔진 버전)를 올린다. 조용히 섞지 않고 크게 실패하는, 지원하지 않는 구성이다. 설정을 바꿀 때는 그 DB(파일)를 쓰는 프로세스를 모두 내리고 새 설정으로 다시 띄운다.
+  - **운영 메모 (옛 저장소)**: 임베딩 변경은 `engine_cursor.epoch`와 지식 벡터의 `digest` 열을 더한다. `CREATE TABLE IF NOT EXISTS`는 열을 더해 주지 않으므로 옛 저장소는 이렇게 처리한다.
+    - **SQLite**: 열 때 `PRAGMA table_info`로 두 열이 없는지 보고 `ALTER TABLE ... ADD COLUMN`으로 더한다(스키마 트랜잭션 안, 여러 번 열어도 안전). main의 스키마 3·4 파일(`~/.cortex-mem/cortex.db` 같은 사용자 파일)도 그대로 열리고(검색 색인은 다시 만든다), 이벤트·지식·엔진 상태와 커서가 남는다. 임베딩을 쓰지 않으면 엔진은 이어서 전달받는다. 임베딩을 켜면 엔진 상태의 합성 버전이 바뀌므로(위) 엔진이 한 번 처음부터 다시 받는다.
+    - **PostgreSQL**: 임베딩 변경 이전의 개발 스키마에는 두 열이 없다. 열 때 확인해서 없으면 스키마를 지우고 다시 만들라는 `RuntimeError`를 낸다(URL은 메시지에 없다). PG 저장소는 이 변경과 함께 처음 나가므로 지울 운영 데이터가 없다.
+    - 예전 개발 브랜치가 엔진 상태에 남긴 `_runtime/index` 키는 이제 평범한 키로 보인다. 엔진이 쓰지 않으면 영향이 없고, 상태를 다시 만들 때(엔진 버전·색인 세대 변경) 함께 지워진다.
+- **상태 형식 버전**: 엔진에 `state_version: str`을 두면, 저장된 버전과 다를 때 런타임이 상태를 지우고 커서를 0으로 돌려 이벤트 로그 처음부터 다시 전달한다. 마이그레이션 코드는 필요 없다. 같은 트랜잭션에서 지식 베이스도 비운다: 다시 전달하며 나온 Promote가 엔진이 여전히 맞다고 보는 항목을 다시 채우고, 더는 승격되지 않는 항목은 남지 않는다(남기면 그것을 강등할 엔진 상태가 없다). 한 저장소의 지식 베이스는 그 저장소의 엔진 하나가 채운다고 본다. 엔진을 바꿔 띄워도(새 엔진 이름) 같은 이유로 비워진다. 지식 베이스는 저장소 전체가 같이 쓰므로, 런타임은 비울 때 소유자(엔진 클래스와 합성 버전, `KnowledgeStore.set_owner`)를 기록하고, `Runtime`마다 한 번(그리고 합성 버전이 바뀔 때) 비교한다. 엔진을 바꾸는 일은 서버를 다시 띄우는 일이기 때문이다. 엔진 A → B → A로 바꾸면, B가 자기를 위해 비운 지식 베이스를 A가 알아채고 자기 상태도 지운 뒤 처음부터 다시 받는다(A의 상태 버전은 그대로여도). `state_version`이 없고 색인도 없어 합성 버전이 None인 엔진(서버 기본값인 `promote_all`에 임베딩 없음)도 같은 방식으로 소유자를 확인한다. 그래서 임베딩을 끄면(색인이 있던 저장소에서 색인 없이 띄우면) 그 엔진도 한 번 처음부터 다시 받는다. 상태가 더는 읽지 않는 색인 위에서 만들어졌기 때문이다. 소유자는 엔진이 처음 sync할 때 한 번 기록한다(쓰기 트랜잭션 하나). 소유자가 기록되지 않은 지식 베이스(이 변경 이전의 저장소)는 이 엔진의 상태가 이미 있고(커서, `epoch` 또는 키) 상태 버전이 맞을 때만 그 엔진의 것으로 보고 표시만 남긴다. 상태가 없는 엔진은 그 지식 베이스를 채운 적이 없으므로(업그레이드하면서 엔진도 바꾼 경우) 다른 엔진의 것으로 보고, 비운 뒤 처음부터 받는다. 엔진이 처음부터 다시 받으며 지식 베이스를 비우면 런타임은 무엇이 달랐는지(상태가 쓰인 합성 버전과 지금 버전, 또는 기록된 소유자와 이 엔진)를 `cortex_mem.runtime` 경고 로그로 남긴다. 합성 버전에는 색인 지문이 들어 있으므로, 색인 설정이 다른 프로세스가 같은 저장소를 쓸 때도 여기서 드러난다. 처음 시작해서 비울 것이 없으면 남기지 않는다. 버전이 다른 서버 프로세스를 동시에 띄우지 않는다. Claude Code 세션마다 서버 프로세스가 하나씩 뜨므로, 이 말은 그 저장소를 쓰는 모든 세션의 서버 프로세스를 뜻한다. 엔진이나 색인 설정을 바꿀 때는 모든 세션을 다시 시작한다. 이미 떠 있는 프로세스는 지식 베이스의 소유자를 한 번만 읽으므로, 다른 세션이 엔진을 바꿔도 알아채지 못하고 다른 엔진의 지식 베이스에 계속 승격한다.
 - record의 scope 기본값은 서버 설정(저장소 → 기본 scope)이 정하고, 에이전트는 기본값보다 **좁히는 것만** 할 수 있다. 저장소 정책은 설정된 저장소(`CORTEX_REPO`)로만 고른다. 도구 인자 `repo`는 근거 위치(`Event.repo`)만 바꾸므로, 기본값이 더 넓은 저장소 이름을 넘겨 범위를 넓힐 수 없다. 설정된 저장소가 없으면 기본 정책(`CORTEX_RECORD_SCOPE`)만 적용한다. recall의 기본 scope는 볼 수 있는 가장 넓은 범위다.
 - outcome(결과 보고)의 scope 기본값은 **판정 대상 지식의 범위**다. 그래야 팀 지식을 강등하는 근거가 된다. 에이전트는 좁히는 것만 할 수 있다. 하니스처럼 scope를 직접 정하는 호출자는 팀 지식에 대한 결과 이벤트를 team으로 넣어야 강등이 일어난다.
 - 그 범위가 설정된 저장소의 정책보다 넓으면(예: personal 정책 저장소에서 org 지식을 판정) 서버는 판정(`outcome`·`signal`·`refs`)만 남기고 `text`를 비운 뒤 `text_redacted=True`로 표시한다. 강등에 필요한 건 판정이고, 에이전트가 쓴 본문(경로, 내부 사정)은 저장소 정책을 따른다. refs에 범위가 다른 항목이 섞이면 가장 넓은 범위 하나로 남는다.
@@ -251,7 +286,7 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 
 - 엔진마다 시나리오별로 새 `InMemoryDatabase`와 `Runtime`을 만들어 같은 이벤트를 흘려 넣는다. 하니스는 엔진을 직접 부르지 않고 런타임만 부른다(서버와 같은 진입점).
 - 주 채점은 에이전트에게 건넨 결과(handoff)로 한다. 지식 베이스 상태(`knowledge.all()`)는 신뢰도 채점(Brier, v0.2) 같은 선택 기능에만 쓴다.
-- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다. **비교는 인메모리 저장소 기준**이다. 저장소 구현마다 검색 점수 함수가 달라(인메모리 BM25, SQLite FTS5 `bm25`, PostgreSQL `ts_rank`) 같은 데이터에서도 순위가 달라질 수 있으므로, 하니스 비교는 저장소 구현 하나로 고정한다. 인메모리 BM25는 하니스 `all_store`와 같은 공식·상수(`k1=1.5`, `b=0.75`)를 써서, 기준선과의 점수 차이가 검색 공식이 아니라 엔진 판단에서 나오게 한다.
+- 판정 기준선은 같은 런타임 위의 `PromoteAllEngine`이다. **비교는 인메모리 저장소 기준**이다. 저장소 구현마다 검색 점수 함수가 달라(인메모리 BM25, SQLite FTS5 `bm25`, PostgreSQL 역색인 BM25) 같은 데이터에서도 순위가 달라질 수 있으므로, 하니스 비교는 저장소 구현 하나로 고정한다. 인메모리 BM25는 하니스 `all_store`와 같은 공식·상수(`k1=1.5`, `b=0.75`)를 써서, 기준선과의 점수 차이가 검색 공식이 아니라 엔진 판단에서 나오게 한다.
 - 런타임은 `max_failures=None`(기본값)으로 만든다(§3-1).
 - 관찰 지표: 결정 기록(`verdicts`: 승인·거부, 사유, 근거 id), `why`별 강등 수, handoff 필터에 걸린 수.
 
@@ -263,31 +298,67 @@ personal 기록 여러 개로 팀 지식을 만드는 것(롤업)을 v0.1에서 
 class EventStore(EventReader, Protocol):
     def append(self, event) -> str: ...
     def since(self, seq) -> Iterator[tuple[int, Event]]: ...   # 위치는 1부터, 커밋 순서대로 늘어나기만
+    def count_since(self, seq) -> int: ...                      # since(seq)의 개수, 이벤트를 읽지 않고
 
 class KnowledgeStore(KnowledgeReader, Protocol):
     def put(self, item) -> None: ...
     def remove(self, id) -> None: ...
+    def clear(self) -> None: ...                                # 항목 전부 삭제, 소유자는 남김
+    def owner(self) -> str | None: ...                          # 런타임이 기록한 소유자 (None = 기록 없음)
+    def set_owner(self, owner) -> None: ...                     # 트랜잭션과 함께 되돌려진다
 
 class EngineStateBackend(Protocol):                           # 엔진 하나의 상태 + 커서
     def get(self, key): ...
     def scan(self, prefix=""): ...
     def cursor(self) -> int: ...
-    def commit(self, expected, cursor, writes, deletes) -> None: ...  # 커서가 expected가 아니면 CursorConflict
-    def version(self) -> str | None: ...                      # 상태를 쓴 엔진의 state_version
-    def reset(self, version) -> None: ...                     # 키 전부 삭제, 커서 0, 버전 기록
+    def epoch(self) -> int: ...                                 # commit과 reset마다 1씩 오른다. 읽기 전에 먼저 읽는다
+    def commit(self, expected, cursor, writes, deletes, *, epoch) -> None: ...  # 커서가 expected가 아니거나 epoch가 다르면 CursorConflict, 성공하면 epoch + 1
+    def version(self) -> str | None: ...                      # 상태를 쓴 엔진의 버전 (합성 버전, §3-8)
+    def reset(self, version) -> None: ...                     # 키 전부 삭제, 커서 0, 버전 기록, epoch + 1
 
 class Database(Protocol):                                     # 한 연결 뒤의 저장소 전부
     events: EventStore
     knowledge: KnowledgeStore
+    vectors: VectorBackend                                    # 임베딩을 쓰지 않아도 있어야 한다
     def state(self, engine) -> EngineStateBackend: ...       # 엔진별 이름공간
     def transaction(self): ...
+
+class VectorBackend(Protocol):                                # 색인 상태·벡터·묶음·캐시 + 유사도 계산
+    kind: str                                                 # "memory" | "sqlite" | "postgres"
+    ...                                                       # meta/reset/indexed, put_vector/vector/vectors, put_group/members/partition, cached/cache
+    def generation(self) -> int: ...                          # 색인을 다시 만들 때(reset)마다 1씩 오른다
+    def set_indexed(self, expected, seq, generation) -> None: ...  # 위치가 expected가 아니거나 세대가 다르면 CursorConflict
+    def put_vector(self, kind, id, vector, digest=None) -> None: ...  # 지식 벡터는 만든 본문의 digest를 같이 저장
+    def knowledge_digests(self) -> dict[str, str]: ...        # 지식 id -> digest
+    def nearest_member(self, scope, owner, vector, upto) -> tuple[str, float] | None: ...
+    def search_events(self, vector, caller, scope, k, kinds=None, upto=None, exclude=None) -> list[tuple[str, float]]: ...
+    def search_knowledge(self, vector, caller, scope, k) -> list[tuple[str, float]]: ...
 ```
 
-- `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인한다. `search` 점수는 "높을수록 좋음"만 약속한다.
-- 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **한 트랜잭션**으로 묶고 프로세스 사이에서 직렬화한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
-- 커서의 compare-and-set(`expected`)은 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다.
-- **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 `bigserial`은 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, append를 `transaction()` 안에서 잠금(advisory lock 등)으로 직렬화한다. PG 구현에는 동시 append 두 개를 섞는 적합성 테스트를 추가한다(지금의 `DatabaseContract`로는 잡히지 않는다).
-- **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL도 `to_tsvector('simple', words || ' ' || grams)`로 같은 토큰을 쓰면 확장 없이 옮겨진다.
+- `cortex_mem.testing`의 `EventStoreContract`, `KnowledgeStoreContract`, `EngineStateBackendContract`, `VectorBackendContract`, `DatabaseContract`를 상속해 `make()`만 구현한 테스트가 통과하면 계약을 지킨 것이다(`tests/test_store.py` 참고). `DatabaseContract`는 런타임을 올려 정확히 한 번 전달, 실패 시 전부 롤백, 재접속 후 유지, 상태 버전 교체를 확인하고, `transaction()` 안의 벡터 쓰기가 예외와 함께 되돌려지는지도 본다(되돌릴 수 없는 단일 프로세스 저장소는 `rolls_back = False`). `search` 점수는 "높을수록 좋음"만 약속한다.
+- 영속 구현은 `Runtime(..., transaction=...)`에 쓰기 트랜잭션을 넘겨, 커서·엔진 상태·지식 반영을 **짧은 트랜잭션 하나**로 묶고 프로세스 사이에서 직렬화한다. **쓰기 트랜잭션은 짧아야 한다: 엔진 코드(`observe`, `tick`)와 임베딩 호출은 그 안에서 돌지 않는다.** 트랜잭션 안에서는 읽은 것이 그대로인지 확인하고(§3-1) 쓰기만 한다. 인메모리 구현은 단일 프로세스라 기본값(`nullcontext`)을 쓴다.
+- `Database`에는 `vectors: VectorBackend` 속성이 있다. `Database` 프로토콜이 요구하므로 임베딩을 쓰지 않는 배포에서도 구현해야 한다(쓰지 않으면 비어 있을 뿐이다). `VectorBackend`는 색인 상태(모델, 묶음 문턱값, 저장소 종류, 세대, 색인한 마지막 위치), 이벤트·지식 벡터, 묶음, 임베딩 캐시를 맡는다. 모든 쓰기는 런타임의 `transaction()` 안에서 일어나고 그 트랜잭션과 함께 되돌려진다. 색인은 전달 앞의 별도 단계다: 임베딩과 묶음 찾기는 트랜잭션 밖에서 하고, 이벤트 하나를 쓰는 짧은 트랜잭션이 위치와 세대를 확인한 뒤(`set_indexed(expected, seq, generation)`) 벡터와 묶음을 쓴다. 임베딩 캐시는 묶음마다 짧은 트랜잭션으로 채운다. `reset`은 벡터·묶음·지식 digest를 지우고 위치를 0으로 돌리며 세대를 1 올린다. `position()`은 `(meta, generation, indexed)`를, `EngineStateBackend.position()`은 `(epoch, cursor, version)`을 한 번에 읽는다(지속 저장소에서 왕복 한 번). 지식 벡터는 만든 본문의 digest와 함께 저장하고(`put_vector(..., digest=)`, `knowledge_digests(ids=None)`: id를 주면 그 id들만 읽는다), 지식 베이스가 바뀌면 digest가 다른 것만 다시 임베딩한다. 결정이 건드린 id만 맞출 때는 그 id의 digest만 읽어, 결정 하나의 비용이 지식 베이스 크기에 따라 늘지 않는다. 벡터는 **float32**다: 쓰기(벡터와 임베딩 캐시)는 모두 float32로 반올림해 저장하고, 읽기는 그 값을 파이썬 float로 돌려준다. NaN·무한대·float32 범위를 넘는 값은 `ValueError`로 거절한다(쓰기와 질의 모두). SQLite는 스키마 6이다. 3·4·5에서 올라오면 검색 색인을 지금의 토큰(한글 경계에서 단어를 나눔)으로 다시 만든다. 스키마 4에는 두 배치가 있다: main의 4(재색인한 스키마 3 파일, 벡터 테이블 없음)와 임베딩 변경의 출시 전 스키마 4(float64 BLOB 벡터). `vectors` 테이블이 있는 4만 float64 벡터·묶음·색인 메타·임베딩 캐시를 지운다(다음 `sync`가 다시 임베딩한다). 스키마 5의 float32 벡터는 그대로 둔다. PostgreSQL은 스키마 2다. 검색어를 쓸 때 토큰으로 나눠 저장하므로, 옛 토큰을 담은 스키마 1 데이터베이스는 열지 않고 새로 만들라는 `RuntimeError`를 낸다. 기존 `Database`의 다른 부분은 그대로다. 포트 정의는 `cortex_mem.store.base`의 `VectorBackend`에 있고, 모든 저장소가 `cortex_mem.testing`의 적합성 테스트를 통과한다.
+- **유사도 계산은 저장소가 한다** (0.3.0). `Index`는 임베딩·캐시·묶음 배정·커서를 맡고, 코사인 점수는 `VectorBackend`의 세 메서드가 낸다. 질의 벡터도 float32로 반올림해 계산한다.
+  - `nearest_member(scope, owner, vector, upto)`: 그 (scope, owner) 칸의 묶인 이벤트 중 위치 ≤ `upto`이고 가장 가까운 것과 그 점수. 점수와 상관없이 가장 가까운 것을 돌려주고(문턱값은 `Index`가 본다), 동점은 위치가 작은 것, 칸이 비었으면 `None`. 언제나 정확 검색이다(근사 색인을 쓰지 않는다).
+  - `search_events(vector, caller, scope, k, kinds, upto, exclude)`: 호출자가 그 범위에서 볼 수 있는 묶인 이벤트 중 점수 > 0인 것 k개, 점수 내림차순, 동점은 위치 순. `kinds`는 이벤트 종류, `upto`는 위치 상한(`None` = 상한 없음), `exclude`는 뺄 id 하나.
+  - `search_knowledge(vector, caller, scope, k)`: 볼 수 있는 지식 중 점수 > 0인 것 k개, 동점은 id 순.
+  - **위치**는 `put_group`에 준 seq(= 이벤트 로그 위치)다. 묶음이 없는 이벤트 벡터는 검색 후보가 아니고, 이벤트·지식 저장소에 없는 id도 후보가 아니다.
+  - 가시성은 같은 `Database`의 이벤트·지식으로 판단한다. 그래서 백엔드는 그 옆에서 만든다(인메모리는 `InMemoryVectorBackend(events, knowledge)`, SQL 저장소는 `events`·`knowledge` 표와 잇는다). 파이썬 구현은 `access.event_visible`·`knowledge_visible`, SQL 구현은 텍스트 검색과 같은 조건(`store/text.py`의 `EVENT_VISIBLE_SQL`·`KNOWLEDGE_VISIBLE_SQL`)을 쓴다. `VectorBackendContract`의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려주고, 범위 × 호출자 조합의 기대 id 표로 두 구현이 같은지 고정한다.
+  - 인메모리와 SQLite는 같은 파이썬 코드로 계산하므로 점수가 비트까지 같다. PostgreSQL(pgvector)은 DB 안에서 계산하므로 점수가 약 1e-6 이내에서 같다(차원이 커질수록 오차가 커진다. 4096차원에서 8e-7까지 측정, 1024차원은 `tests/test_postgres.py`가 `SCORE_TOLERANCE`로 확인한다). 색인 버전(`Index.want()`)에 `store: backend.kind`가 들어 있어 저장소를 옮기면 색인을 다시 만들고 엔진에 처음부터 다시 전달한다.
+- 커서의 compare-and-set(`expected`)과 `epoch`는 여러 프로세스가 같은 엔진 상태를 쓸 때 이중 전달을 막는다. 커서만으로는 `tick`(커서를 올리지 않는다)의 중복 커밋이나, 리셋(커서를 0으로 돌린다) 전에 읽은 낡은 결과의 커밋을 구분할 수 없어서 `epoch`를 함께 비교한다.
+- **append의 위치는 커밋 순서대로 늘어나야 한다.** 커서는 "이 위치까지 전달했다"는 뜻이라, 작은 위치가 큰 위치보다 늦게 커밋되면 그 이벤트는 영영 전달되지 않는다. SQLite는 쓰기가 한 번에 하나라 자동으로 지켜진다. PostgreSQL의 시퀀스(`bigserial`·`IDENTITY`)는 번호를 먼저 받은 트랜잭션이 나중에 커밋될 수 있으므로, 스키마는 `seq bigint PRIMARY KEY`로 두고 PG 구현(`PostgresDatabase`)은 `transaction()`을 바깥에서만 `BEGIN` + `pg_advisory_xact_lock`(DB 전체 잠금 하나)으로 열고, 위치를 잠금 안에서 `max(seq)+1`로 정한다. 롤백된 append는 번호를 남기지 않는다. 잠금 대기는 `lock_timeout`(서버 `CORTEX_DB_LOCK_TIMEOUT`, 기본 `30s`, 연결할 때 한 번 설정)으로 끊고 분명한 오류를 낸다. 트랜잭션 안에서 DB 오류를 잡아 넘기면 안 된다(중단된 트랜잭션은 커밋되지 않는다). 동시 append·전달을 섞는 시험은 `tests/test_postgres.py`와 `tests/test_similarity_behaviour.py`에 있다(`DatabaseContract`만으로는 잡히지 않는다).
+- **한국어 검색**: 토큰(`words`, 한글 2-gram `grams`)을 Python에서 미리 만들어 저장한다. PostgreSQL은 같은 토큰(`store/text.py`)을 역색인 표(`event_terms`, `knowledge_terms`, 문서 길이 표)에 쓰고 BM25(k1=1.2, b=0.75)를 SQL 집계로 계산한다. 기본 전문 검색(`tsvector`)은 한국어를 나누지 못하고 IDF가 없어 쓰지 않으며, 확장도 필요 없다. df·문서 수·평균 길이는 호출자가 볼 수 있는 기록만으로 계산한다(숨은 기록이 점수를 바꾸지 않는다). 점수 값은 저장소마다 다르고 순서의 성질만 같다.
+- **PostgreSQL 저장 형식**: JSON(`conditions`, `refs`, 엔진 상태 값 등)과 시각은 `text`로 저장해 키 순서와 시간대·마이크로초가 그대로 돌아온다(`jsonb`·`timestamptz`를 쓰지 않는다). id로 정렬하거나 동점을 가를 때는 `COLLATE "C"`로 파이썬·SQLite와 같은 바이트 순서를 쓴다. 벡터는 pgvector `vector`(float32)이고 점수는 `1 - (emb <=> q)`다. 정확 검색이 기본이고, 근사 색인(HNSW, `CORTEX_VECTOR_INDEX=hnsw`)은 `search_events`·`search_knowledge`에만 쓰며 기본은 꺼져 있다. 근사 색인은 진짜 최근접을 놓치거나 가시성 필터 때문에 k개보다 적게 낼 수 있다. 차원이 4000을 넘으면 색인 없이 정확 검색만 된다. 한 색인 버전 안에서 벡터 차원이 다르면 쓰기에서 `ValueError`를 낸다.
+
+### 계약 변경 이력
+
+| 버전 | 바뀐 것 | 엔진 영향 |
+| --- | --- | --- |
+| 0.2.0 | 코어 임베딩 색인과 읽기 전용 `ctx.similar`(`SimilarityReader`: search·neighbors·knowledge·group), `Database.vectors`, `VectorBackend` | 엔진이 `ctx.similar`를 쓸 수 있다(없으면 `None`) |
+| 0.3.0 | 벡터는 float32로 저장(기존 float64). 유사도 계산을 `VectorBackend`로 옮김(`nearest_member`, `search_events`, `search_knowledge`, `kind`). 백엔드는 같은 DB의 이벤트·지식을 받아 가시성을 판단. 색인 버전에 저장소 종류(`store`)가 들어가 처음 한 번 색인을 다시 만든다. 적합성 시험 `test_vectors_round_trip_as_float64` → `test_vectors_round_trip_at_float32_precision` | `SimilarityReader`는 그대로. 점수가 float32 반올림만큼(약 1e-6 이내) 달라질 수 있다. PostgreSQL + pgvector 구현(`PostgresDatabase`)이 같은 적합성 시험을 통과하는 기준 저장소로 추가된다 |
+| 0.3.0 (하네스·제3자 백엔드) | 하네스는 `CONTRACT_VERSION` 0.3.0을 읽어 `EngineInfo.version`이 `contract-0.3.0`이 된다. 제3자 `VectorBackendContract` 하위 클래스의 `make()`는 `.events`·`.knowledge`·`.vectors`를 가진 `Database`를 돌려줘야 한다(벡터 백엔드만 돌려주면 안 된다) | 엔진 코드는 그대로. 하네스 리포트의 버전 문자열과 제3자 적합성 시험의 `make()`가 바뀐다 |
+| 0.4.0 | 엔진 전달(`observe`)·`tick`·건너뛰기를 쓰기 트랜잭션 밖으로, 결과는 `epoch`·색인 세대·색인 위치·엔진 버전을 확인하는 짧은 트랜잭션 하나로 커밋(`EngineStateBackend.epoch`, `commit(..., epoch=)`, `VectorBackend.generation`, `set_indexed(expected, seq, generation)`, 지식 벡터의 digest). 엔진 상태의 버전 칸에 `[state_version, 색인 지문]`을 합쳐 저장하고 `_runtime/` 예약 키와 접두사를 없앰. 서버 응답에 `pending`(정수 또는 null) 추가, `Runtime.pending()`·`Runtime.waiting()`. 엔진을 다시 전달할 때(상태 버전·색인 세대가 바뀔 때) 지식 베이스를 비움(`KnowledgeStore.clear()`). 임베더가 한 텍스트만 거부하는 `EmbeddingRejected`(벡터 없이 색인, 전달은 계속) | **`observe`·`tick`은 같은 이벤트·커서에 대해 여러 번, 두 프로세스에서 동시에도 실행될 수 있고 하나의 결과만 반영된다**(바깥 상태를 바꾸지 않아야 한다). `_runtime/`로 시작하는 키도 평범한 키다. 색인 세대가 바뀌면 모든 엔진이 다시 받는다. 저장소 구현은 `epoch`·`generation`·digest(`knowledge_digests(ids)`)와 두 `position()`, `KnowledgeStore.clear()`를 구현해야 한다. SQLite 파일은 열 때 열이 자동으로 더해지고, 이 변경 이전의 PG 개발 스키마는 지우고 시작한다(§3-8) |
+| 0.4.0 (하네스) | 하네스는 `CONTRACT_VERSION` 0.4.0을 읽어 `EngineInfo.version`이 `contract-0.4.0`이 된다. 하네스가 쓰는 표면(`Runtime(engine, events, knowledge, state, transaction, max_failures)`, `InMemoryDatabase()`, `append`·`handoff`·`tick`·`sync`·`skipped`·`CONTRACT_VERSION`)은 바뀌지 않는다. `EngineStateBackend.commit`의 `epoch` 인자와 `Index`의 `transaction` 인자는 하네스가 직접 부르지 않는다 | 하네스 리포트의 버전 문자열만 바뀐다(버전으로 결과를 묶는 분석은 새 버전으로 나뉜다) |
 
 ## 6. v0.2 이후로 미룬 것
 
@@ -327,9 +398,15 @@ class Database(Protocol):                                     # 한 연결 뒤�
 **합의됨 (10/25)**
 - [x] 레포 이름은 `dure-ai/core` (계약·런타임·저장소와 MCP 서버를 함께 담음). 패키지 이름 `cortex-mem`·`cortex-mem-server`는 그대로
 
+**임베딩 (v0.2)**
+- [x] 임베딩 모델과 차원, 묶음 문턱값은 서버 설정이다. 엔진이 고르지 않는다.
+- [ ] 저장 계층의 차원 문제(pgvector 인덱스 한도 등)는 설계 v2 §3.4 참고.
+
 **저장 계층 (PostgreSQL + pgvector)**
 - [ ] 임베딩 모델 = 벡터 차원. Upstage 임베딩으로 바꾸면 pgvector 인덱스 한도에 걸릴 수 있다(차원 수치는 확인 필요).
 - [ ] 공용 DB 위치: team scope는 공용 DB가 있어야 사람 간 독립 출처를 셀 수 있다.
+- **운영 요구**: PostgreSQL 14 이상, pgvector: 정확 검색(기본)은 0.7 이상, `CORTEX_VECTOR_INDEX=hnsw`는 0.8 이상이 필요하다(HNSW 검색은 `SET LOCAL hnsw.iterative_scan = relaxed_order`를 항상 실행한다). 열 때 `vector` 타입이 있는지(`require_vector_type`) 검사하고, hnsw를 켤 때는 pgvector가 0.8 이상인지도 검사한다(`require_hnsw_support`, 낮으면 필요한 버전과 설치된 버전을 알리고 멈춘다). PostgreSQL 버전과 정확 검색의 0.7 요구는 검사하지 않는다(가정). DB마다 `CREATE EXTENSION vector`가 필요하고, 확장이 없으면 시작할 때 빠진 것을 알리고 멈춘다. 드라이버는 선택 의존성 `cortex-mem[postgres]`(psycopg 3).
+- [ ] 전역 잠금(DB 하나에 잠금 하나)을 유지할지는 지연을 잰 뒤 정한다. 근사 색인 기본값도 측정 뒤 정한다.
 
 **모두**
 - [ ] 독립 출처의 기본 단위를 `user`로 볼지, `(user, session)`으로 볼지. 계약은 둘 다 담을 수 있고, 판정은 엔진 몫이다.
@@ -371,7 +448,7 @@ class ExternalMemoryAdapter:
 ## 9. 디스코드 공유용 요약
 
 ```
-[T5] 엔진 포트 계약 v0.1 (리뷰 반영) — docs/contract.md
+[T5] 엔진 포트 계약 v0.2 (리뷰 반영) — docs/contract.md
 - 엔진이 구현할 것: observe(event, ctx) / tick(now, ctx) → 결정 목록, handoff(query, caller, scope, ctx, k)
 - 승격·강등은 Promote/Demote로 반환 → 런타임이 근거·범위 검증 후 즉시 지식 베이스에 반영 (갱신=같은 id Promote, Skill=kind="skill", 보관=Demote why="stale")
 - 엔진 데이터는 ctx.state(전용 영속 저장소, JSON, 값당 64 KiB)에. 대상 하나당 키 하나 권장. state_version 바꾸면 처음부터 재전달
@@ -383,5 +460,6 @@ class ExternalMemoryAdapter:
 - scope 정책은 설정된 저장소(CORTEX_REPO)로만. 정책보다 넓게 공개되는 outcome은 text를 비우고 text_redacted
 - 계속 실패하는 이벤트는 Runtime(max_failures=N)이 건너뛰고 skipped에 남김(하니스는 None = 건너뛰지 않음)
 - 하니스는 같은 Runtime + InMemoryDatabase로 실행, handoff로 채점. 결정 기록(verdicts)은 관찰 지표
+- v0.2: 코어가 임베딩을 색인하고 (scope, owner)별로 묶는다. 엔진은 읽기 전용 ctx.similar(search·neighbors·knowledge·group)를 쓴다. 임베딩 미설정이면 None이라 엔진이 처리해야 한다. 이벤트는 색인된 뒤 전달되고, 색인 버전이 바뀌면 처음부터 재전달
 - 저장소 공통 테스트(cortex_mem.testing): PG 구현도 이걸 상속해 통과하면 계약 준수
 ```
