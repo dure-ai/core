@@ -9,6 +9,11 @@ outermost write transactions. Measurement B holds a slow `observe` for --hold se
 on one connection and times a raw `events.append` and a `Runtime.append` on a second
 connection to the same store. It uses the public API only, so it runs before and after
 the delivery redesign.
+
+Measurement B gives its two engines separate states on one fresh store, so the second
+one's first sync finds the knowledge base recorded for the first and starts over. The
+runtime logs that on stderr ("BenchEngine starts over ...") once per repetition. Neither
+engine promotes anything there, so it does not change the numbers.
 """
 
 from __future__ import annotations
