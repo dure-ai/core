@@ -28,22 +28,31 @@ import json
 import logging
 import re
 import threading
+import time
 from array import array
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
-from typing import Any, LiteralString, cast
+from typing import TYPE_CHECKING, Any, LiteralString, cast
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from ..embed import float32
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, pg_params, words
 
+if TYPE_CHECKING:
+    from psycopg import Connection
+    from psycopg.rows import TupleRow
+
 SCHEMA_VERSION = 2  # 2: search terms split at Hangul boundaries; a schema-1 database is refused
 VECTOR_INDEXES = ("none", "hnsw")
 LOCK_TIMEOUT_SETTING = "CORTEX_DB_LOCK_TIMEOUT"
+# After a failed reconnect, calls fail at once for this long before the next attempt; the wait
+# doubles after each failed attempt up to RECONNECT_MAX, and a success starts it over.
+RECONNECT_FIRST = 1.0
+RECONNECT_MAX = 30.0
 # A PostgreSQL duration as lock_timeout takes it: a number with an optional unit (no unit
 # means milliseconds). PostgreSQL still checks the range when transaction() applies it.
 _DURATION = re.compile(r"\d+(\.\d+)?(us|ms|s|min|h|d)?")
@@ -185,43 +194,45 @@ class PostgresDatabase:
     in every process with one advisory lock. Needs the pgvector extension."""
     kind = "postgres"
 
-    def __init__(self, url: str, lock_timeout: str = "30s", vector_index: str = "none") -> None:
+    def __init__(
+        self,
+        url: str,
+        lock_timeout: str = "30s",
+        vector_index: str = "none",
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         """url: a libpq connection string or URL. lock_timeout: how long
         transaction() waits for the write lock, as a PostgreSQL duration
         ("0" waits forever). vector_index: "none" (exact search) or "hnsw"
-        (see PgVectorBackend). Creates the tables if missing.
+        (see PgVectorBackend). clock: the time source for reconnect waits
+        (tests pass a fake one). Creates the tables if missing.
 
         Raises ValueError for a bad setting, ConnectionError (password
         redacted) when it cannot connect, and RuntimeError when pgvector (or,
         for HNSW, a recent enough pgvector) is missing or the schema is of
-        another version."""
+        another version.
+
+        A lost session (a server restart, an idle disconnect) is replaced on
+        the next operation, but only where repeating it is safe: before a
+        read outside a transaction, and before a transaction begins. Inside a
+        transaction the error goes to the caller, since the server dropped
+        what the transaction wrote. While the server stays unreachable, calls
+        fail at once with ConnectionError between attempts, which are spaced
+        RECONNECT_FIRST seconds apart and twice as far after each failure, up
+        to RECONNECT_MAX."""
         if vector_index not in VECTOR_INDEXES:
             raise ValueError(f"vector_index must be one of {VECTOR_INDEXES}, not {vector_index!r}")
         check_lock_timeout(lock_timeout)
-        import psycopg  # fails early with a clear error if the extra is missing
-
-        self._where, password = _describe(url)
+        self._url: str = url
+        # _describe imports psycopg, so a missing extra fails here with a clear error.
+        self._where, self._password = _describe(url)
         self.lock_timeout = lock_timeout
         self.vector_index = vector_index  # read when the vector store builds its indexes
-        try:
-            self.con = psycopg.connect(url, autocommit=True)
-        except psycopg.Error as exc:
-            # The driver's message names host and user, not the password; redact anyway.
-            # A parse error may quote any fragment of the string, so it is not repeated.
-            reason = (
-                _redact(str(exc).strip(), url, password)
-                if password is not None
-                else "the connection string could not be parsed"
-            )
-            raise ConnectionError(f"cannot connect to PostgreSQL ({self._where}): {reason}") from None
-        try:
-            # Once per connection rather than SET LOCAL in every transaction: it only
-            # bounds lock waits, and this connection takes no lock but the advisory one
-            # (and DDL in _create). set_config binds the value.
-            self.con.execute("SELECT set_config('lock_timeout', %s, false)", (lock_timeout,))
-        except psycopg.errors.InvalidParameterValue:  # matches the pattern but PostgreSQL refuses it
-            self.con.close()
-            raise _bad_lock_timeout(lock_timeout) from None
+        self._clock: Callable[[], float] = clock
+        self._wait: float | None = None  # the current reconnect wait; None while connected
+        self._until: float = 0.0
+        self._last: str = ""
+        self.con = self._open()
         # MCP servers may call tools from worker threads; one lock serializes them.
         self._lock = threading.RLock()
         self._depth = 0
@@ -241,6 +252,99 @@ class PostgresDatabase:
     def __repr__(self) -> str:
         """Host, port and database only, never the password."""
         return f"PostgresDatabase({self._where})"
+
+    def _open(self) -> "Connection[TupleRow]":
+        """A new autocommit connection with this database's session settings.
+        ConnectionError (password redacted) when it cannot connect."""
+        import psycopg
+
+        try:
+            con = psycopg.connect(self._url, autocommit=True)
+        except psycopg.Error as exc:
+            # The driver's message names host and user, not the password; redact anyway.
+            # A parse error may quote any fragment of the string, so it is not repeated.
+            reason = (
+                _redact(str(exc).strip(), self._url, self._password)
+                if self._password is not None
+                else "the connection string could not be parsed"
+            )
+            raise ConnectionError(f"cannot connect to PostgreSQL ({self._where}): {reason}") from None
+        try:
+            # Once per connection rather than SET LOCAL in every transaction: it only
+            # bounds lock waits, and this connection takes no lock but the advisory one
+            # (and DDL in _create). set_config binds the value.
+            _ = con.execute("SELECT set_config('lock_timeout', %s, false)", (self.lock_timeout,))
+        except psycopg.errors.InvalidParameterValue:  # matches the pattern but PostgreSQL refuses it
+            con.close()
+            raise _bad_lock_timeout(self.lock_timeout) from None
+        except psycopg.Error as exc:
+            con.close()
+            reason = _redact(str(exc).strip(), self._url, self._password or "")
+            raise ConnectionError(f"cannot set up the PostgreSQL session ({self._where}): {reason}") from None
+        return con
+
+    def _lost(self) -> bool:
+        """Whether the connection is closed or its session is gone."""
+        return bool(self.con.closed or self.con.broken)
+
+    def _reconnect(self) -> None:
+        """Replace the lost connection. While the last attempt failed less than
+        the current wait ago, raise ConnectionError at once instead of trying."""
+        now = self._clock()
+        if self._wait is not None and now < self._until:
+            wait = self._until - now
+            raise ConnectionError(f"PostgreSQL ({self._where}) is unavailable; next attempt in {wait:.0f}s ({self._last})")
+        try:
+            con = self._open()
+        except ConnectionError as exc:
+            self._wait = RECONNECT_FIRST if self._wait is None else min(self._wait * 2, RECONNECT_MAX)
+            self._until = self._clock() + self._wait
+            self._last = str(exc)
+            if self._wait == RECONNECT_FIRST:
+                log.warning("lost the PostgreSQL session (%s) and cannot reconnect: %s", self._where, exc)
+            raise
+        if self._wait is not None:
+            log.warning("reconnected to PostgreSQL (%s)", self._where)
+        self._wait = None
+        old, self.con = self.con, con
+        with suppress(Exception):  # the old session is gone either way
+            old.close()
+
+    def read_only(self, read: "Callable[[Connection[TupleRow]], list[tuple[Any, ...]]]") -> list[tuple[Any, ...]]:
+        """Run `read` on the connection in a read-only transaction of its own, replacing a lost
+        session first, and once more when BEGIN finds it lost. Call it outside a write
+        transaction, with the in-process lock held."""
+        from psycopg import OperationalError
+
+        if self._lost():
+            self._reconnect()
+        try:
+            self.con.execute("BEGIN READ ONLY")
+        except OperationalError:
+            if not self._lost():
+                raise
+            self._reconnect()
+            self.con.execute("BEGIN READ ONLY")
+        try:
+            return read(self.con)
+        finally:
+            self._rollback()
+
+    def _start(self) -> None:
+        """Begin the outermost transaction, first replacing a lost session.
+        BEGIN is the first statement, so when it finds the session lost it
+        is safe to reconnect and begin once more."""
+        from psycopg import OperationalError
+
+        if self._lost():
+            self._reconnect()
+        try:
+            self._begin()
+        except OperationalError:
+            if not self._lost():
+                raise
+            self._reconnect()
+            self._begin()
 
     def _create(self) -> None:
         """Create the tables if missing, under the write lock so two processes
@@ -306,7 +410,7 @@ class PostgresDatabase:
         with self._lock:
             outer = self._depth == 0
             if outer:
-                self._begin()
+                self._start()
             self._depth += 1
             try:
                 yield
@@ -385,8 +489,20 @@ class PostgresDatabase:
         has a transaction open. It takes no database lock: outside a transaction it sees
         committed rows, inside one it also sees that transaction's own writes.
         """
+        from psycopg import OperationalError
+
         with self._lock:
-            cur = self.con.execute(_sql(sql), params)
+            if self._depth == 0 and self._lost():
+                self._reconnect()
+            try:
+                cur = self.con.execute(_sql(sql), params)
+            except OperationalError:
+                # Outside a transaction a statement is its own unit, so it can run again on a
+                # new session; inside one, what the transaction wrote is gone with the session.
+                if self._depth or not self._lost():
+                    raise
+                self._reconnect()
+                cur = self.con.execute(_sql(sql), params)
             return cur.fetchall() if cur.description is not None else []
 
     def close(self) -> None:
@@ -1132,14 +1248,14 @@ class PgVectorBackend:
                 self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
                 return self.db.con.execute(_sql(sql), params).fetchall()
             # A read-only transaction of its own, so SET LOCAL has one to live in; it takes
-            # no advisory lock, so a search never waits for writers.
-            self.db.con.execute("BEGIN READ ONLY")
-            try:
-                self.db.con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
-                rows = self.db.con.execute(_sql(sql), params).fetchall()
-            finally:
-                self.db._rollback()
-            return rows
+            # no advisory lock, so a search never waits for writers. It only reads, so it can
+            # run again on a new session when the first statement finds the session lost.
+            return self.db.read_only(lambda con: self._hnsw_rows(con, sql, params))
+
+    @staticmethod
+    def _hnsw_rows(con: "Connection[TupleRow]", sql: str, params: Mapping[str, Any]) -> list[tuple[Any, ...]]:
+        con.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        return con.execute(_sql(sql), params).fetchall()
 
     def search_events(
         self,
