@@ -296,9 +296,10 @@ class OutageBreaker:
     After an outage (EmbeddingError; a refused text, EmbeddingRejected, is not
     one), calls fail at once for a cooldown, `first` seconds and doubling after
     each failed retry up to `maximum`. The first call after the cooldown tries
-    the backend again, and a success resets it. Delivery never skips an event
-    for an EmbeddingError, so failing fast only makes the wait cheaper; the
-    cost is noticing recovery up to `maximum` seconds late."""
+    the backend again, and any answer resets it: a success, or a refused text.
+    Delivery never skips an event for an EmbeddingError, so failing fast only
+    makes the wait cheaper; the cost is noticing recovery up to `maximum`
+    seconds late."""
 
     def __init__(
         self,
@@ -334,6 +335,8 @@ class OutageBreaker:
         try:
             vectors = self.inner.embed(texts, kind)
         except EmbeddingRejected:
+            with self._lock:
+                self._wait = None  # the backend answered, so a later outage is a new one
             raise
         except EmbeddingError as exc:
             with self._lock:

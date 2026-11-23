@@ -212,3 +212,28 @@ def test_breaker_caps_the_wait_and_ignores_refused_texts():
         now[0] += 20.0
     assert backend.calls == 8
     assert (emb.model, emb.dim) == (backend.model, backend.dim)
+
+
+def test_breaker_takes_a_refused_text_as_an_answer_and_starts_the_next_wait_over():
+    from cortex_mem.embed import EmbeddingError, EmbeddingRejected
+
+    backend, now = _Backend(), [0.0]
+    emb = _breaker(backend, now)
+    backend.down = True
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")  # waits 5
+    now[0] = 6.0
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")  # waits 10
+    backend.down, backend.refuse = False, "too long"
+    now[0] = 17.0
+    with pytest.raises(EmbeddingRejected):
+        emb.embed(["too long"], "passage")  # the backend answered
+    backend.down = True
+    now[0] = 18.0
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    now[0] = 23.0  # the new outage waits 5 again, not 20
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    assert backend.calls == 5
