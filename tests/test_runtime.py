@@ -619,3 +619,65 @@ def test_a_reset_that_empties_the_knowledge_base_logs_what_differed(caplog):
     first, second = (r.getMessage() for r in caplog.records)
     assert "V2" in first and "'1'" in first and "'2'" in first
     assert "Scripted" in second and "V2" in second
+
+
+# ── an engine that keeps failing while another process moves the epoch ─────
+
+
+def test_a_failing_observe_restarted_by_moved_epochs_is_counted_after_a_cap():
+    """A failure while the epoch moved is not counted (the state it read was replaced), and the event
+    starts over. If another process keeps moving the epoch without delivering it (for example by
+    ticking), that would loop forever; after MAX_CONFIG_RETRIES such restarts the failure counts."""
+    from cortex_mem.runtime import MAX_CONFIG_RETRIES
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+
+    class FailsWhileAnotherTicks(Scripted):
+        calls = 0
+
+        def observe(self, event, ctx):
+            FailsWhileAnotherTicks.calls += 1
+            if FailsWhileAnotherTicks.calls > 50:
+                raise SystemExit("looped without a cap")
+            state.commit(state.cursor(), state.cursor(), {"tick": self.calls}, set(), epoch=state.epoch())
+            raise RuntimeError("boom")
+
+    events.append(ev("e1"))
+    engine = FailsWhileAnotherTicks()
+    with pytest.raises(RuntimeError, match="boom"):
+        Runtime(engine, events, kb, state).sync()
+    assert FailsWhileAnotherTicks.calls == MAX_CONFIG_RETRIES + 1
+
+    FailsWhileAnotherTicks.calls = 0
+    skipping = Runtime(FailsWhileAnotherTicks(), events, kb, state, max_failures=2)
+    with pytest.raises(RuntimeError, match="boom"):
+        skipping.sync()  # the first counted failure, as for any engine below max_failures
+    skipping.sync()  # the second: skipped, against the epoch as it is now
+    assert [s.event_id for s in skipping.skipped] == ["e1"]
+    assert state.cursor() == 1
+
+
+def test_a_failing_observe_past_the_cap_is_not_counted_once_another_process_delivered_the_event():
+    """The cap covers an epoch that moves without this event being delivered. When another process
+    delivers the event while observe fails, nothing is counted, even after the cap: the event is
+    already passed, so sync returns as it does before the cap."""
+    from cortex_mem.runtime import MAX_CONFIG_RETRIES
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+
+    class FailsWhileAnotherDelivers(Scripted):
+        calls = 0
+
+        def observe(self, event, ctx):
+            FailsWhileAnotherDelivers.calls += 1
+            # calls 1-3 tick; the next call delivers e1 in the other process
+            done = FailsWhileAnotherDelivers.calls > MAX_CONFIG_RETRIES
+            state.commit(state.cursor(), 1 if done else state.cursor(), {"b": self.calls}, set(), epoch=state.epoch())
+            raise RuntimeError("boom")
+
+    events.append(ev("e1"))
+    rt = Runtime(FailsWhileAnotherDelivers(), events, kb, state)
+    assert rt.sync() == 0
+    assert FailsWhileAnotherDelivers.calls == MAX_CONFIG_RETRIES + 1
+    assert state.cursor() == 1 and rt.pending() == 0
+    assert rt.skipped == []

@@ -1467,3 +1467,48 @@ def test_a_query_that_cannot_be_embedded_is_answered_by_text_search():
 
     assert [h.id for h in rt.handoff("deploy", caller(), "personal")] == ["k1"]
     assert engine.similar["handoff"] is None  # asked again without the similarity reader
+
+
+# ── knowledge ids a skipped sync could not write ────────────────────────────
+
+
+def _skipping(rt, skip_calls):
+    """Make rt's index skip its sync_knowledge calls numbered in skip_calls (from 1), as when the
+    index went stale or was rebuilt meanwhile; returns the list of `touched` arguments seen."""
+    real = rt.index.sync_knowledge
+    seen = []
+
+    def sync_knowledge(knowledge, touched=None):
+        seen.append(None if touched is None else sorted(touched))
+        if len(seen) in skip_calls:
+            return False
+        return real(knowledge, touched)
+
+    rt.index.sync_knowledge = sync_knowledge
+    return seen
+
+
+def test_knowledge_ids_a_skipped_sync_could_not_write_wait_for_the_next_sync():
+    db = InMemoryDatabase()
+    rt = runtime(ProbeEngine(decisions={"e1": [Promote(item("k1", ("e1",)))]}), db)
+    seen = _skipping(rt, {2})  # 1: the first full comparison, 2: k1 after e1's commit
+    rt.append(ev("e1"))
+    assert db.vectors.vector("knowledge", "k1") is None
+
+    rt.sync()
+    assert seen == [None, ["k1"], ["k1"]]
+    assert db.vectors.vector("knowledge", "k1") is not None
+
+
+def test_a_skipped_full_comparison_runs_again_on_the_next_sync():
+    db = InMemoryDatabase()
+    runtime(ProbeEngine(), db).sync()  # the index is built
+    db.knowledge.put(item("k1", ("e0",)))  # then written by another process, with no vector
+    rt = runtime(ProbeEngine(), db)  # a new Runtime compares every item on its first sync
+    seen = _skipping(rt, {1})
+    rt.sync()
+    assert db.vectors.vector("knowledge", "k1") is None
+
+    rt.sync()
+    assert seen == [None, None]
+    assert db.vectors.vector("knowledge", "k1") is not None

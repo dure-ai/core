@@ -35,7 +35,9 @@ from .store.base import CursorConflict, EngineStateBackend, EventStore, Knowledg
 log = logging.getLogger(__name__)
 
 _ABSENT = object()
-MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
+# Per event: restarts after another config rebuilt the index or another version reset the engine,
+# and restarts of a failing observe because the engine's epoch moved meanwhile.
+MAX_CONFIG_RETRIES = 3
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 
 
@@ -171,7 +173,11 @@ class Runtime:
     MAX_CONFIG_RETRIES (3) restarts of one event, sync raises
     IndexConfigChanged or StateVersionChanged. Processes with another index
     config, or another engine state_version, on one store are not supported;
-    they fail loudly instead of mixing.
+    they fail loudly instead of mixing. A failing observe whose epoch moved
+    is likewise restarted uncounted only MAX_CONFIG_RETRIES times per event
+    (counted by this Runtime until the event is passed, not per sync call);
+    after that its failures count toward max_failures. A failure while
+    another process passed the event is never counted.
 
     `sync()` returns how many events it delivered; `pending()` returns how
     many still wait after the engine's cursor.
@@ -199,6 +205,8 @@ class Runtime:
         self.verdicts: list[Verdict] = []
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
+        # seq -> failed observes not counted because the epoch moved meanwhile, in this process
+        self._restarts: dict[int, int] = {}
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
         # The owner this Runtime found recorded on the knowledge base. Engines are switched by
@@ -236,8 +244,9 @@ class Runtime:
         committed in a short checked transaction (_deliver_next). If the
         engine raises, that event stays undelivered and is retried next time,
         until `max_failures` attempts have failed; then it is skipped (see
-        `skipped`). A failure is counted only if the engine's epoch did not
-        move while it observed. With an index, each event is indexed before
+        `skipped`). A failure is not counted when the engine's epoch moved
+        while it observed (the event starts over), until that has happened
+        MAX_CONFIG_RETRIES times for the event. With an index, each event is indexed before
         it is observed, and an EmbeddingError while indexing it (or while
         embedding knowledge, or raised inside observe) is raised as is: the
         event stays undelivered and is never skipped for it.
@@ -254,6 +263,7 @@ class Runtime:
         self._follow_knowledge()
         done = self.state.cursor()  # delivered or skipped, here or by another process
         self._failures = {seq: n for seq, n in self._failures.items() if seq > done}
+        self._restarts = {seq: n for seq, n in self._restarts.items() if seq > done}
         delivered = 0
         ahead = self.index is not None
         outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
@@ -333,8 +343,10 @@ class Runtime:
         engine's state and cursor (state.commit checks the epoch and cursor
         once more, atomically, and is the one place that raises
         CursorConflict) and applies the accepted decisions. A failure of the
-        engine is counted toward max_failures; nothing else is: a store error
-        while committing, an EmbeddingError or IndexConfigChanged is raised."""
+        engine is counted toward max_failures, except when another process
+        passed the event during observe, or while the epoch moved during
+        observe (at most MAX_CONFIG_RETRIES times per event); nothing else is: a store error while committing, an EmbeddingError or
+        IndexConfigChanged is raised."""
         staged = self._staged()
         try:
             # Materialized here: a generator would run engine code inside the commit.
@@ -342,8 +354,17 @@ class Runtime:
         except (EmbeddingError, IndexConfigChanged):
             raise  # not the engine's failure: retried, never counted
         except Exception as exc:
-            if self.state.epoch() != epoch:
-                return 0, []  # reset or moved on meanwhile: not a failure on this state; read again
+            now, now_cursor, _ = self.state.position()
+            if now_cursor >= seq:
+                return 0, []  # another process delivered or skipped it meanwhile: nothing to count
+            if now != epoch:
+                # Reset or moved on meanwhile: not a failure on this state, so read again. A
+                # process that keeps moving the epoch without delivering this event (ticking,
+                # say) would make that a loop, so after MAX_CONFIG_RETRIES restarts it counts.
+                self._restarts[seq] = self._restarts.get(seq, 0) + 1
+                if self._restarts[seq] <= MAX_CONFIG_RETRIES:
+                    return 0, []
+                epoch = now  # a skip commits against the state as it is now
             attempts = self._give_up(seq)
             if attempts is None:
                 raise
@@ -363,7 +384,7 @@ class Runtime:
             return 0, []
         touched, verdicts = committed
         self.verdicts.extend(verdicts)
-        self._failures.pop(seq, None)
+        self._forget_attempts(seq)
         return 1, touched
 
     def _moved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> str | None:
@@ -401,20 +422,23 @@ class Runtime:
         except CursorConflict:
             # Another process delivered or skipped it, or the engine was reset.
             # An epoch-only conflict (a tick or a reset, the event still pending)
-            # also starts the count again: correct, only slower to skip.
-            self._failures.pop(seq, None)
+            # also starts the count again: correct, only slower to skip. The
+            # restarts stay: clearing them would let a moving epoch loop again.
+            _ = self._failures.pop(seq, None)
             return
-        self._failures.pop(seq, None)
+        self._forget_attempts(seq)
         self.skipped.append(Skipped(seq, event_id, attempts, f"{type(error).__name__}: {error}"))
 
     def _sync_knowledge(self, touched: Collection[str]) -> None:
         """After a commit, outside its transaction: let the knowledge vectors
-        follow the ids the decisions touched. On an EmbeddingError the
-        decisions stand; the ids wait for this Runtime's next sync."""
+        follow the ids the decisions touched. On an EmbeddingError, or when
+        the index went stale or was rebuilt meanwhile so nothing was written,
+        the decisions stand and the ids wait for this Runtime's next sync."""
         if self.index is None or not touched:
             return
         try:
-            self.index.sync_knowledge(self.knowledge, touched)
+            if not self.index.sync_knowledge(self.knowledge, touched):
+                self._pending_knowledge.update(touched)
         except EmbeddingError:
             self._pending_knowledge.update(touched)
             raise
@@ -426,13 +450,19 @@ class Runtime:
         if self.index is None:
             return
         if not self._knowledge_reconciled:
-            self.index.sync_knowledge(self.knowledge, None)
-            self._knowledge_reconciled = True
-            self._pending_knowledge.clear()
+            if self.index.sync_knowledge(self.knowledge, None):  # else: compare again next time
+                self._knowledge_reconciled = True
+                self._pending_knowledge.clear()
         elif self._pending_knowledge:
             ids = set(self._pending_knowledge)
-            self.index.sync_knowledge(self.knowledge, ids)
-            self._pending_knowledge -= ids
+            if self.index.sync_knowledge(self.knowledge, ids):  # else: the ids keep waiting
+                self._pending_knowledge -= ids
+
+    def _forget_attempts(self, seq: int) -> None:
+        """Drop what this process counted for the event at `seq`, its failures
+        and its uncounted restarts, once it is delivered or skipped."""
+        _ = self._failures.pop(seq, None)
+        _ = self._restarts.pop(seq, None)
 
     def _give_up(self, seq: int) -> int | None:
         """Count a failed attempt; the attempt count when the event is to be

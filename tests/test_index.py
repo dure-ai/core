@@ -1078,3 +1078,41 @@ def test_sync_knowledge_of_touched_ids_reads_only_their_digests():
 
     assert asked == [["k2"]]  # not the whole knowledge base
     assert db.vectors.knowledge_digests(["k2"]) == {"k2": text_digest("deploy\nitem 2, restated")}
+
+
+# ── sync_knowledge says whether it could write ──────────────────────────────
+
+
+def test_sync_knowledge_returns_true_when_it_wrote_or_had_nothing_to_write():
+    db, index = build([])
+    db.knowledge.put(item("k1"))
+    assert index.sync_knowledge(db.knowledge, ["k1"]) is True
+    assert db.vectors.vector("knowledge", "k1") is not None
+    assert index.sync_knowledge(db.knowledge, ["k1"]) is True  # nothing to do is not a skip
+
+
+def test_sync_knowledge_on_a_stale_index_reads_and_writes_nothing():
+    """The early check: an index another config rebuilt is not ours to write into."""
+    emb = CountingEmbedder()
+    db, index = build([], emb)
+    Index(db.vectors, HashEmbedder(), 0.8).ensure_current(db.knowledge)  # another process, another threshold
+    db.knowledge.put(item("k1"))
+    calls = len(emb.calls)
+    assert index.stale()
+
+    assert index.sync_knowledge(db.knowledge, ["k1"]) is False
+    assert index.sync_knowledge(db.knowledge, None) is False
+    assert len(emb.calls) == calls
+    assert db.vectors.vector("knowledge", "k1") is None
+
+
+def test_sync_knowledge_returns_false_when_the_index_is_rebuilt_while_it_embeds():
+    db = InMemoryDatabase()
+    db.knowledge.put(item("k1", body="first"))
+
+    def meanwhile(texts, kind):
+        if "deploy\nfirst" in texts:
+            Index(db.vectors, HashEmbedder(), 0.8).ensure_current(db.knowledge)  # another process rebuilds
+
+    index, _, _, _ = spied(db, SpyEmbedder(None, during=meanwhile))
+    assert index.sync_knowledge(db.knowledge, ["k1"]) is False
