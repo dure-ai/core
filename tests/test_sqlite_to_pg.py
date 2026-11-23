@@ -122,6 +122,7 @@ def test_moves_everything_and_the_first_sync_embeds_nothing(tmp_path, pg_schema)
     assert pg_schema not in result.stdout + result.stderr
     for table in ("events", "knowledge", "engine_state", "engine_cursor", "embed_cache"):
         assert table in result.stdout
+    assert "With embeddings on" in result.stdout and "copied cursors" in result.stdout
 
     src, pg = SqliteDatabase(path), PostgresDatabase(pg_schema)
     try:
@@ -176,6 +177,51 @@ def test_a_target_with_data_exits_2_and_is_left_alone(tmp_path, pg_schema):
         pg.close()
 
 
+def test_a_target_with_only_a_knowledge_owner_exits_2_and_keeps_it(tmp_path, pg_schema):
+    """A server's first tool call on an empty database can record an owner before it records any
+    event. Moving an ownerless source on top would keep that owner, and an engine would then adopt
+    another engine's knowledge base where the source would replay."""
+    path = tmp_path / "core.db"
+    build_source(path)
+    con = sqlite3.connect(path)
+    con.execute("DELETE FROM knowledge_meta")  # an ownerless source, as from main
+    con.commit()
+    con.close()
+    pg = PostgresDatabase(pg_schema)
+    try:
+        with pg.transaction():
+            pg.knowledge.set_owner("another engine")
+    finally:
+        pg.close()
+
+    result = run(str(path), pg_schema)
+    assert result.returncode == 2
+    assert "cortex_meta" in result.stderr
+    assert pg_count(pg_schema, "events") == 0
+    pg = PostgresDatabase(pg_schema)
+    try:
+        assert pg.knowledge.owner() == "another engine"
+    finally:
+        pg.close()
+
+
+def test_a_target_with_index_rows_exits_2(tmp_path, pg_schema):
+    """Index tables left by a partial cleanup would make the first sync skip the moved events."""
+    path = tmp_path / "core.db"
+    build_source(path)
+    pg = PostgresDatabase(pg_schema)
+    try:
+        with pg.transaction():
+            pg.vectors.reset({"model": "m", "group_threshold": 0.9})
+    finally:
+        pg.close()
+
+    result = run(str(path), pg_schema)
+    assert result.returncode == 2
+    assert "vector_meta" in result.stderr
+    assert pg_count(pg_schema, "events") == 0
+
+
 def test_a_source_that_fails_midway_leaves_the_target_empty(tmp_path, pg_schema):
     path = tmp_path / "core.db"
     build_source(path)
@@ -216,6 +262,16 @@ def test_a_failed_connection_exits_2_without_the_password(tmp_path):
     assert result.returncode == 2
     assert "hunter2pw" not in result.stdout + result.stderr
     assert url not in result.stdout + result.stderr
+
+
+def test_a_connection_error_is_one_line(tmp_path):
+    """localhost resolves to more than one address, and psycopg then reports every attempt on its own line."""
+    path = tmp_path / "core.db"
+    SqliteDatabase(path).con.close()
+    result = run(str(path), "postgresql://someone:hunter2pw@localhost:1/db")
+    assert result.returncode == 2
+    assert len(result.stderr.strip().splitlines()) == 1, result.stderr
+    assert "hunter2pw" not in result.stderr
 
 
 def test_the_password_never_appears_in_the_output(tmp_path, pg_schema):

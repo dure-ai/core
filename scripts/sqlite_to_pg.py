@@ -20,6 +20,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 TABLES = ("events", "knowledge", "engine_state", "engine_cursor", "embed_cache")
+# Tables the first sync fills: rows left in them (a partial cleanup) would make it skip moved events.
+DERIVED = (
+    "event_terms", "event_stats", "knowledge_terms", "knowledge_stats",
+    "event_vectors", "vector_groups", "knowledge_vectors", "vector_meta",
+)
 
 
 class MigrationError(Exception):
@@ -32,8 +37,13 @@ def _count(db, table: str) -> int:
 
 
 def _check_empty(pg) -> None:
-    """MigrationError when any table the migration writes already has rows."""
-    full = [t for t in TABLES if _count(pg, t)]
+    """MigrationError unless the target is as a new database leaves it: no rows in any table, and
+    nothing in cortex_meta but the schema version. A knowledge owner recorded there by a server's
+    first tool call would otherwise outlive an ownerless source, and an engine would adopt another
+    engine's knowledge base where the source would replay."""
+    full = [t for t in (*TABLES, *DERIVED) if _count(pg, t)]
+    if pg.query("SELECT count(*) FROM cortex_meta WHERE key <> 'schema_version'")[0][0]:
+        full.append("cortex_meta")
     if full:
         raise MigrationError(f"the target must be empty, but it already has rows in: {', '.join(full)}")
 
@@ -154,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         rows = _run(args.sqlite_path, args.pg_url)
     except MigrationError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {' '.join(str(exc).split())}", file=sys.stderr)  # psycopg reports each attempt on a line
         return 2
     except Exception as exc:  # noqa: BLE001  one line, no traceback, and never the URL
         message = " ".join(str(exc).replace(args.pg_url, "<url>").split())
@@ -164,7 +174,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{'table':<16}{'source':>8}{'target':>8}")
     for table, a, b in rows:
         print(f"{table:<16}{a:>8}{b:>8}")
-    print("moved; the first sync on PostgreSQL rebuilds the index from the embedding cache")
+    cached = next(b for t, _, b in rows if t == "embed_cache")
+    print(
+        f"moved. With embeddings on, the first sync on PostgreSQL rebuilds the index and replays the engines, "
+        f"embedding from the cache where it can ({cached} cached vectors); without them, engines continue "
+        "from their copied cursors"
+    )
     return 0
 
 
