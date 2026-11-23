@@ -19,6 +19,11 @@ query or after the winner fails, and handoff is the only place it shows.
 
 With embeddings enabled, records compete only when the Core index puts their
 source events in the same group. A source without a group does not compete.
+A correction keeps the task and changes the command, so its cosine to the old
+record sits just under the default CORTEX_GROUP_THRESHOLD (0.9): with Upstage
+embedding-passage, 1 of 10 hand-written correction pairs reached 0.9, 7 of 10
+reached 0.8, and no pair of different tasks reached 0.8 (the closest was
+0.770). Supersede needs a threshold near 0.8 to catch most corrections.
 Without embeddings, the topic test is the share of the shorter item's words
 found in the other. On the harness dev set, records within one scenario had
 a median overlap of 0.35-0.50 and those from different scenarios 0.14
