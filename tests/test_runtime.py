@@ -571,3 +571,51 @@ def test_a_knowledge_base_without_an_owner_is_adopted_without_starting_over():
 
     assert again.seen == [] and state.epoch() == epoch and [k.id for k in kb.all()] == ["k1"]
     assert kb.owner() is not None
+
+
+@pytest.mark.parametrize("a_version", ["1", None], ids=["versioned", "unversioned"])
+def test_a_knowledge_base_without_an_owner_is_not_adopted_by_an_engine_that_delivered_nothing(a_version, caplog):
+    """A store written before owners were recorded, opened by another engine: the items it holds were
+    promoted by the old engine, and nothing would be left to demote them."""
+
+    class B(Scripted):
+        state_version = "1"
+
+    def promotes(prefix):
+        return {e: [Promote(item(f"{prefix}-{e}", (e,), scope="personal", owner="u1"))] for e in ("e1", "e2")}
+
+    events, kb = InMemoryEventStore(), InMemoryKnowledgeBase()
+    runtime(B(promotes("B")), events, kb, InMemoryStateBackend()).append(ev("e1"))
+    kb._owner = None  # as written before owners existed
+
+    a = Scripted(promotes("k"))
+    if a_version is not None:
+        a.state_version = a_version
+    with caplog.at_level("WARNING", logger="cortex_mem.runtime"):
+        runtime(a, events, kb, InMemoryStateBackend()).append(ev("e2"))
+
+    assert a.seen == ["e1", "e2"]
+    assert [k.id for k in kb.all()] == ["k-e1", "k-e2"]
+    assert ["no recorded owner" in r.getMessage() for r in caplog.records] == [True]
+
+
+def test_a_reset_that_empties_the_knowledge_base_logs_what_differed(caplog):
+    class V1(Scripted):
+        state_version = "1"
+
+    class V2(Scripted):
+        state_version = "2"
+
+    events, kb, state = InMemoryEventStore(), InMemoryKnowledgeBase(), InMemoryStateBackend()
+    with caplog.at_level("WARNING", logger="cortex_mem.runtime"):
+        runtime(V1({"e1": [Promote(item("k1", ("e1",), scope="personal", owner="u1"))]}), events, kb, state).append(
+            ev("e1")
+        )
+        assert caplog.records == []  # the first start discards nothing
+
+        runtime(V2(), events, kb, state).sync()
+        runtime(Scripted(), events, kb, InMemoryStateBackend()).sync()  # another engine
+
+    first, second = (r.getMessage() for r in caplog.records)
+    assert "V2" in first and "'1'" in first and "'2'" in first
+    assert "Scripted" in second and "V2" in second

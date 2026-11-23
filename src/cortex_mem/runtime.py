@@ -7,6 +7,7 @@ a harness score describes what the server does.
 """
 
 import json
+import logging
 import sys
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -30,6 +31,8 @@ from .contract import (
 from .embed import EmbeddingError
 from .index import Index, IndexConfigChanged
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
+
+log = logging.getLogger(__name__)
 
 _ABSENT = object()
 MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
@@ -444,7 +447,8 @@ class Runtime:
         """The version this engine's state must have been written with. With
         an index it is the JSON of [state_version or None, index fingerprint]:
         the state records which index generation it was built on. Without
-        one it is the engine's state_version, and None means nothing to check."""
+        one it is the engine's state_version (None for an engine without one,
+        whose knowledge base owner is checked all the same)."""
         return self._want(None)
 
     def _want(self, generation: int | None) -> str | None:
@@ -481,17 +485,33 @@ class Runtime:
         if self.state.version() == want and (self._owner_seen == owner or self.knowledge.owner() == owner):
             self._owner_seen = owner
             return  # the common case takes no lock
+        reason = None
         with self.transaction():
             want = self._want_version()
             owner = self._owner(want)
             recorded = self.knowledge.owner()
-            # A recorded owner of None is a knowledge base written before owners were recorded;
-            # with the state under `want` it is this engine's, and is only marked as such.
-            if self.state.version() != want or recorded not in (None, owner):
+            epoch, cursor, stored = self.state.position()
+            has_state = cursor > 0 or epoch > 0 or next(self.state.scan(), None) is not None
+            # A recorded owner of None is a new store or one written before owners were recorded.
+            # It is marked as this engine's, unless it holds items while this engine has no state:
+            # an engine with no state did not fill it, so another engine did.
+            if recorded is None:
+                foreign = not has_state and bool(self.knowledge.all())
+            else:
+                foreign = recorded != owner
+            if stored != want or foreign:
+                if foreign or recorded is not None or has_state:  # a first start discards nothing
+                    reason = _reset_reason(stored, want, recorded, owner, foreign)
                 self.state.reset(want)
                 self.knowledge.clear()
                 self._knowledge_reconciled = False  # drop the vectors of what was removed
             self.knowledge.set_owner(owner)
+        if reason is not None:  # logged once the reset has committed
+            log.warning(
+                "%s starts over from the first event and empties the knowledge base: %s",
+                type(self.engine).__qualname__,
+                reason,
+            )
         self._owner_seen = None  # read it again once the transaction has committed
 
     def _owner(self, want: str | None) -> str:
@@ -667,3 +687,14 @@ class Runtime:
             return False
         items = self.knowledge.get([handoff.id])
         return not items or knowledge_visible(items[0], caller, scope)
+
+
+def _reset_reason(stored: str | None, want: str | None, recorded: str | None, owner: str, foreign: bool) -> str:
+    """What differed when an engine starts over, for the log: its state's version, or the owner of
+    the shared knowledge base. A version with an index holds its fingerprint (model, threshold,
+    store, generation), so two processes with different index settings show here."""
+    if recorded is None and foreign:
+        return "the knowledge base has no recorded owner but holds items, and this engine has no state"
+    if stored != want:
+        return f"its state was written under version {stored!r}, and it now runs under {want!r}"
+    return f"the knowledge base belongs to {recorded!r}, not {owner!r}"
