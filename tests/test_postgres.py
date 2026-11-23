@@ -939,6 +939,15 @@ def test_a_write_after_the_session_is_lost_reconnects(pg_schema):
         assert [e.id for _, e in db.events.since(0)] == ["e1", "e2"]
 
 
+def test_a_knowledge_put_after_the_session_is_lost_reconnects(pg_schema):
+    """put opens its own transaction, which replaces the lost session; it must write on the new one."""
+    with closing(PostgresDatabase(pg_schema)) as db:
+        db.knowledge.put(item("k0"))
+        _kill(db)
+        db.knowledge.put(item("k1"))
+        assert sorted(k.id for k in db.knowledge.all()) == ["k0", "k1"]
+
+
 def test_a_session_lost_inside_a_transaction_is_not_retried(pg_schema):
     """A retry inside a transaction could repeat writes the server already dropped; the error is the
     caller's to see, and the next operation reconnects."""
@@ -979,6 +988,10 @@ def test_reconnecting_backs_off_while_the_server_stays_down(pg_schema):
         for _ in range(3):
             with pytest.raises(ConnectionError, match="unavailable"):
                 db.events.count_since(0)  # within the first wait: no attempt
+        now[0] = 100.6
+        with pytest.raises(ConnectionError, match=r"next attempt in 1s"):
+            db.events.count_since(0)  # 0.4 s left reads as 1 s, not 0 s
+        now[0] = 100.0
         assert attempts == [100.0]
 
         waits = []

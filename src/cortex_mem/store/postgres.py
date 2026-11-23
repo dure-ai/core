@@ -26,6 +26,7 @@ must be written ``%%``. The shared fragments contain neither.
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -301,7 +302,7 @@ class PostgresDatabase:
         now = self._clock()
         if self._wait is not None and now < self._until:
             wait = self._until - now
-            raise ConnectionError(f"PostgreSQL ({self._where}) is unavailable; next attempt in {wait:.0f}s ({self._last})")
+            raise ConnectionError(f"PostgreSQL ({self._where}) is unavailable; next attempt in {math.ceil(wait)}s ({self._last})")
         try:
             con = self._open()
         except ConnectionError as exc:
@@ -696,8 +697,8 @@ class PgKnowledgeStore:
 
     def put(self, item: Knowledge) -> None:
         tokens = Counter(words(f"{item.title} {item.body}") + bigrams(f"{item.title} {item.body}"))
-        con = self.db.con
         with self.db.transaction():
+            con = self.db.con  # read inside: the transaction may have replaced a lost session
             con.execute(
                 _sql(
                     f"INSERT INTO knowledge ({_KNOWLEDGE_COLUMNS}) VALUES ({', '.join(['%s'] * 8)}) "
