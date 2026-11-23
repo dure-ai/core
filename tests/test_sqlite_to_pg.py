@@ -83,6 +83,11 @@ def runtime(db, embedder):
 def build_source(path):
     """5 events, 2 knowledge items, one engine's state/cursor/version, a full cache."""
     db = SqliteDatabase(path)
+    rt = runtime(db, HashEmbedder())
+    for i, text in enumerate(TEXTS, 1):
+        rt.append(ev(i, text))
+    # After the engine's first sync, which records it as the owner: before it, an ownerless
+    # knowledge base with items would count as another engine's and be emptied.
     for i in (1, 2):
         db.knowledge.put(
             Knowledge(
@@ -95,9 +100,7 @@ def build_source(path):
                 sources=(f"e{i}",),
             )
         )
-    rt = runtime(db, HashEmbedder())
-    for i, text in enumerate(TEXTS, 1):
-        rt.append(ev(i, text))
+    runtime(db, HashEmbedder()).sync()  # a new Runtime embeds the knowledge into the cache
     db.con.close()
 
 
@@ -124,11 +127,14 @@ def test_moves_everything_and_the_first_sync_embeds_nothing(tmp_path, pg_schema)
     try:
         assert list(pg.events.since(0)) == list(src.events.since(0))
         assert [seq for seq, _ in pg.events.since(0)] == [1, 2, 3, 4, 5]
+        assert [k.id for k in src.knowledge.all()] == ["k1", "k2"]
         assert sorted(pg.knowledge.all(), key=lambda k: k.id) == sorted(src.knowledge.all(), key=lambda k: k.id)
         s, p = src.state("count"), pg.state("count")
         assert dict(p.scan()) == dict(s.scan())
         assert p.cursor() == s.cursor() == 5
         assert p.version() == s.version()  # copied as is
+        assert src.knowledge.owner() is not None
+        assert pg.knowledge.owner() == src.knowledge.owner()  # so a switch of engines is still seen
         assert json.loads(p.version())[0] == "count-1"  # with the SQLite index it was built on
         digest = text_digest(TEXTS[0])
         model = HashEmbedder().model
@@ -313,6 +319,7 @@ def test_a_schema_4_source_from_main_migrates_without_the_warning(tmp_path, pg_s
     con = sqlite3.connect(path)
     for table in ("vectors", "vector_groups", "embed_cache", "vector_meta"):
         con.execute(f"DROP TABLE {table}")
+    con.execute("DELETE FROM knowledge_meta")  # main recorded no knowledge owner
     con.execute("PRAGMA user_version = 4")
     con.commit()
     con.close()
@@ -320,6 +327,11 @@ def test_a_schema_4_source_from_main_migrates_without_the_warning(tmp_path, pg_s
     assert result.returncode == 0, result.stderr
     assert "re-embed" not in result.stderr
     assert pg_count(pg_schema, "events") == 5
+    pg = PostgresDatabase(pg_schema)
+    try:
+        assert pg.knowledge.owner() is None  # left for the runtime to decide, as on the source
+    finally:
+        pg.close()
 
 
 def test_a_non_finite_cache_vector_exits_2_naming_the_digest(tmp_path, pg_schema):
@@ -358,5 +370,37 @@ def test_engine_rows_without_state_keys_copy_and_the_cache_count_matches(tmp_pat
         assert (pg.state("fresh").cursor(), pg.state("fresh").version()) == (0, "v9")
         assert list(pg.state("bare").scan()) == []
         assert pg.query("SELECT count(*) FROM embed_cache")[0][0] == cached > 0
+    finally:
+        pg.close()
+
+
+class QuietEngine(CountEngine):
+    """Another engine that promotes nothing."""
+
+    state_version = "quiet-1"
+
+
+def test_a_switch_of_engines_before_the_move_is_still_seen_after_it(tmp_path, pg_schema):
+    """No index: promote_all, then another engine, then the move. Starting promote_all on the
+    target must replay, as it would on the source, not adopt the knowledge base the other engine left."""
+    from cortex_mem.engines.baseline import PromoteAllEngine
+
+    def plain(db, engine, name):
+        return Runtime(engine, db.events, db.knowledge, db.state(name), db.transaction)
+
+    path = tmp_path / "core.db"
+    db = SqliteDatabase(path)
+    plain(db, PromoteAllEngine(), "promote_all").append(ev(1, TEXTS[0]))
+    plain(db, QuietEngine(), "quiet").sync()
+    assert db.knowledge.all() == []  # the other engine emptied it for itself
+    db.con.close()
+
+    result = run(str(path), pg_schema)
+    assert result.returncode == 0, result.stderr
+
+    pg = PostgresDatabase(pg_schema)
+    try:
+        plain(pg, PromoteAllEngine(), "promote_all").sync()
+        assert [k.id for k in pg.knowledge.all()] == ["k-e1"]  # replayed, as on SQLite
     finally:
         pg.close()

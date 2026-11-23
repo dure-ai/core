@@ -1,7 +1,7 @@
 """Move a SQLite store into an empty PostgreSQL database.
 
-Moves events (same seq), knowledge, every engine's state, cursor and version, and the
-embedding cache. Vectors, groups and the index version are not moved: the first sync on
+Moves events (same seq), knowledge and its owner, every engine's state, cursor and
+version, and the embedding cache. Vectors, groups and the index version are not moved: the first sync on
 PostgreSQL rebuilds the index (its version names the store) and finds every embedding in
 the cache. Everything happens in one transaction, so a failure leaves the target empty.
 
@@ -90,6 +90,9 @@ def migrate(src, pg) -> list[tuple[str, int, int]]:
         _copy_events(src, pg)
         for item in src.knowledge.all():
             pg.knowledge.put(item)
+        owner = src.knowledge.owner()
+        if owner is not None:  # without it, an engine switched before the move would adopt the other's items
+            pg.knowledge.set_owner(owner)
         _copy_state(src, pg)
         _copy_cache(src, pg)
         rows = [(t, _count(src, t), _count(pg, t)) for t in TABLES]
