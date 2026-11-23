@@ -9,18 +9,33 @@ from datetime import timedelta
 import pytest
 
 from cortex_mem.contract import Caller, Demote, Engine, Promote
+from cortex_mem.embed import HashEmbedder
 from cortex_mem.engines.ledger import LedgerEngine
+from cortex_mem.index import Index
+from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.postgres import PostgresDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
 
-from .helpers import T0, UNVERIFIED_TEAM, edit_state, ev, knowledge_ids, runtime, state
+from .helpers import (
+    ENGINE,
+    T0,
+    UNVERIFIED_TEAM,
+    edit_state,
+    ev,
+    knowledge_ids,
+    runtime,
+    state,
+)
 
 FACT = "the deploy script must run migrations before restarting the api server every time"
 # Jaccard with FACT is 11/13: the same claim on the lexical path, not a copy.
 NEAR = "the deploy script must run migrations before restarting the api server each time"
 # A different wording: only a similarity port can join it to FACT.
 OTHER = "always apply the database schema changes first, then restart the service"
+# Two values of one setting: a group joins them (there is no judge yet), but they do not agree.
+PORT_8080 = "the staging api gateway listens on port 8080 and the health check path is /healthz behind the proxy"
+PORT_9090 = "the staging api gateway listens on port 9090 and the health check path is /healthz behind the proxy"
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])
@@ -130,16 +145,60 @@ def test_a_conflicting_record_does_not_promote_the_first_one_as_team_knowledge(d
     """Two people record the same setting with different values. A group can join them (there is no
     judge yet), so the other value must not supply the second vote: nothing is promoted until a
     verified source confirms one of them."""
-    first = "the staging api gateway listens on port 8080 and the health check path is /healthz behind the proxy"
-    other = "the staging api gateway listens on port 9090 and the health check path is /healthz behind the proxy"
     rt, _ = runtime(LedgerEngine(), db=db, groups={"e1": "g", "e2": "g"} if port else None)
-    rt.append(ev("e1", first, user="ann"))
-    rt.append(ev("e2", other, user="bob", minutes=1))
+    rt.append(ev("e1", PORT_8080, user="ann"))
+    rt.append(ev("e2", PORT_9090, user="bob", minutes=1))
 
     assert knowledge_ids(db) == []
     assert [c.status for c in state(db).claims()] == ["provisional"]
     assert decisions_of(rt, Promote) == []
 
+
+
+@pytest.mark.parametrize("port", [False, True], ids=["lexical", "port"])
+def test_verifying_the_other_value_does_not_promote_the_first_one(db, port):
+    """Until an LLM judge decides whether the records in one claim say the same thing, they are only
+    known to share a topic. A verified judgment of bob's 9090 record says nothing about ann's 8080
+    body, so it counts for the claim only when it names the claim or its canonical record."""
+    rt, _ = runtime(LedgerEngine(), db=db, groups={"e1": "g", "e2": "g"} if port else None)
+    rt.append(ev("e1", PORT_8080, user="ann"))
+    rt.append(ev("e2", PORT_9090, user="bob", minutes=1))
+    rt.append(judgment("e3", "carol", refs=("e2",), minutes=2))  # a review of bob's record
+    rt.append(judgment("e4", "dan", kind="human_confirm", signal=None, refs=("e2",), minutes=3))
+
+    st = state(db)
+    assert knowledge_ids(db) == []
+    assert [c.status for c in st.claims()] == ["provisional"]
+    assert {e.event_id for e in st.evidence("c-e1")} == {"e1", "e2"}
+    assert st.skipped() == {"verified_not_canonical": 2}
+
+    rt.append(judgment("e5", "erin", refs=("c-e1",), minutes=4))  # names the claim
+    assert knowledge_ids(db) == ["c-e1"]
+    assert "8080" in db.knowledge.get(["c-e1"])[0].body
+
+    rt.append(judgment("e6", "frank", outcome="failure", refs=("e2",), minutes=5))
+    assert knowledge_ids(db) == ["c-e1"]  # a verified failure of bob's value does not demote ann's
+    assert state(db).skipped() == {"verified_not_canonical": 3}
+    assert rt.rejections == []
+
+
+def test_with_a_hash_index_a_verified_judgment_counts_only_for_the_canonical_record(db):
+    """The same case over core's own Index and the offline hash embedder instead of FakeSimilarity:
+    the two values join one group (cosine 0.96 at threshold 0.9), and only a judgment that names
+    ann's canonical record promotes it."""
+    index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
+    rt = Runtime(LedgerEngine(), db.events, db.knowledge, db.state(ENGINE), transaction=db.transaction, index=index)
+    rt.append(ev("e1", PORT_8080, user="ann"))
+    rt.append(ev("e2", PORT_9090, user="bob", minutes=1))
+    assert [c.status for c in state(db).claims()] == ["provisional"]
+
+    rt.append(judgment("e3", "carol", refs=("e2",), minutes=2))
+    assert knowledge_ids(db) == []
+
+    rt.append(judgment("e4", "dan", refs=("e1",), minutes=3))
+    assert knowledge_ids(db) == ["c-e1"]
+    assert "8080" in db.knowledge.get(["c-e1"])[0].body
+    assert rt.rejections == []
 
 def test_without_the_port_two_wordings_do_not_promote(db):
     rt, _ = runtime(db=db)

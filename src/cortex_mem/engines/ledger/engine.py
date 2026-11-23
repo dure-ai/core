@@ -230,7 +230,10 @@ class LedgerEngine:
         self, event: Event, ctx: EngineContext, store: LedgerStore
     ) -> list[Decision]:
         """Spec section 6, `outcome` and `human_confirm`: add support or
-        contradiction to the claims the refs name, when in scope."""
+        contradiction to the claims the refs name, when in scope. A verified
+        judgment counts for a claim only when it names the claim or its
+        canonical record (until an LLM judge says whether the claim's records
+        agree)."""
         if event.scope == "org":
             # v0.1 covers personal and team only: an org judgment would let
             # other teams vote and hide the claim from team-scope handoffs
@@ -245,6 +248,11 @@ class LedgerEngine:
             assert claim is not None
             if not in_scope(event, claim):
                 store.skip("out_of_scope_evidence", event.id, claim_id)
+                continue
+            if channel_of(event) in VERIFIED and not self._names_body(event, claim):
+                # Before an LLM judge, records in one claim are only known to share a topic,
+                # not to agree: a verified judgment of another record says nothing about the body.
+                store.skip("verified_not_canonical", event.id, claim_id)
                 continue
             if store.judged(claim_id, event.id):
                 continue  # delivered again: this judgment is already counted
@@ -309,13 +317,18 @@ class LedgerEngine:
         return out
 
     @staticmethod
+    def _names_body(event: Event, claim: Claim) -> bool:
+        """The event's refs name the claim itself or its canonical record."""
+        return claim.id in event.refs or claim.canonical in event.refs
+
+    @staticmethod
     def _retrieved(event: Event, claim_id: str, store: LedgerStore) -> bool:
         """The record repeats what it was handed: it cites the claim, or its
-        session was handed the claim before the record was made."""
+        session was handed the claim at or before the time of the record."""
         if claim_id in event.refs:
             return True
         seen = store.seen(event.session, claim_id)
-        return seen is not None and seen < event.at
+        return seen is not None and seen <= event.at
 
     @staticmethod
     def _human_fresh(evidence: Sequence[Evidence], canonical: str) -> bool:

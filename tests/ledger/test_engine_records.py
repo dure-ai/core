@@ -178,13 +178,26 @@ def test_a_record_after_its_session_was_handed_the_claim_is_retrieved(groups):
 def test_a_record_before_its_session_was_handed_the_claim_is_a_vote(groups):
     rt, db = runtime(groups=groups)
     rt.append(ev("e1", FACT))
-    # Seen at the very time of the record: not earlier, so not retrieved.
-    edit_state(db, lambda st: st.mark_seen("s2", "c-e1", T0 + timedelta(minutes=2)))
+    edit_state(db, lambda st: st.mark_seen("s2", "c-e1", T0 + timedelta(minutes=3)))
     rt.append(ev("e2", NEAR, user="u2", session="s2", minutes=2))
 
     rows = {e.event_id: e for e in state(db).evidence("c-e1")}
     assert rows["e2"].derived is None
     assert knowledge_ids(db) == ["c-e1"]
+
+
+@both("e1", "e2")
+def test_a_record_at_the_very_time_its_session_was_handed_the_claim_is_retrieved(groups):
+    """The same rule as use counting (seen at or before): delivery order already shows the handoff
+    came first, and the harness can give both the same virtual time."""
+    rt, db = runtime(groups=groups)
+    rt.append(ev("e1", FACT))
+    edit_state(db, lambda st: st.mark_seen("s2", "c-e1", T0 + timedelta(minutes=2)))
+    rt.append(ev("e2", NEAR, user="u2", session="s2", minutes=2))
+
+    rows = {e.event_id: e for e in state(db).evidence("c-e1")}
+    assert rows["e2"].derived == "retrieved"
+    assert knowledge_ids(db) == []
 
 
 @both("e1", "e2")

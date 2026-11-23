@@ -182,7 +182,8 @@ class LedgerStore:
 
     def skip(self, reason: str, event_id: str, detail: str = "") -> None:
         """Count one event the engine passed over, under `reason`
-        (`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`).
+        (`org_scope`, `unknown_outcome`, `unknown_ref`, `out_of_scope_evidence`,
+        `verified_not_canonical`).
         `detail` tells apart several skips of one event (the unknown ref, the
         claim out of scope). The same (reason, event, detail) counts once, so
         observing an event again does not change the counts."""
