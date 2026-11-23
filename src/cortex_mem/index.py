@@ -214,7 +214,7 @@ class Index:
         if failure is not None and self._backend.indexed() < failure[0]:
             raise failure[1]
 
-    def sync_knowledge(self, knowledge: KnowledgeReader, touched: Collection[str] | None = None) -> None:
+    def sync_knowledge(self, knowledge: KnowledgeReader, touched: Collection[str] | None = None) -> bool:
         """Make the knowledge vectors follow the knowledge base, for the ids in
         `touched` (None: every item, and every stored vector). An item whose
         stored digest differs from its passage's is embedded with no
@@ -225,14 +225,13 @@ class Index:
 
         The generation and the config are checked before anything is read and
         again inside the write transaction: if the index is stale, or another
-        process rebuilt it meanwhile, nothing is written and the call returns
-        quietly. The rebuilder stores every knowledge vector of its snapshot,
-        and a Runtime that rebuilds compares every item again afterwards, so
-        nothing is lost; raising instead would only make the caller retry
-        against the same rebuild."""
+        process rebuilt it meanwhile, nothing is written and it returns False,
+        so the caller keeps the ids for its next sync (raising instead would
+        only make the caller retry against the same rebuild). Otherwise it
+        returns True, also when there was nothing to write."""
         generation = self._backend.generation()  # first: a rebuild after this read changes it
         if self.stale():
-            return
+            return False
         # In full: every stored digest and vector id. For touched ids: theirs only,
         # so a decision costs what it touched, not the size of the knowledge base.
         stored = self._backend.knowledge_digests(None if touched is None else list(dict.fromkeys(touched)))
@@ -248,12 +247,12 @@ class Index:
         # A refused passage gets no vector; one stored for an earlier passage goes.
         changed = [i for i in changed if text_digest(_passage(i)) not in self._rejected or i.id in stored]
         if not changed and not gone:
-            return
+            return True
         vectors = self._knowledge_vectors(changed)
         refused = {item.id for item in changed if item.id not in vectors}
         with self._transaction():
             if self._backend.generation() != generation or self.stale():
-                return  # rebuilt meanwhile, maybe for another model: not ours to write into
+                return False  # rebuilt meanwhile, maybe for another model: not ours to write into
             still_gone = gone - {item.id for item in knowledge.get(list(gone))} if gone else set()
             if refused:  # only while the item still has the passage that was refused
                 still_gone |= {
@@ -263,6 +262,7 @@ class Index:
             if still_gone:
                 self._backend.delete_vectors("knowledge", sorted(still_gone))
             self._put_knowledge(knowledge, vectors)
+        return True
 
     def reader(
         self, events: EventReader, knowledge: KnowledgeReader, upto: int | None = None

@@ -199,6 +199,8 @@ class Runtime:
         self.verdicts: list[Verdict] = []
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
+        # seq -> failed observes not counted because the epoch moved meanwhile, in this process
+        self._restarts: dict[int, int] = {}
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
         # The owner this Runtime found recorded on the knowledge base. Engines are switched by
@@ -254,6 +256,7 @@ class Runtime:
         self._follow_knowledge()
         done = self.state.cursor()  # delivered or skipped, here or by another process
         self._failures = {seq: n for seq, n in self._failures.items() if seq > done}
+        self._restarts = {seq: n for seq, n in self._restarts.items() if seq > done}
         delivered = 0
         ahead = self.index is not None
         outage: tuple[int, EmbeddingError] | None = None  # (indexed position, error) of the batched pass
@@ -342,8 +345,15 @@ class Runtime:
         except (EmbeddingError, IndexConfigChanged):
             raise  # not the engine's failure: retried, never counted
         except Exception as exc:
-            if self.state.epoch() != epoch:
-                return 0, []  # reset or moved on meanwhile: not a failure on this state; read again
+            now = self.state.epoch()
+            if now != epoch:
+                # Reset or moved on meanwhile: not a failure on this state, so read again. A
+                # process that keeps moving the epoch without delivering this event (ticking,
+                # say) would make that a loop, so after MAX_CONFIG_RETRIES restarts it counts.
+                self._restarts[seq] = self._restarts.get(seq, 0) + 1
+                if self._restarts[seq] <= MAX_CONFIG_RETRIES:
+                    return 0, []
+                epoch = now  # a skip commits against the state as it is now
             attempts = self._give_up(seq)
             if attempts is None:
                 raise
@@ -364,6 +374,7 @@ class Runtime:
         touched, verdicts = committed
         self.verdicts.extend(verdicts)
         self._failures.pop(seq, None)
+        self._restarts.pop(seq, None)
         return 1, touched
 
     def _moved(self, epoch: int, cursor: int, generation: int | None, seq: int) -> str | None:
@@ -405,16 +416,19 @@ class Runtime:
             self._failures.pop(seq, None)
             return
         self._failures.pop(seq, None)
+        self._restarts.pop(seq, None)
         self.skipped.append(Skipped(seq, event_id, attempts, f"{type(error).__name__}: {error}"))
 
     def _sync_knowledge(self, touched: Collection[str]) -> None:
         """After a commit, outside its transaction: let the knowledge vectors
-        follow the ids the decisions touched. On an EmbeddingError the
-        decisions stand; the ids wait for this Runtime's next sync."""
+        follow the ids the decisions touched. On an EmbeddingError, or when
+        the index went stale or was rebuilt meanwhile so nothing was written,
+        the decisions stand and the ids wait for this Runtime's next sync."""
         if self.index is None or not touched:
             return
         try:
-            self.index.sync_knowledge(self.knowledge, touched)
+            if not self.index.sync_knowledge(self.knowledge, touched):
+                self._pending_knowledge.update(touched)
         except EmbeddingError:
             self._pending_knowledge.update(touched)
             raise
@@ -426,13 +440,13 @@ class Runtime:
         if self.index is None:
             return
         if not self._knowledge_reconciled:
-            self.index.sync_knowledge(self.knowledge, None)
-            self._knowledge_reconciled = True
-            self._pending_knowledge.clear()
+            if self.index.sync_knowledge(self.knowledge, None):  # else: compare again next time
+                self._knowledge_reconciled = True
+                self._pending_knowledge.clear()
         elif self._pending_knowledge:
             ids = set(self._pending_knowledge)
-            self.index.sync_knowledge(self.knowledge, ids)
-            self._pending_knowledge -= ids
+            if self.index.sync_knowledge(self.knowledge, ids):  # else: the ids keep waiting
+                self._pending_knowledge -= ids
 
     def _give_up(self, seq: int) -> int | None:
         """Count a failed attempt; the attempt count when the event is to be
