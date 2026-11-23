@@ -62,11 +62,11 @@ def _candidates(
     return relevance
 
 
-def _claims_of(found: Sequence[tuple[object, float]], store: LedgerStore) -> list[str]:
+def _claims_of(found: Sequence[tuple[Event, float]], store: LedgerStore) -> list[str]:
     """Claim ids of the observed records among search hits, in hit order."""
     ids: list[str] = []
     for event, _ in found:
-        memory = store.memory(event.id)  # type: ignore[attr-defined]
+        memory = store.memory(event.id)
         if memory is not None:
             ids.append(memory.claim_id)
     return ids

@@ -22,7 +22,6 @@ from cortex_mem.contract import (
     Handoff,
     Scope,
 )
-from cortex_mem.engines.ledger import retrieve
 from cortex_mem.engines.ledger.config import LedgerConfig
 from cortex_mem.engines.ledger.decide import canonical_of, decisions
 from cortex_mem.engines.ledger.evidence import (
@@ -35,6 +34,7 @@ from cortex_mem.engines.ledger.evidence import (
 from cortex_mem.engines.ledger.gate import evaluate
 from cortex_mem.engines.ledger.matcher import DOWN, eligible, match_claim
 from cortex_mem.engines.ledger.model import Claim, Derived, Evidence, Memory
+from cortex_mem.engines.ledger.retrieve import handoff as retrieve_handoff
 from cortex_mem.engines.ledger.similar import similar_of
 from cortex_mem.engines.ledger.store import LedgerStore
 from cortex_mem.engines.ledger.text import signature
@@ -121,7 +121,7 @@ class LedgerEngine:
         with its canonical text, a provenance line and all its counted
         support as sources. Reads only (see `retrieve.handoff`)."""
         store = LedgerStore(ctx.state)
-        return retrieve.handoff(query, caller, scope, ctx, store, self._cfg, k)
+        return retrieve_handoff(query, caller, scope, ctx, store, self._cfg, k)
 
     def _record(
         self, event: Event, ctx: EngineContext, store: LedgerStore
