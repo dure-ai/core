@@ -784,10 +784,11 @@ def test_an_engine_without_a_state_version_is_checked_when_an_index_is_present()
     assert runtime(replayed, db, threshold=0.5).sync() == 1
     assert json.loads(db.state("probe").version()) == [None, fingerprint(db, 0.5)]
 
-    # Without an index and without a state_version nothing is checked, as before.
-    unchecked = ProbeEngine()
-    assert runtime(unchecked, db, with_index=False).sync() == 0
-    assert unchecked.seen == []
+    # Turning the index off replays it too: its state was built on an index it no longer reads, and
+    # the knowledge base is recorded as owned under the indexed version.
+    unindexed = ProbeEngine()
+    assert runtime(unindexed, db, with_index=False).sync() == 1
+    assert unindexed.seen == ["e1"] and db.state("probe").version() is None
 
 
 def test_rebuild_by_another_process_with_the_same_config_replays_this_engine():
@@ -1429,3 +1430,40 @@ def test_a_record_takes_few_round_trips_to_postgresql(request):
 
     db.con = counting._inner
     assert len(counting.statements) <= ROUND_TRIPS_PER_RECORD, "\n".join(counting.statements)
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_recall_answers_from_what_was_delivered_during_an_embedding_outage(store, tmp_path, request):
+    db = reopener(store, tmp_path, request)()
+    emb = Switchable()
+    engine = ProbeEngine(handoffs=[Handoff("k1", "deploy uses tags", ("e1",))])
+    rt = runtime(engine, db, emb)
+    rt.append(ev("e1"))
+    emb.down = True
+    with pytest.raises(EmbeddingError):
+        rt.append(ev("e2", "payments need vendor v2"))
+
+    # The waiting event and the query cannot be embedded: recall answers without them, with the
+    # similarity reader left out as when no index is configured, and still records the recall.
+    handoffs = rt.recall("deploy", caller(), "personal", event_id="r1")
+
+    assert [h.id for h in handoffs] == ["k1"]
+    assert engine.similar["handoff"] is None
+    assert [e.id for _, e in db.events.since(0)] == ["e1", "e2", "r1"]
+    assert rt.waiting() == ["e2", "r1"]
+
+    emb.down = False
+    rt.sync()
+    assert rt.waiting() == []
+
+
+def test_a_query_that_cannot_be_embedded_is_answered_by_text_search():
+    db = InMemoryDatabase()
+    emb = Switchable()
+    engine = ProbeEngine(handoffs=[Handoff("k1", "deploy uses tags", ("e1",))])
+    rt = runtime(engine, db, emb)
+    rt.append(ev("e1"))
+    emb.queries_down = True  # passages embed, queries fail
+
+    assert [h.id for h in rt.handoff("deploy", caller(), "personal")] == ["k1"]
+    assert engine.similar["handoff"] is None  # asked again without the similarity reader

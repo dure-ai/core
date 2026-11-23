@@ -2,7 +2,9 @@
 
 import re
 
-_WORD = re.compile(r"\w+")
+# A Hangul run and a run of other word characters are separate words, so "pytest가"
+# indexes "pytest" (the harness tokenizer splits the same way).
+_WORD = re.compile(r"[가-힣]+|[^\W가-힣]+")
 _HANGUL = re.compile(r"[가-힣]")
 _NAMED_PARAM = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
 

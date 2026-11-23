@@ -7,10 +7,12 @@ import http.client
 import json
 import math
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from array import array
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Literal, Protocol
 
 from cortex_mem.store.text import bigrams, words
@@ -34,7 +36,11 @@ class Embedder(Protocol):
     """Port for anything that turns texts into vectors."""
 
     model: str
-    dim: int
+
+    @property
+    def dim(self) -> int:
+        """Vector length; read-only, since an embedder may learn it from its first response."""
+        ...
 
     def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
         """One vector per text, in order, each `dim` long. kind says whether the
@@ -181,7 +187,6 @@ class UpstageEmbedder:
         self.timeout = timeout
         self.batch = max(1, batch)
         self._dim: int | None = None
-        self._working: set[str] = set()  # models that have answered in this process
 
     @property
     def dim(self) -> int:
@@ -198,9 +203,10 @@ class UpstageEmbedder:
         """Embed texts in batches with the model matching kind.
 
         A single text answered with a status in REJECTING raises
-        EmbeddingRejected once the model is known to work: it has answered
-        before in this process, or it answers the PROBE text now. Otherwise,
-        and for a batch of several texts, the error is an EmbeddingError."""
+        EmbeddingRejected only if the model answers the PROBE text right
+        after: a model that answered before can be retired, or the request
+        format change, and then every text would be refused. Otherwise, and
+        for a batch of several texts, the error is an EmbeddingError."""
         model = self.passage_model if kind == "passage" else self.query_model
         out: list[list[float]] = []
         for i in range(0, len(texts), self.batch):
@@ -214,9 +220,7 @@ class UpstageEmbedder:
         return out
 
     def _works(self, model: str) -> bool:
-        """Whether `model` has embedded something in this process, or embeds PROBE now."""
-        if model in self._working:
-            return True
+        """Whether `model` embeds PROBE now."""
         try:
             self._post(model, [self.PROBE])
         except EmbeddingError:
@@ -234,6 +238,7 @@ class UpstageEmbedder:
         differ from each other or from `dim`)."""
         body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
         unsendable: str | None = None
+        raw = b""  # set by the request; every path that leaves it unset raises below
         try:
             request = urllib.request.Request(
                 f"{self.base_url}/embeddings",
@@ -282,7 +287,65 @@ class UpstageEmbedder:
             raise EmbeddingError("embedding response has empty or inconsistent vector lengths")
         if self._dim is None and vectors:
             self._dim = width
-        self._working.add(model)
+        return vectors
+
+
+class OutageBreaker:
+    """Wraps an embedder so a long outage costs one timeout, not one per call.
+
+    After an outage (EmbeddingError; a refused text, EmbeddingRejected, is not
+    one), calls fail at once for a cooldown, `first` seconds and doubling after
+    each failed retry up to `maximum`. The first call after the cooldown tries
+    the backend again, and any answer resets it: a success, or a refused text.
+    Delivery never skips an event for an EmbeddingError, so failing fast only
+    makes the wait cheaper; the cost is noticing recovery up to `maximum`
+    seconds late."""
+
+    def __init__(
+        self,
+        inner: Embedder,
+        first: float = 5.0,
+        maximum: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.inner = inner
+        self.model = inner.model
+        self.first = first
+        self.maximum = maximum
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._wait: float | None = None  # the current cooldown; None while the backend answers
+        self._until = 0.0
+        self._last = ""
+
+    @property
+    def dim(self) -> int:
+        return self.inner.dim
+
+    def __repr__(self) -> str:
+        return f"OutageBreaker({self.inner!r})"
+
+    def embed(self, texts: Sequence[str], kind: EmbedKind) -> list[list[float]]:
+        with self._lock:
+            now = self._clock()
+            if self._wait is not None and now < self._until:
+                raise EmbeddingError(
+                    f"embedding is unavailable; retrying in {self._until - now:.0f}s (last error: {self._last})"
+                )
+        try:
+            vectors = self.inner.embed(texts, kind)
+        except EmbeddingRejected:
+            with self._lock:
+                self._wait = None  # the backend answered, so a later outage is a new one
+            raise
+        except EmbeddingError as exc:
+            with self._lock:
+                self._wait = self.first if self._wait is None else min(self._wait * 2, self.maximum)
+                self._until = self._clock() + self._wait
+                self._last = str(exc)
+            raise
+        with self._lock:
+            self._wait = None
         return vectors
 
 

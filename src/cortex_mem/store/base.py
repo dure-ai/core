@@ -5,7 +5,8 @@ A durable implementation (SQLite, PostgreSQL) passes the contract when it
 passes the suites in cortex_mem.testing.
 """
 
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
@@ -36,6 +37,10 @@ class EventStore(EventReader, Protocol):
         positions. Positions start at 1 and only grow; since(0) is everything."""
         ...
 
+    def count_since(self, seq: int) -> int:
+        """How many events since(seq) would give, without reading them."""
+        ...
+
 
 class KnowledgeStore(KnowledgeReader, Protocol):
     """The knowledge base. In production the Git wiki is the copy people read."""
@@ -49,7 +54,18 @@ class KnowledgeStore(KnowledgeReader, Protocol):
         ...
 
     def clear(self) -> None:
-        """Remove every item at once (an engine reset empties the knowledge base)."""
+        """Remove every item at once (an engine reset empties the knowledge base).
+        The owner stays."""
+        ...
+
+    def owner(self) -> str | None:
+        """Which engine state the knowledge base belongs to, as the runtime
+        recorded it with set_owner (None = never recorded)."""
+        ...
+
+    def set_owner(self, owner: str) -> None:
+        """Record the owner. Durable stores keep it with the knowledge base,
+        and a transaction that rolls back undoes it."""
         ...
 
 
@@ -74,7 +90,7 @@ class EngineStateBackend(Protocol):
         expected: int,
         cursor: int,
         writes: Mapping[str, Any],
-        deletes: Set[str],
+        deletes: AbstractSet[str],
         *,
         epoch: int,
     ) -> None:
@@ -96,9 +112,9 @@ class EngineStateBackend(Protocol):
         before it commits, at the cost of one round trip."""
         ...
 
-    def reset(self, version: str) -> None:
-        """Drop every key, move the cursor back to 0, record `version` and
-        add 1 to the epoch."""
+    def reset(self, version: str | None) -> None:
+        """Drop every key, move the cursor back to 0, record `version` (None:
+        an engine with no state_version) and add 1 to the epoch."""
         ...
 
 
@@ -120,12 +136,12 @@ class VectorBackend(Protocol):
     Part of the index version, so moving to another store rebuilds the index."""
 
     # Index state
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         """{"model": str, "group_threshold": float, "store": str} as the Index
         passed it to reset(), None until reset() is called."""
         ...
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         """Drop every vector (and the knowledge digests) and group, move the cursor
         to 0, record meta and add 1 to generation(), all in one step. The embedding
         cache stays."""
@@ -140,7 +156,7 @@ class VectorBackend(Protocol):
         """Position of the last event indexed (0 = none)."""
         ...
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         """(meta(), generation(), indexed()) read together, in one step on a
         durable store, so the three come from one moment."""
         ...

@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import get_args
+from typing import Any, cast, get_args
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -50,7 +50,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from cortex_mem.access import knowledge_visible
 from cortex_mem.contract import Caller, Engine, Event, Outcome, Scope, Signal
-from cortex_mem.embed import Embedder, HashEmbedder, UpstageEmbedder
+from cortex_mem.embed import (
+    Embedder,
+    EmbeddingError,
+    HashEmbedder,
+    OutageBreaker,
+    UpstageEmbedder,
+)
 from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
@@ -83,7 +89,7 @@ def _narrow(requested: Scope | None, default: Scope) -> Scope:
 def _scope(value: str) -> Scope:
     if value not in get_args(Scope):
         raise ValueError(f"unknown scope: {value!r}")
-    return value  # type: ignore[return-value]
+    return cast(Scope, value)
 
 
 @dataclass(frozen=True)
@@ -154,36 +160,64 @@ class Service:
         self.policy = policy
         self.clock = clock
         self._skipped_logged = 0
+        self._outage = False  # an embedding outage has been logged and has not ended yet
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
+        return self._caught_up(repo, context)[0]
+
+    def _caught_up(self, repo: str | None, context: Mapping[str, str] | None) -> tuple[Caller, bool]:
+        """The caller, after delivering what other sessions appended and letting
+        time pass; and whether that failed on an embedding outage, so the rest
+        of the tool call does not wait on another failing request."""
         caller = Caller(
             user=self.user, team=self.team, session=self.session, at=self.clock(), agent=self.agent,
             repo=repo or self.repo, context=context or {},
         )
+        down = False
         try:
-            self.runtime.tick(caller.at)  # delivers what other sessions appended, then lets time pass
+            self.runtime.tick(caller.at)
+        except EmbeddingError as exc:
+            down = True
+            self._embedding_failed(exc)
         except Exception:
             # An engine failure must not stop the tool call; the runtime retries
             # the event next time and skips it after max_failures attempts.
             log.exception("engine failed while catching up; continuing")
+        else:
+            self._embedding_works()
         self._log_skipped()
-        return caller
+        return caller, down
+
+    def _embedding_failed(self, exc: EmbeddingError) -> None:
+        """Log an outage once, when it begins: every tool call meets it until it ends."""
+        if not self._outage:
+            log.warning("embedding failed; delivery waits and recall answers from what was delivered: %s", exc)
+            self._outage = True
+
+    def _embedding_works(self) -> None:
+        if self._outage:
+            log.warning("embedding works again; delivery resumes")
+            self._outage = False
 
     def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
         """Append an event; returns its id, whether the engine has taken this
         event in (false while it waits: behind an earlier event, an embedding
-        outage or a failing engine) and how many events still wait, this one
-        or others (None when that could not be read).
+        outage or a failing engine; and false when it was skipped after
+        max_failures failed deliveries) and how many events still wait, this
+        one or others (None when that could not be read).
         Once stored, the event is not lost if delivery fails: it is retried
         later, so the agent must not record it again."""
         event = Event(id=uuid4().hex, at=caller.at, user=caller.user, team=caller.team,
                       session=caller.session, agent=caller.agent, **fields)
         try:
             self.runtime.append(event)
-        except Exception:
+        except Exception as exc:
             if not self.runtime.events.get([event.id]):
                 raise  # refused before it was stored (e.g. missing refs)
-            log.exception("event %s stored, but the engine failed to take it in", event.id)
+            if isinstance(exc, EmbeddingError):
+                self._embedding_failed(exc)
+            else:
+                log.exception("event %s stored, but the engine failed to take it in", event.id)
         finally:
             self._log_skipped()
         try:
@@ -193,7 +227,17 @@ class Service:
             # agent would answer by recording it again.
             log.exception("event %s stored, but its delivery could not be checked", event.id)
             return event.id, False, None
-        return event.id, event.id not in waiting, len(waiting)
+        skipped = any(s.event_id == event.id for s in self.runtime.skipped)
+        return event.id, event.id not in waiting and not skipped, len(waiting)
+
+    def pending(self) -> int | None:
+        """How many events wait to be delivered, from any session; None when
+        that could not be read."""
+        try:
+            return self.runtime.pending()
+        except Exception:
+            log.exception("could not count the waiting events")
+            return None
 
     def _log_skipped(self) -> None:
         for skipped in self.runtime.skipped[self._skipped_logged:]:
@@ -211,7 +255,7 @@ class Service:
         refs: Sequence[str] = (),
         repo: str | None = None,
         rev: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = self.policy.resolve(scope, self.repo)
         id, delivered, pending = self._append(
@@ -227,9 +271,9 @@ class Service:
         k: int = 6,
         repo: str | None = None,
         context: Mapping[str, str] | None = None,
-    ) -> list[dict]:
-        caller = self._caller(repo, context)
-        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k)
+    ) -> list[dict[str, Any]]:
+        caller, down = self._caught_up(repo, context)
+        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
             for h in handoffs
@@ -240,10 +284,9 @@ class Service:
         outcome: Outcome,
         refs: Sequence[str],
         text: str = "",
-        signal: Signal = "self",
         scope: Scope | None = None,
         repo: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         caller = self._caller(repo)
         effective = _narrow(scope, self._outcome_default(caller, refs))
         # The judgement must reach whoever sees the judged item, but the agent's
@@ -251,10 +294,13 @@ class Service:
         redacted = bool(text) and _WIDTH[effective] > _WIDTH[self.policy.default_for(self.repo)]
         id, delivered, pending = self._append(
             caller, kind="outcome", scope=effective, text="" if redacted else text, outcome=outcome,
-            signal=signal, refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
+            # An agent's report is its own judgement, like its records: a test,
+            # review or person must report through another path to count as one.
+            signal="self", refs=tuple(refs), repo=caller.repo, text_redacted=redacted,
         )
         return {
-            "id": id, "scope": effective, "text_redacted": redacted, "delivered": delivered, "pending": pending,
+            "id": id, "scope": effective, "signal": "self", "text_redacted": redacted, "delivered": delivered,
+            "pending": pending,
         }
 
     def _outcome_default(self, caller: Caller, refs: Sequence[str]) -> Scope:
@@ -317,7 +363,8 @@ def _embedder() -> Embedder | None:
         if missing:
             raise SystemExit(f"cortex-mem: CORTEX_EMBEDDER=upstage also needs {', '.join(missing)}")
         try:
-            return UpstageEmbedder(key, passage, query, timeout=UPSTAGE_TIMEOUT_S)
+            # During an outage, fail at once for a while instead of waiting for a timeout on every call.
+            return OutageBreaker(UpstageEmbedder(key, passage, query, timeout=UPSTAGE_TIMEOUT_S))
         except ValueError:
             pass  # exit after the handler, so nothing is chained; the message names no value
 
@@ -417,7 +464,7 @@ def record_episode(
     refs: list[str] | None = None,
     repo: str | None = None,
     rev: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Record something learned while working (a fix, a cause, a convention) so
     future sessions can recall it. Who may see it is set by the server for the
     repo; scope can only narrow that (e.g. "personal" for a private note).
@@ -426,7 +473,9 @@ def record_episode(
     repo defaults to the project's configured repo and does not change who may
     see the record. Returns the id, the scope actually used, delivered and
     pending: delivered false means it is stored and will reach memory later
-    (it is among the pending events that wait), so do not record it again.
+    (it is among the pending events that wait), so do not record it again;
+    rarely, it was skipped after repeated engine failures, which the server
+    logs.
     pending counts every event that waits, from any session, as an integer,
     or null when it could not be read (delivered is then false; the record is
     still stored)."""
@@ -440,14 +489,18 @@ def recall(
     k: int = 6,
     repo: str | None = None,
     context: dict[str, str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Recall memories relevant to the current task. Call before starting work
     that past sessions may have covered. By default searches everything you may
     see (your own, your team's, the org's); scope narrows it. repo and context
     say where you are working (e.g. context={"service": "api"}), so facts that
     hold only elsewhere can be left out; repo defaults to the project's
-    configured repo. Returns up to k memories, best first."""
-    return {"memories": get_service().recall(query, scope, k, repo, context)}
+    configured repo. Returns up to k memories, best first, and pending: how
+    many recorded events have not reached memory yet (an integer, or null when
+    it could not be read). While pending is above 0, the answer may miss them,
+    for example during an embedding outage; they arrive on later calls."""
+    service = get_service()
+    return {"memories": service.recall(query, scope, k, repo, context), "pending": service.pending()}
 
 
 @mcp.tool()
@@ -458,19 +511,23 @@ def report_outcome(
     signal: Signal = "self",
     scope: Scope | None = None,
     repo: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Report whether recalled memories (refs = their ids, at least one) helped:
-    "success", "failure", or "unknown". signal says who judged it: "self", "test",
-    "review", "human", or "doc". This is how memories earn or lose trust.
-    By default the judgement (outcome, signal, refs) is visible to whoever can
-    see the judged memories, e.g. the whole org for an org memory; scope can
-    only narrow that. If that is wider than this repo's policy, text is not
-    stored (text_redacted: true). Returns the id, the scope actually used,
-    text_redacted, delivered and pending (delivered false: stored, reaches
-    memory later, pending events wait; do not report it again). pending is an
-    integer, or null when it could not be read (delivered is then false)."""
+    "success", "failure", or "unknown". This is how memories earn or lose trust.
+    The report is stored as your own judgement (signal "self") whatever signal
+    you pass; test, review and human results count only when they report
+    themselves. By default the judgement (outcome, signal, refs) is visible to
+    whoever can see the judged memories, e.g. the whole org for an org memory;
+    scope can only narrow that. If that is wider than this repo's policy, text
+    is not stored (text_redacted: true). Returns the id, the scope and signal
+    actually used, text_redacted, delivered and pending (delivered false:
+    stored, reaches memory later, pending events wait; do not report it again;
+    rarely, skipped after repeated engine failures, which the server logs).
+    pending is an integer, or null when it could not be read (delivered is then
+    false)."""
+    del signal  # kept so clients that send it still work; the server sets the signal
     try:
-        return get_service().report_outcome(outcome, refs, text, signal, scope, repo)
+        return get_service().report_outcome(outcome, refs, text, scope, repo)
     except ValueError as exc:  # e.g. empty refs: tell the agent why, not just that it failed
         raise ToolError(str(exc)) from exc
 

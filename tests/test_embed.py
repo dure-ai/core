@@ -132,3 +132,108 @@ def test_cosine_of_float32_vectors_is_bit_for_bit_the_fsum_formula(dim):
     assert [s for _, s in top_by_cosine(query, enumerate(vectors), 200)] == sorted(
         (s for s in (_fsum_cosine(query, v) for v in vectors) if s > 0), reverse=True
     )
+
+
+# ── OutageBreaker ───────────────────────────────────────────────────────────
+
+
+class _Backend:
+    """HashEmbedder that fails while `down` (an outage) or refuses `refuse` (one text)."""
+
+    def __init__(self):
+        self.inner = HashEmbedder()
+        self.model, self.dim = self.inner.model, self.inner.dim
+        self.down = False
+        self.refuse = None
+        self.calls = 0
+
+    def embed(self, texts, kind):
+        from cortex_mem.embed import EmbeddingError, EmbeddingRejected
+
+        self.calls += 1
+        if self.down:
+            raise EmbeddingError("backend is down")
+        if self.refuse in texts:
+            raise EmbeddingRejected("refused")
+        return self.inner.embed(texts, kind)
+
+
+def _breaker(backend, now):
+    from cortex_mem.embed import OutageBreaker
+
+    return OutageBreaker(backend, first=5.0, maximum=20.0, clock=lambda: now[0])
+
+
+def test_breaker_fails_fast_after_an_outage_and_retries_after_the_cooldown():
+    from cortex_mem.embed import EmbeddingError
+
+    backend, now = _Backend(), [100.0]
+    emb = _breaker(backend, now)
+    backend.down = True
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    with pytest.raises(EmbeddingError, match="unavailable"):
+        emb.embed(["b"], "query")  # within the cooldown: no request
+    assert backend.calls == 1
+
+    now[0] = 105.0  # the cooldown is over: one request finds it still down, and the wait doubles
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    now[0] = 114.0
+    with pytest.raises(EmbeddingError, match="unavailable"):
+        emb.embed(["a"], "passage")
+    assert backend.calls == 2
+
+    backend.down = False
+    now[0] = 115.0
+    assert emb.embed(["a"], "passage") == HashEmbedder().embed(["a"], "passage")
+    backend.down = True  # a success resets the wait to the first one
+    with pytest.raises(EmbeddingError):
+        emb.embed(["a"], "passage")
+    now[0] = 120.0
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    assert backend.calls == 5
+
+
+def test_breaker_caps_the_wait_and_ignores_refused_texts():
+    from cortex_mem.embed import EmbeddingError, EmbeddingRejected
+
+    backend, now = _Backend(), [0.0]
+    emb = _breaker(backend, now)
+    backend.refuse = "too long"
+    with pytest.raises(EmbeddingRejected):
+        emb.embed(["too long"], "passage")
+    assert emb.embed(["fine"], "passage")  # a refused text is not an outage
+    backend.down = True
+    for _ in range(6):  # waits 5, 10, 20, 20, 20, 20
+        with pytest.raises(EmbeddingError, match="backend is down"):
+            emb.embed(["a"], "passage")
+        now[0] += 20.0
+    assert backend.calls == 8
+    assert (emb.model, emb.dim) == (backend.model, backend.dim)
+
+
+def test_breaker_takes_a_refused_text_as_an_answer_and_starts_the_next_wait_over():
+    from cortex_mem.embed import EmbeddingError, EmbeddingRejected
+
+    backend, now = _Backend(), [0.0]
+    emb = _breaker(backend, now)
+    backend.down = True
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")  # waits 5
+    now[0] = 6.0
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")  # waits 10
+    backend.down, backend.refuse = False, "too long"
+    now[0] = 17.0
+    with pytest.raises(EmbeddingRejected):
+        emb.embed(["too long"], "passage")  # the backend answered
+    backend.down = True
+    now[0] = 18.0
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    now[0] = 23.0  # the new outage waits 5 again, not 20
+    with pytest.raises(EmbeddingError, match="backend is down"):
+        emb.embed(["a"], "passage")
+    assert backend.calls == 5

@@ -6,7 +6,8 @@ import bisect
 import json
 import math
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -82,6 +83,9 @@ class InMemoryEventStore:
         for i in range(seq, len(self._log)):
             yield i + 1, self._log[i]
 
+    def count_since(self, seq: int) -> int:
+        return max(0, len(self._log) - seq)
+
     def get(self, ids: Collection[str]) -> list[Event]:
         return [self._events[i] for i in ids if i in self._events]
 
@@ -106,6 +110,7 @@ class InMemoryEventStore:
 class InMemoryKnowledgeBase:
     def __init__(self) -> None:
         self._items: dict[str, Knowledge] = {}
+        self._owner: str | None = None
 
     def put(self, item: Knowledge) -> None:
         self._items[item.id] = item
@@ -115,6 +120,12 @@ class InMemoryKnowledgeBase:
 
     def clear(self) -> None:
         self._items.clear()
+
+    def owner(self) -> str | None:
+        return self._owner
+
+    def set_owner(self, owner: str) -> None:
+        self._owner = owner
 
     def get(self, ids: Collection[str]) -> list[Knowledge]:
         return [self._items[i] for i in ids if i in self._items]
@@ -159,7 +170,7 @@ class InMemoryStateBackend:
         expected: int,
         cursor: int,
         writes: Mapping[str, Any],
-        deletes: Set[str],
+        deletes: AbstractSet[str],
         *,
         epoch: int,
     ) -> None:
@@ -180,7 +191,7 @@ class InMemoryStateBackend:
     def position(self) -> tuple[int, int, str | None]:
         return self._epoch, self._cursor, self._version
 
-    def reset(self, version: str) -> None:
+    def reset(self, version: str | None) -> None:
         self._data.clear()
         self._cursor = 0
         self._epoch += 1
@@ -207,14 +218,14 @@ class InMemoryVectorBackend:
         self._cells: dict[tuple[Scope, str], list[tuple[int, str]]] = {}
         self._cache: dict[tuple[str, str], list[float]] = {}
         self._digests: dict[str, str] = {}
-        self._meta: dict | None = None
+        self._meta: dict[str, Any] | None = None
         self._indexed = 0
         self._generation = 0
 
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         return None if self._meta is None else dict(self._meta)
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         for table in self._vectors.values():
             table.clear()
         self._groups.clear()
@@ -230,7 +241,7 @@ class InMemoryVectorBackend:
     def indexed(self) -> int:
         return self._indexed
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         return self.meta(), self._generation, self._indexed
 
     def set_indexed(self, expected: int, seq: int, generation: int) -> None:

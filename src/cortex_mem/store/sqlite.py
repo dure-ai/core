@@ -17,18 +17,19 @@ import json
 import sqlite3
 import threading
 from array import array
-from collections.abc import Collection, Iterator, Mapping, Sequence, Set
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from datetime import datetime
 from os import PathLike
-from typing import Any
+from typing import Any, Self
 
 from ..contract import Caller, Event, Kind, Knowledge, Scope
 from ..embed import QueryScorer, float32, top_by_cosine
 from .base import CursorConflict
 from .text import EVENT_VISIBLE_SQL, KNOWLEDGE_VISIBLE_SQL, bigrams, words
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's write lock
 
 _EVENT_COLUMNS = (
@@ -43,7 +44,7 @@ def _match(query: str) -> str | None:
     return " OR ".join(terms) or None
 
 
-def _row_to_event(row: tuple) -> Event:
+def _row_to_event(row: tuple[Any, ...]) -> Event:
     id, kind, at, user, team, session, scope, text, agent, signal, outcome, conditions, refs, repo, rev, redacted = row
     return Event(
         id=id, kind=kind, at=datetime.fromisoformat(at), user=user, team=team, session=session,
@@ -53,7 +54,7 @@ def _row_to_event(row: tuple) -> Event:
     )
 
 
-def _row_to_knowledge(row: tuple) -> Knowledge:
+def _row_to_knowledge(row: tuple[Any, ...]) -> Knowledge:
     id, kind, title, body, scope, owner, sources, conditions = row
     return Knowledge(
         id=id, kind=kind, title=title, body=body, scope=scope, owner=owner,
@@ -67,11 +68,25 @@ class SqliteDatabase:
         self.con = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._lock = threading.RLock()
         self._depth = 0
-        self.con.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-        self._create()
+        try:
+            self.con.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            self._create()
+        except BaseException:
+            self.con.close()  # e.g. an old schema: do not leave the file open
+            raise
         self.events = SqliteEventStore(self)
         self.knowledge = SqliteKnowledgeBase(self)
         self.vectors = SqliteVectorBackend(self)
+
+    def close(self) -> None:
+        """Close the connection; the stores cannot be used afterwards."""
+        self.con.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def _create(self) -> None:
         version = self.con.execute("PRAGMA user_version").fetchone()[0]
@@ -81,17 +96,19 @@ class SqliteDatabase:
                 self.con.execute("ALTER TABLE events ADD COLUMN text_redacted INTEGER NOT NULL DEFAULT 0")
                 self.con.execute("PRAGMA user_version = 3")
             version = 3
-        if has_tables and version == 4:
-            # 4 -> 5: vectors and the embedding cache became float32 BLOBs (contract
-            # 0.3.0). The float64 ones would read back as garbage of twice the length,
-            # so drop them all; the next sync rebuilds the index and embeds again.
+        # Schema 4 means two layouts. On main it is a schema-3 file reindexed with words split at
+        # Hangul boundaries, with no vector tables. On feat/core-embedding before 5 it held float64
+        # vector BLOBs, which would read back as float32 garbage of twice the length; only that
+        # layout has a `vectors` table, so only then are the vector tables emptied and re-embedded.
+        if has_tables and version == 4 and self._has_table("vectors"):
             with self.transaction():
                 for table in ("embed_cache", "vectors", "vector_groups", "vector_meta"):
-                    self.con.execute(f"DELETE FROM {table}")
-                self.con.execute("PRAGMA user_version = 5")
-            version = 5
-        # 3 -> 5 only adds the vector tables (3 has none), which the CREATE IF NOT EXISTS below makes.
-        if has_tables and version not in (3, SCHEMA_VERSION):
+                    if self._has_table(table):
+                        self.con.execute(f"DELETE FROM {table}")
+        # 3, 4 and 5 -> 6: search words split at Hangul boundaries, so the search indexes are
+        # rebuilt below once the tables exist. Files without vector tables gain them there.
+        reindex = has_tables and version in (3, 4, 5)
+        if has_tables and version not in (3, 4, 5, SCHEMA_VERSION):
             raise RuntimeError(f"database schema {version} is not {SCHEMA_VERSION}; start from a new file")
         with self.transaction():
             self.con.execute(
@@ -128,11 +145,14 @@ class SqliteDatabase:
                 "PRIMARY KEY (model, digest))"
             )
             self.con.execute("CREATE TABLE IF NOT EXISTS vector_meta (key TEXT PRIMARY KEY, value TEXT)")
+            self.con.execute("CREATE TABLE IF NOT EXISTS knowledge_meta (key TEXT PRIMARY KEY, value TEXT)")
             # Columns added without a version bump: main's schema-3 files have no
             # engine_cursor.epoch, feat/core-embedding's schema-5 files no
             # vectors.digest. CREATE IF NOT EXISTS keeps an old table as it is.
             self._add_column("engine_cursor", "epoch", "INTEGER NOT NULL DEFAULT 0")
             self._add_column("vectors", "digest", "TEXT")
+            if reindex:
+                self._reindex()
             self.con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _add_column(self, table: str, column: str, definition: str) -> None:
@@ -140,6 +160,25 @@ class SqliteDatabase:
         columns = {row[1] for row in self.con.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             self.con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _has_table(self, name: str) -> bool:
+        return self.con.execute("SELECT count(*) FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0] > 0
+
+    def _reindex(self) -> None:
+        """Rebuild both search indexes from the stored text with the current tokens."""
+        self.con.execute("DELETE FROM events_fts")
+        for seq, text in self.con.execute("SELECT seq, text FROM events").fetchall():
+            self.con.execute(
+                "INSERT INTO events_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (seq, " ".join(words(text)), " ".join(bigrams(text))),
+            )
+        self.con.execute("DELETE FROM knowledge_fts")
+        for rowid, title, body in self.con.execute("SELECT rowid, title, body FROM knowledge").fetchall():
+            text = f"{title} {body}"
+            self.con.execute(
+                "INSERT INTO knowledge_fts (rowid, words, grams) VALUES (?, ?, ?)",
+                (rowid, " ".join(words(text)), " ".join(bigrams(text))),
+            )
 
     def state(self, engine: str) -> "SqliteStateBackend":
         return SqliteStateBackend(self, engine)
@@ -163,7 +202,7 @@ class SqliteDatabase:
             if outer:
                 self.con.execute("COMMIT")
 
-    def query(self, sql: str, params: Any = ()) -> list[tuple]:
+    def query(self, sql: str, params: Any = ()) -> list[tuple[Any, ...]]:
         with self._lock:
             return self.con.execute(sql, params).fetchall()
 
@@ -191,6 +230,9 @@ class SqliteEventStore:
         except sqlite3.IntegrityError:
             raise ValueError(f"duplicate event id: {e.id}") from None
         return e.id
+
+    def count_since(self, seq: int) -> int:
+        return self.db.query("SELECT count(*) FROM events WHERE seq > ?", (seq,))[0][0]
 
     def since(self, seq: int, page: int = 256) -> Iterator[tuple[int, Event]]:
         # Paged: the runtime usually takes only the next event.
@@ -272,6 +314,18 @@ class SqliteKnowledgeBase:
             self.db.con.execute("DELETE FROM knowledge_fts")
             self.db.con.execute("DELETE FROM knowledge")
 
+    def owner(self) -> str | None:
+        rows = self.db.query("SELECT value FROM knowledge_meta WHERE key = 'owner'")
+        return rows[0][0] if rows else None
+
+    def set_owner(self, owner: str) -> None:
+        with self.db.transaction():
+            self.db.con.execute(
+                "INSERT INTO knowledge_meta (key, value) VALUES ('owner', ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (owner,),
+            )
+
     def remove(self, id: str) -> None:
         with self.db.transaction():
             row = self.db.con.execute("SELECT rowid FROM knowledge WHERE id = ?", (id,)).fetchone()
@@ -338,7 +392,7 @@ class SqliteStateBackend:
         expected: int,
         cursor: int,
         writes: Mapping[str, Any],
-        deletes: Set[str],
+        deletes: AbstractSet[str],
         *,
         epoch: int,
     ) -> None:
@@ -372,7 +426,7 @@ class SqliteStateBackend:
         rows = self.db.query("SELECT epoch, cursor, version FROM engine_cursor WHERE engine = ?", (self.engine,))
         return (rows[0][0], rows[0][1], rows[0][2]) if rows else (0, 0, None)
 
-    def reset(self, version: str) -> None:
+    def reset(self, version: str | None) -> None:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM engine_state WHERE engine = ?", (self.engine,))
             self.db.con.execute(
@@ -407,11 +461,11 @@ class SqliteVectorBackend:
     def __init__(self, db: SqliteDatabase) -> None:
         self.db = db
 
-    def meta(self) -> dict | None:
+    def meta(self) -> dict[str, Any] | None:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'meta'")
         return json.loads(rows[0][0]) if rows else None
 
-    def reset(self, meta: dict) -> None:
+    def reset(self, meta: dict[str, Any]) -> None:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM vectors")
             self.db.con.execute("DELETE FROM vector_groups")
@@ -434,7 +488,7 @@ class SqliteVectorBackend:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'indexed'")
         return int(rows[0][0]) if rows else 0
 
-    def position(self) -> tuple[dict | None, int, int]:
+    def position(self) -> tuple[dict[str, Any] | None, int, int]:
         found = dict(self.db.query("SELECT key, value FROM vector_meta WHERE key IN ('meta', 'generation', 'indexed')"))
         meta = found.get("meta")
         return (

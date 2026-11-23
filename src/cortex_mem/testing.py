@@ -14,21 +14,23 @@ Needs pytest; import it from tests only.
 import threading
 import time
 from array import array
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from typing import Any
+from dataclasses import replace
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 
 from .access import owner_for
-from .contract import Caller, Event, Knowledge, Promote
+from .contract import Caller, Event, Kind, Knowledge, Promote, Scope
 from .runtime import Runtime, StateVersionChanged
 from .store.base import CursorConflict
 
-T0 = datetime(2026, 10, 19, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 19, tzinfo=UTC)
 
 
-def ev(id, text="", kind="record", user="u1", team="t1", scope="personal"):
+def ev(id, text="", kind: Kind = "record", user="u1", team="t1", scope: Scope = "personal"):
     return Event(id=id, kind=kind, at=T0, user=user, team=team, session="s1", scope=scope, text=text)
 
 
@@ -36,7 +38,7 @@ def caller(user="u1", team="t1"):
     return Caller(user=user, team=team, session="s2", at=T0)
 
 
-def item(id, body="deploy uses tags", scope="team", owner="t1"):
+def item(id, body="deploy uses tags", scope: Scope = "team", owner="t1"):
     return Knowledge(id=id, kind="knowledge", title=id, body=body, scope=scope, owner=owner, sources=("e1",))
 
 
@@ -91,6 +93,13 @@ class EventStoreContract(_Contract):
         assert positions == sorted(positions) and positions[0] >= 1
         assert [e.id for _, e in store.since(positions[1])] == ["c"]
 
+    def test_count_since_counts_without_reading_the_events(self, store):
+        assert store.count_since(0) == 0
+        for id in ["b", "a", "c"]:
+            store.append(ev(id, "x"))
+        positions = [seq for seq, _ in store.since(0)]
+        assert [store.count_since(p) for p in [0, *positions]] == [3, 2, 1, 0]
+
     def test_search_ranks_better_match_first(self, store):
         store.append(ev("weak", "deploy"))
         store.append(ev("strong", "deploy uses release tags"))
@@ -108,6 +117,11 @@ class EventStoreContract(_Contract):
         store.append(ev("e1", "배포가 실패했다"))
 
         assert [e.id for e, _ in store.search("배포", caller(), "personal")] == ["e1"]
+
+    def test_search_matches_a_latin_word_with_a_korean_particle_attached(self, store):
+        store.append(ev("e1", "pytest가 ResourceWarning으로 실패했다"))
+
+        assert [e.id for e, _ in store.search("pytest resourcewarning", caller(), "personal")] == ["e1"]
 
     def test_search_scores_are_descending(self, store):
         for i, text in enumerate(["deploy", "deploy tags", "deploy release tags"]):
@@ -170,6 +184,15 @@ class KnowledgeStoreContract(_Contract):
         kb.put(item("d", "deploy uses tags"))  # usable again afterwards
         assert [k.id for k, _ in kb.search("deploy tags", Caller("u1", "t1", "s1", T0), "org", 10)] == ["d"]
 
+    def test_knowledge_owner_is_recorded_and_kept_by_clear(self, kb):
+        assert kb.owner() is None
+        kb.set_owner("engine A")
+        kb.put(item("a"))
+        kb.clear()
+        assert kb.owner() == "engine A"
+        kb.set_owner("engine B")
+        assert kb.owner() == "engine B"
+
     def test_knowledge_get_finds_nothing_for_ids_that_are_not_strings(self, kb):
         kb.put(item("1"))
         kb.put(item("k2"))
@@ -198,6 +221,11 @@ class KnowledgeStoreContract(_Contract):
         kb.put(item("rare", "canary notes"))
 
         assert next(i.id for i, _ in kb.search("deploy canary", caller(), "team")) == "rare"
+
+    def test_knowledge_search_matches_a_latin_word_with_a_korean_particle_attached(self, kb):
+        kb.put(item("k1", "pytest가 ResourceWarning으로 실패했다"))
+
+        assert [i.id for i, _ in kb.search("pytest", caller(), "team")] == ["k1"]
 
     def test_knowledge_search_respects_scope(self, kb):
         kb.put(item("mine", scope="personal", owner="u1"))
@@ -258,6 +286,8 @@ class EngineStateBackendContract(_Contract):
         state.reset("2")
 
         assert (state.version(), state.cursor(), list(state.scan())) == ("2", 0, [])
+        state.reset(None)  # an engine with no state_version
+        assert state.version() is None
 
     def test_epoch_starts_at_zero_and_commit_bumps_it(self, state):
         assert state.epoch() == 0
@@ -424,7 +454,7 @@ class VectorBackendContract(_Contract):
         assert got == expected
 
     def test_search_events_respects_kinds_upto_exclude_k_and_drops_nonpositive(self, db, vb):
-        rows = [("a", "record", [1.0, 0.0]), ("b", "recall", [0.8, 0.6]), ("c", "record", [0.0, 1.0]),
+        rows: list[tuple[str, Kind, list[float]]] = [("a", "record", [1.0, 0.0]), ("b", "recall", [0.8, 0.6]), ("c", "record", [0.0, 1.0]),
                 ("d", "record", [-1.0, 0.0]), ("e", "record", [0.8, 0.6]), ("f", "record", [1.0, 0.0])]  # fmt: skip
         for seq, (id, kind, vector) in enumerate(rows, start=1):
             self.index_event(db, ev(id, kind=kind), vector, seq)
@@ -453,7 +483,7 @@ class VectorBackendContract(_Contract):
         assert search(k=-1) == []
 
     def test_search_knowledge_visibility_and_id_ties(self, db, vb):
-        rows = [("k1", "personal", "u1", [1.0, 0.0]), ("k2", "personal", "u2", [1.0, 0.0]),
+        rows: list[tuple[str, Scope, str, list[float]]] = [("k1", "personal", "u1", [1.0, 0.0]), ("k2", "personal", "u2", [1.0, 0.0]),
                 ("k3", "team", "t1", [1.0, 0.0]), ("k4", "team", "t2", [1.0, 0.0]),
                 ("k5", "org", "*", [1.0, 0.0]), ("k6", "org", "*", [0.6, 0.8]),
                 ("k7", "org", "*", [0.0, 1.0])]  # fmt: skip
@@ -736,6 +766,15 @@ class _Counting:
         return []
 
 
+class _OtherIds(_Counting):
+    """A different engine: promotes each event as B-<id>."""
+
+    def observe(self, event, ctx):
+        [promote] = super().observe(event, ctx)
+        assert isinstance(promote, Promote)
+        return [Promote(replace(promote.item, id=f"B-{event.id}"))]
+
+
 class _Blocking(_Counting):
     """_Counting that, the first time it observes `block_on`, sets `entered`
     and waits for `release`: a slow observe a test controls."""
@@ -759,7 +798,7 @@ class _Ticking(_Counting):
     def __init__(self, name):
         super().__init__([])
         self.name = name
-        self.meanwhile = None
+        self.meanwhile: Callable[[], object] | None = None
 
     def tick(self, now, ctx):
         meanwhile, self.meanwhile = self.meanwhile, None
@@ -942,6 +981,35 @@ class DatabaseContract:
         assert [k for k, _ in again.state.scan()] == ["v0/e1"]
         assert [k.id for k in again.knowledge.all()] == ["k-e1"]
 
+    @pytest.mark.parametrize("a_version", ["1", None], ids=["versioned", "unversioned"])
+    @pytest.mark.parametrize("b_version", ["1", None], ids=["b-versioned", "b-unversioned"])
+    def test_switching_engines_and_back_leaves_only_the_running_engines_knowledge(
+        self, open_db, a_version, b_version
+    ):
+        """The knowledge base is shared by the store. A -> B -> A must not leave A believing in items
+        B's reset removed, nor leave B's items with no engine to demote them, whether or not the
+        engines declare a state_version (the server default, promote_all with no index, does not)."""
+        self.runtime(open_db, _Counting([], state_version=a_version), name="A").append(ev("e1"))
+        self.runtime(open_db, _OtherIds([], state_version=b_version), name="B").sync()
+        assert [k.id for k in open_db().knowledge.all()] == ["B-e1"]
+
+        seen: list[str] = []
+        self.runtime(open_db, _Counting(seen, state_version=a_version), name="A").append(ev("e2"))
+
+        assert seen == ["e1", "e2"]  # A starts over on the emptied knowledge base
+        assert [k.id for k in open_db().knowledge.all()] == ["k-e1", "k-e2"]
+
+    def test_knowledge_owner_survives_reopening_and_rolls_back(self, open_db):
+        db = open_db()
+        db.knowledge.set_owner("engine A")
+        assert open_db().knowledge.owner() == "engine A"
+        if not self.rolls_back:
+            return
+        with pytest.raises(RuntimeError), db.transaction():
+            db.knowledge.set_owner("engine B")
+            raise RuntimeError("roll back")
+        assert open_db().knowledge.owner() == "engine A"
+
     def test_changed_state_version_drops_state_and_redelivers(self, open_db):
         rt = self.runtime(open_db, _Counting([], state_version="1"))
         rt.append(ev("e1", "x"))
@@ -986,10 +1054,11 @@ class DatabaseContract:
     def test_duplicate_ticks_apply_once(self, open_db):
         """Two processes tick from the same cursor and epoch; both engines decide,
         only the first commit lands (the epoch moved), the other is dropped."""
-        a = self.runtime(open_db, _Ticking("a"))
+        ticking_a = _Ticking("a")
+        a = self.runtime(open_db, ticking_a)
         b = self.runtime(open_db, _Ticking("b"))
         a.append(ev("e1", "one"))
-        a.engine.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
+        ticking_a.meanwhile = lambda: b.tick(T0)  # b ticks while a's tick is deciding
         before = len(a.verdicts)  # e1's delivery
 
         a.tick(T0)
@@ -1039,7 +1108,8 @@ class DatabaseContract:
         worker = pool.submit(old.sync)
         try:
             assert entered.wait(10), "observe never started"
-            new = self.runtime(open_db, _Counting([], state_version="2", fail=True))
+            failing = _Counting([], state_version="2", fail=True)
+            new = self.runtime(open_db, failing)
             with pytest.raises(RuntimeError, match="boom"):
                 new.sync()  # resets the state to "2", then its observe fails
         finally:
@@ -1054,7 +1124,7 @@ class DatabaseContract:
             return state.version(), keys
 
         assert consistent() == ("1", ["1/e1"])  # A re-checked its version and delivered on its own
-        new.engine.fail = False
+        failing.fail = False
         assert new.sync() == 1  # B resets again and replays
         assert consistent() == ("2", ["2/e1"])
 
@@ -1088,7 +1158,7 @@ class DatabaseContract:
         assert rt.sync() == 1
 
         assert [k.id for k in open_db().knowledge.all()] == ["k-attempt2"]
-        assert [v.decision.item.id for v in rt.verdicts] == ["k-attempt2"]
+        assert [cast(Promote, v.decision).item.id for v in rt.verdicts] == ["k-attempt2"]
 
     def test_two_engine_versions_resetting_each_other_end_in_state_version_changed(self, open_db):
         """Another version of the engine resets the state each time this one

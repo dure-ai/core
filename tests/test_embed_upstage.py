@@ -238,14 +238,26 @@ def test_a_bad_key_that_reaches_the_request_becomes_an_embedding_error(key, offl
 # A 4xx for one text is that text's fault only when the model works (contract §5).
 
 
-def test_a_400_for_one_text_after_a_success_rejects_that_text(fake):
+def test_a_400_for_one_text_after_a_success_is_still_checked_with_a_probe(fake):
     emb = make(fake)
     emb.embed(["ok"], "passage")
-    fake.status = 400
+    fake.status = lambda req: 400 if req["input"] == ["far too long"] else 200
     with pytest.raises(EmbeddingRejected) as info:
         emb.embed(["far too long"], "passage")
     assert KEY not in str(info.value)
-    assert len(fake.requests) == 2  # no probe: this model already answered
+    assert [r["json"]["input"] for r in fake.requests] == [["ok"], ["far too long"], [UpstageEmbedder.PROBE]]
+
+
+def test_every_text_refused_after_a_success_is_an_outage(fake):
+    """A model that answered once can be retired, or the request format change: then every text gets
+    a 400, and each must stay waiting rather than be indexed for good without a vector."""
+    emb = make(fake)
+    emb.embed(["ok"], "passage")
+    fake.status = 400
+    for text in ("a", "b"):
+        with pytest.raises(EmbeddingError) as info:
+            emb.embed([text], "passage")
+        assert not isinstance(info.value, EmbeddingRejected)
 
 
 def test_a_400_for_one_text_is_checked_with_a_probe_first(fake):

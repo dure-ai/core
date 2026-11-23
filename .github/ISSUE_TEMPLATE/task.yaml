@@ -1,0 +1,50 @@
+name: Task
+description: Planned work, a follow-up from a review, or a question for the team
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What needs to be done and why. For a follow-up, link the PR or issue it came from.
+    validations:
+      required: true
+
+  - type: input
+    id: scope
+    attributes:
+      label: Scope
+      description: The files, modules or contract sections this touches.
+      placeholder: e.g. src/cortex_mem/runtime.py, docs/contract.md §3-2
+    validations:
+      required: false
+
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      options:
+        - S
+        - M
+        - L
+        - Not sized yet
+    validations:
+      required: false
+
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: The conditions that make this complete.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: Decisions that still need to be made.
+    validations:
+      required: false

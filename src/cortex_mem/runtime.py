@@ -7,12 +7,13 @@ a harness score describes what the server does.
 """
 
 import json
+import logging
 import sys
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from .access import audience_sees, event_visible, knowledge_visible
 from .contract import (
@@ -30,6 +31,8 @@ from .contract import (
 from .embed import EmbeddingError
 from .index import Index, IndexConfigChanged
 from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
+
+log = logging.getLogger(__name__)
 
 _ABSENT = object()
 MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
@@ -198,6 +201,9 @@ class Runtime:
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
         self._pending_knowledge: set[str] = set()  # ids whose vectors failed to follow the knowledge base
         self._knowledge_reconciled = False  # every knowledge item compared once by this Runtime
+        # The owner this Runtime found recorded on the knowledge base. Engines are switched by
+        # restarting the server, so a Runtime reads the owner once per version, not on every sync.
+        self._owner_seen: str | None = None
 
     @property
     def rejections(self) -> list[Verdict]:
@@ -299,8 +305,9 @@ class Runtime:
             self._sync_knowledge(touched)
 
     def pending(self) -> int:
-        """How many events wait after the engine's cursor (read now, no lock)."""
-        return sum(1 for _ in self.events.since(self.state.cursor()))
+        """How many events wait after the engine's cursor (read now, no lock),
+        counted by the store without reading them."""
+        return self.events.count_since(self.state.cursor())
 
     def waiting(self) -> list[str]:
         """Ids of the events that wait after the engine's cursor, in order
@@ -345,14 +352,16 @@ class Runtime:
         try:
             with self.transaction():
                 moved = self._moved(epoch, cursor, generation, seq)
-                if moved is None:
-                    touched, verdicts = self._commit(decisions, staged, cursor, epoch, seq, event.at)
+                committed = None if moved is not None else self._commit(
+                    decisions, staged, cursor, epoch, seq, event.at
+                )
         except CursorConflict:
             return 0, []  # another process delivered, skipped or reset first; read again
         if moved == "version":
             raise _VersionMoved(seq)
-        if moved is not None:
+        if committed is None:  # moved: nothing was committed
             return 0, []
+        touched, verdicts = committed
         self.verdicts.extend(verdicts)
         self._failures.pop(seq, None)
         return 1, touched
@@ -438,7 +447,8 @@ class Runtime:
         """The version this engine's state must have been written with. With
         an index it is the JSON of [state_version or None, index fingerprint]:
         the state records which index generation it was built on. Without
-        one it is the engine's state_version, and None means nothing to check."""
+        one it is the engine's state_version (None for an engine without one,
+        whose knowledge base owner is checked all the same)."""
         return self._want(None)
 
     def _want(self, generation: int | None) -> str | None:
@@ -462,18 +472,56 @@ class Runtime:
         store. The same transaction empties the knowledge base: the replay
         promotes again what the engine still holds true, and an item it no
         longer promotes would otherwise stay with no engine state left to
-        demote it. Knowledge vectors follow on this sync."""
+        demote it. Knowledge vectors follow on this sync.
+
+        The knowledge base is shared by the store, so it records its owner
+        (_owner: the engine's class and version). When another engine, or
+        this one under another version, emptied it for itself, this engine
+        starts over too, even if its own state still has the right version."""
         if self.index is not None and self.index.ensure_current(self.knowledge):
             self._knowledge_reconciled = False  # compare every item again on this sync
         want = self._want_version()
-        if want is None or self.state.version() == want:
+        owner = self._owner(want)
+        if self.state.version() == want and (self._owner_seen == owner or self.knowledge.owner() == owner):
+            self._owner_seen = owner
             return  # the common case takes no lock
+        reason = None
         with self.transaction():
             want = self._want_version()
-            if want is not None and self.state.version() != want:
+            owner = self._owner(want)
+            recorded = self.knowledge.owner()
+            epoch, cursor, stored = self.state.position()
+            has_state = cursor > 0 or epoch > 0 or next(self.state.scan(), None) is not None
+            # A recorded owner of None is a new store or one written before owners were recorded.
+            # It is marked as this engine's, unless it holds items while this engine has no state:
+            # an engine with no state did not fill it, so another engine did.
+            if recorded is None:
+                foreign = not has_state and bool(self.knowledge.all())
+            else:
+                foreign = recorded != owner
+            if stored != want or foreign:
+                if foreign or recorded is not None or has_state:  # a first start discards nothing
+                    reason = _reset_reason(stored, want, recorded, owner, foreign)
                 self.state.reset(want)
                 self.knowledge.clear()
                 self._knowledge_reconciled = False  # drop the vectors of what was removed
+            self.knowledge.set_owner(owner)
+        if reason is not None:  # logged once the reset has committed
+            log.warning(
+                "%s starts over from the first event and empties the knowledge base: %s",
+                type(self.engine).__qualname__,
+                reason,
+            )
+        self._owner_seen = None  # read it again once the transaction has committed
+
+    def _owner(self, want: str | None) -> str:
+        """The knowledge base's owner for this engine with its state under
+        `want`: the engine's class and that version (None for an engine with
+        no state_version and no index, which is checked all the same). Another engine, or this
+        one under another version, emptied the knowledge base for itself, so
+        this engine's state no longer matches it."""
+        cls = type(self.engine)
+        return json.dumps([f"{cls.__module__}:{cls.__qualname__}", want], separators=(",", ":"))
 
     def tick(self, now: datetime) -> None:
         """Deliver what is pending, then let time pass: engine.tick runs with
@@ -502,27 +550,63 @@ class Runtime:
         self.verdicts.extend(verdicts)
         self._sync_knowledge(touched)
 
-    def handoff(self, query: str, caller: Caller, scope: Scope, k: int = 6) -> list[Handoff]:
-        self.sync()
+    def handoff(
+        self, query: str, caller: Caller, scope: Scope, k: int = 6, *, embedding_down: bool = False
+    ) -> list[Handoff]:
+        """Deliver what waits, then ask the engine. During an embedding outage
+        reads still answer, from what was delivered (see _handoff)."""
+        return self._handoff(query, caller, scope, k, embedding_down)[0]
+
+    def _handoff(
+        self, query: str, caller: Caller, scope: Scope, k: int, embedding_down: bool = False
+    ) -> tuple[list[Handoff], bool]:
+        """handoff, and whether embedding was down. Events that cannot be indexed
+        stay waiting for a later sync. When embedding is down, or the engine's
+        similarity search cannot embed the query, the engine answers with
+        `ctx.similar` None, as when no index is configured (text search only).
+        `embedding_down`: the caller has just seen an EmbeddingError (a tick in
+        the same tool call), so nothing is tried again before answering."""
+        down = embedding_down
+        try:
+            if not down:
+                self.sync()
+        except EmbeddingError:
+            down = True
         staged = self._staged(read_only=True)
-        handoffs = self.engine.handoff(query, caller, scope, self._ctx(staged, self.state.cursor()), k)
-        return [h for h in handoffs if self._may_see(h, caller, scope)][:k]
+        ctx = self._ctx(staged, self.state.cursor())
+        if down:
+            ctx = replace(ctx, similar=None)  # do not wait on another failing request
+        try:
+            handoffs = self.engine.handoff(query, caller, scope, ctx, k)
+        except EmbeddingError:
+            if ctx.similar is None:
+                raise
+            down = True
+            handoffs = self.engine.handoff(query, caller, scope, replace(ctx, similar=None), k)
+        return [h for h in handoffs if self._may_see(h, caller, scope)][:k], down
 
     def recall(
-        self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6
+        self, query: str, caller: Caller, scope: Scope, event_id: str, k: int = 6, *, embedding_down: bool = False
     ) -> list[Handoff]:
         """handoff, then record what was handed off as a recall event (refs = ids,
         repo and conditions = the caller's repo and context). The recall event
         is personal whatever scope was searched: a query says what someone is
-        working on, and is not shared by searching widely."""
-        handoffs = self.handoff(query, caller, scope, k)
-        self.append(
-            Event(
-                id=event_id, kind="recall", at=caller.at, user=caller.user, team=caller.team,
-                session=caller.session, scope="personal", text=query, agent=caller.agent,
-                refs=tuple(h.id for h in handoffs), repo=caller.repo, conditions=caller.context,
-            )
+        working on, and is not shared by searching widely. An embedding outage
+        does not fail it: the answer comes from what was delivered, and the
+        recall event is stored and waits like any other."""
+        handoffs, down = self._handoff(query, caller, scope, k, embedding_down)
+        event = Event(
+            id=event_id, kind="recall", at=caller.at, user=caller.user, team=caller.team,
+            session=caller.session, scope="personal", text=query, agent=caller.agent,
+            refs=tuple(h.id for h in handoffs), repo=caller.repo, conditions=caller.context,
         )
+        if down:
+            self.events.append(event)  # delivering now would wait on the outage again
+            return handoffs
+        try:
+            self.append(event)
+        except EmbeddingError:
+            pass  # stored; it waits for a later sync
         return handoffs
 
     def _commit(
@@ -564,7 +648,7 @@ class Runtime:
     def _current(self, id: str, pending: dict[str, Knowledge | None]) -> Knowledge | None:
         found = pending.get(id, _ABSENT)
         if found is not _ABSENT:
-            return found  # type: ignore[return-value]
+            return cast("Knowledge | None", found)
         items = self.knowledge.get([id])
         return items[0] if items else None
 
@@ -603,3 +687,14 @@ class Runtime:
             return False
         items = self.knowledge.get([handoff.id])
         return not items or knowledge_visible(items[0], caller, scope)
+
+
+def _reset_reason(stored: str | None, want: str | None, recorded: str | None, owner: str, foreign: bool) -> str:
+    """What differed when an engine starts over, for the log: its state's version, or the owner of
+    the shared knowledge base. A version with an index holds its fingerprint (model, threshold,
+    store, generation), so two processes with different index settings show here."""
+    if recorded is None and foreign:
+        return "the knowledge base has no recorded owner but holds items, and this engine has no state"
+    if stored != want:
+        return f"its state was written under version {stored!r}, and it now runs under {want!r}"
+    return f"the knowledge base belongs to {recorded!r}, not {owner!r}"
