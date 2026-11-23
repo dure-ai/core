@@ -73,6 +73,15 @@ def test_main_writes_json_file(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == written
 
 
+def test_main_without_out_prints_and_writes_no_file(monkeypatch, capsys):
+    written = []
+    monkeypatch.setattr(Path, "write_text", lambda self, *a, **kw: written.append(self))
+    code = bench.main(["--store", "sqlite", "--label", "t", "--events", "3", "--hold", "0.1"])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["events"] == 3
+    assert written == []  # a default run leaves nothing in the checkout
+
+
 def test_bad_store_exits_2_with_message():
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--store", "mysql", "--label", "t"], capture_output=True, text=True, check=False

@@ -41,7 +41,6 @@ from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 
 ENV = "CORTEX_BENCH_PG_URL"
-DEFAULT_OUT_DIR = ROOT / "docs" / "plans" / "agy" / "out"
 REPS = 5
 SLOW_ID = "slow"
 START_WAIT_S = 0.3
@@ -339,12 +338,11 @@ def run_bench(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the benchmark, print the JSON result and write it to --out
-    (default: bench-<label>-<store>.json under DEFAULT_OUT_DIR). Returns
-    the exit code."""
+    """Run the benchmark, print the JSON result, and write it to --out when
+    given. Returns the exit code."""
     parser = argparse.ArgumentParser(description="Measure write transactions per event and append latency.")
     parser.add_argument("--store", required=True, choices=["sqlite", "pg"])
-    parser.add_argument("--label", required=True, help="names the run; part of the default output file name")
+    parser.add_argument("--label", required=True, help="names the run in the result")
     parser.add_argument("--events", type=int, default=200)
     parser.add_argument("--hold", type=float, default=3.0, help="seconds the slow engine holds (default 3.0)")
     parser.add_argument("--out", type=Path, default=None)
@@ -357,9 +355,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.store == "pg" and pg_url is None:
         parser.error(f"--store pg needs {ENV} (a PostgreSQL URL)")
     result = run_bench(args.store, args.label, args.events, args.hold, pg_url=pg_url)
-    out = args.out or DEFAULT_OUT_DIR / f"bench-{args.label}-{args.store}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2) + "\n")
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     return 0
 
