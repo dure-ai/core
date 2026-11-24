@@ -367,6 +367,7 @@ class VectorBackend(Protocol):                                # 색인 상태·�
   - **기존 연구 채점이 시작되기 전까지 필요하다.**
 - **HTTP 전송과 인증**: 토큰 → (user, team). 서버 PR 이후.
 - **팀 간(org) 승격**: 여러 팀의 지식을 org로 올리는 경로. v0.1은 org 이벤트만 org 지식의 근거가 된다.
+- **`ctx.events`를 받은 위치까지만 읽기**(#19): `ctx.similar`처럼 `EventReader.search`에도 위치 상한을 둔다. 지금은 엔진이 아직 받지 않은 뒤의 이벤트까지 검색 결과와 BM25 통계에 들어와, 글자 비교로 주장을 찾는 엔진(LedgerEngine)은 처음부터 다시 만들 때 드물게 결과가 달라질 수 있다(§3-7).
 - **결정 기록의 영속화와 엔진에 알리기**: v0.1은 `Runtime.verdicts`와 `Runtime.skipped`(메모리)에만 남는다. 위키 커밋 메시지에 같은 내용을 남기는 것은 위키 반영기와 함께.
 - **personal 기록 롤업**: §3-4의 집계 이벤트 방식.
 - **사람 승인·커밋 입력 경로**: 관리 CLI, Git·CI 훅으로 `human_confirm`·`commit` 이벤트를 넣는 관례.
@@ -409,7 +410,7 @@ class VectorBackend(Protocol):                                # 색인 상태·�
 - [ ] 전역 잠금(DB 하나에 잠금 하나)을 유지할지는 지연을 잰 뒤 정한다. 근사 색인 기본값도 측정 뒤 정한다.
 
 **모두**
-- [ ] 독립 출처의 기본 단위를 `user`로 볼지, `(user, session)`으로 볼지. 계약은 둘 다 담을 수 있고, 판정은 엔진 몫이다.
+- [ ] 독립 출처의 기본 단위를 `user`로 볼지, `(user, session)`으로 볼지. 계약은 둘 다 담을 수 있고, 판정은 엔진 몫이다. 참고: LedgerEngine은 team 범위에서 `user`, personal 범위에서 `session`을 한 표로 센다(README).
 
 ## 8. 기존 연구를 엔진으로 감싸기 (예시)
 
