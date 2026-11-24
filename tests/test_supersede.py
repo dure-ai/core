@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from cortex_mem.contract import Caller, Event
+from cortex_mem.embed import EmbeddingRejected
 from cortex_mem.engines.evidence import EvidenceEngine
 from cortex_mem.engines.supersede import SupersedeEngine
+from cortex_mem.index import Index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.memory import InMemoryDatabase
 
@@ -19,9 +21,10 @@ def ev(id, text="", kind="record", user="u1", signal="self", outcome="unknown", 
     )
 
 
-def runtime(engine=SupersedeEngine):
+def runtime(engine=SupersedeEngine, embedder=None):
     db = InMemoryDatabase()
-    return Runtime(engine(), db.events, db.knowledge, db.state("supersede"), db.transaction)
+    index = Index(db.vectors, embedder, 0.8) if embedder is not None else None
+    return Runtime(engine(), db.events, db.knowledge, db.state("supersede"), db.transaction, index=index)
 
 
 def ask(rt, query, **context):
@@ -31,6 +34,41 @@ def ask(rt, query, **context):
 
 OLD = "run the backend tests with python -m pytest tests/test_gcloud.py from the repo root"
 NEW = "run the backend tests with tox -e py3-django -- tests/test_gcloud.py from the repo root"
+
+
+class TopicEmbedder:
+    dim = 2
+    model = "test-topics"
+
+    def embed(self, texts, kind):
+        if any("unindexed" in text for text in texts):
+            raise EmbeddingRejected("unindexed text")
+        return [[1.0, 0.0] if "backend" in text else [0.0, 1.0] for text in texts]
+
+
+def test_embedding_groups_replace_old_backend_command_but_keep_frontend_command():
+    rt = runtime(embedder=TopicEmbedder())
+    rt.append(ev("old", OLD, signal="test"))
+    rt.append(ev("front", "run the frontend tests with npm test from the repo root", signal="test", minutes=1))
+    rt.append(ev("new", NEW, signal="test", minutes=2))
+
+    assert set(ask(rt, "how to run backend and frontend tests")) == {"k-new", "k-front"}
+
+
+def test_records_without_embedding_groups_do_not_hide_each_other():
+    rt = runtime(embedder=TopicEmbedder())
+    rt.append(ev("old", OLD + " unindexed", signal="test"))
+    rt.append(ev("new", NEW + " unindexed", signal="test", minutes=1))
+
+    assert set(ask(rt, "how to run the backend tests")) == {"k-old", "k-new"}
+
+
+def test_embedding_groups_do_not_allow_a_personal_record_to_hide_a_team_record():
+    rt = runtime(embedder=TopicEmbedder())
+    rt.append(ev("team", OLD, signal="test"))
+    rt.append(ev("personal", NEW, user="u9", scope="personal", signal="test", minutes=1))
+
+    assert set(ask(rt, "how to run the backend tests")) == {"k-team", "k-personal"}
 
 
 def test_a_correction_in_the_contract_shape_replaces_the_old_records():
@@ -187,3 +225,11 @@ def test_known_limit_a_short_checked_note_does_not_hide_the_answer():
     rt.append(ev("flaky", "the tests are flaky on CI", signal="test", minutes=5))
 
     assert "k-howto" in ask(rt, "how to run the backend tests")
+
+
+def test_words_do_not_allow_a_personal_record_to_hide_a_team_record():
+    rt = runtime()
+    rt.append(ev("team", OLD, signal="test"))
+    rt.append(ev("personal", NEW, user="u9", scope="personal", signal="test", minutes=1))
+
+    assert set(ask(rt, "how to run the backend tests")) == {"k-team", "k-personal"}
