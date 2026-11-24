@@ -832,6 +832,32 @@ def test_a_runtime_with_no_embedder_commits_nothing_once_the_store_has_an_index(
     assert db.knowledge.all() == [] and db.vectors.generation() == 1
 
 
+@pytest.mark.parametrize("threshold, reported", [(0.8, True), (0.9, False)], ids=["other settings", "same settings"])
+@pytest.mark.parametrize("store", STORES)
+def test_a_tick_over_an_index_rebuilt_meanwhile_reports_other_settings(store, threshold, reported, tmp_path, request):
+    """The index is rebuilt while an indexed Runtime ticks: the result is
+    dropped either way, and settings other than its own are reported by that
+    call, not left for the next sync."""
+    reopen = reopener(store, tmp_path, request)
+    db = reopen()
+
+    def rebuilt():
+        other = reopen()
+        other.vectors.reset({"model": "someone-else", "group_threshold": 0.1, "store": other.vectors.kind})
+        rebuild(other, threshold=threshold)
+
+    engine = Meanwhile(None, on_tick=[Promote(item("k2", ("e0",), body="tick item"))])
+    rt = runtime(engine, db)
+    rt.append(ev("e0"))
+    engine.during = rebuilt
+    if reported:
+        with pytest.raises(IndexMismatch):
+            rt.tick(T0)
+    else:
+        rt.tick(T0)
+    assert db.knowledge.all() == [] and rt.state.cursor() == 1
+
+
 def test_a_runtime_takes_an_index_or_the_vector_backend_not_both():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9)

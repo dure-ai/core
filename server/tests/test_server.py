@@ -841,6 +841,20 @@ def test_a_server_with_other_index_settings_stores_records_and_refuses_recall(mo
     assert first.pending() == 0 and first.db.vectors.generation() == 1
 
 
+def test_a_rebuild_between_catching_up_and_recalling_is_logged(monkeypatch, tmp_path, caplog):
+    svc = _indexed_store(monkeypatch, tmp_path)
+    tick = svc.runtime.tick
+
+    def tick_then_rebuilt(now):
+        tick(now)
+        srv.rebuild_index(svc.db, srv.HashEmbedder(), 0.8)
+
+    monkeypatch.setattr(svc.runtime, "tick", tick_then_rebuilt)
+    with caplog.at_level("ERROR", logger="cortex_mem_server"), pytest.raises(srv.IndexMismatch):
+        svc.recall("deploy")
+    assert caplog.text.count("cortex-mem-server --rebuild-index") == 1
+
+
 def test_the_recall_tool_tells_the_agent_about_an_index_mismatch(monkeypatch, tmp_path):
     _indexed_store(monkeypatch, tmp_path)
     _service_from_env(monkeypatch, tmp_path)

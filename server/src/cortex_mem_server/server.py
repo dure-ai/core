@@ -302,7 +302,11 @@ class Service:
         context: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         caller, down = self._caught_up(repo, context)
-        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
+        try:
+            handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
+        except IndexMismatch as exc:
+            self._index_mismatch(exc)  # the index was rebuilt since this call caught up
+            raise
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
             for h in handoffs

@@ -580,7 +580,8 @@ class Runtime:
         (the cursor stays). If the epoch, the cursor, the index generation or
         the engine's version moved meanwhile (another process delivered,
         ticked or reset, or the index was rebuilt), the result is dropped; the
-        next tick runs again. A tick that decides nothing and writes no state
+        next tick runs again. When the index was rebuilt with other settings
+        than this Runtime's, IndexMismatch is raised as well. A tick that decides nothing and writes no state
         commits nothing: it takes no write lock and leaves the epoch alone,
         so it never refuses another process's observe."""
         self.sync()
@@ -593,6 +594,8 @@ class Runtime:
         try:
             with self.transaction():
                 if self._moved(epoch, cursor, generation, cursor) is not None:
+                    # Dropped either way; a rebuild with other settings is reported, as sync does.
+                    self.check_index()
                     return
                 touched, verdicts = self._commit(decisions, staged, cursor, epoch, cursor, now)
         except CursorConflict:
