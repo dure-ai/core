@@ -56,6 +56,55 @@ class IndexConfigChanged(Exception):
     it. The caller runs ensure_current and tries again."""
 
 
+class IndexMismatch(Exception):
+    """The store's index settings are not this process's. `stored` is what
+    the store holds (None: its index was dropped on purpose, embedding is
+    off there) and `current` what this process is configured for (None: no
+    embedder). Nothing was rebuilt or replayed: a store has one index
+    configuration, and only an explicit rebuild (Index.rebuild, drop_index)
+    changes it."""
+
+    def __init__(self, stored: dict[str, Any] | None, current: dict[str, Any] | None) -> None:
+        self.stored = stored
+        self.current = current
+        super().__init__(
+            f"the store's index settings are {describe_settings(stored)}, and this process is configured for "
+            f"{describe_settings(current)}. Nothing was rebuilt: only an explicit rebuild changes a store's "
+            "index settings"
+        )
+
+
+def describe_settings(meta: dict[str, Any] | None) -> str:
+    """Index settings (VectorBackend.meta(), Index.want()) on one line, for a person."""
+    if meta is None:
+        return "no index (embedding off)"
+    return ", ".join(f"{key}={meta[key]!r}" for key in sorted(meta))
+
+
+def check_unindexed(backend: VectorBackend) -> None:
+    """For a process with no embedder: raise IndexMismatch when the store
+    holds an index. Delivering without it would build engine state that the
+    indexed processes cannot use."""
+    meta = backend.meta()
+    if meta is not None:
+        raise IndexMismatch(meta, None)
+
+
+def drop_index(
+    backend: VectorBackend, transaction: Callable[[], AbstractContextManager[object]] = nullcontext
+) -> bool:
+    """Turn embedding off for the store, on purpose: drop the vectors and
+    groups and record that the store holds no index (the embedding cache
+    stays). True when this call dropped it; False when there was none. A
+    process with an embedder then gets IndexMismatch until the index is
+    rebuilt (Index.rebuild)."""
+    with transaction():
+        if backend.meta() is None:
+            return False
+        backend.reset(None)
+    return True
+
+
 def _embedded(event: Event) -> bool:
     """Only records with words of their own are embedded (spec §4)."""
     return event.kind == "record" and not event.text_redacted and event.text != ""
@@ -135,23 +184,53 @@ class Index:
         _, generation, indexed = self._backend.position()
         return generation, indexed
 
+    def check(self) -> None:
+        """Raise IndexMismatch when ensure_current would: reads only."""
+        self._to_build(first_only=True)
+
     def ensure_current(self, knowledge: KnowledgeReader) -> bool:
-        """Rebuild the index when it is stale: drop vectors, groups and the
-        position, add 1 to the generation, and store every knowledge item's
-        vector again. True when this call rebuilt it; False when it was current
-        (or another process rebuilt it first). Every passage is embedded
-        before the one short write transaction (the cache makes that free for
-        the same model), so an EmbeddingError changes nothing but the cache
-        and the index stays stale."""
-        if not self.stale():
+        """Build the index when the store never had one: True when this call
+        built it, False when the stored index is this config's already.
+        Raises IndexMismatch, changing nothing, when the store holds an index
+        built for another config, or its index was dropped on purpose
+        (drop_index): only rebuild() replaces a store's index. Embeds like
+        rebuild()."""
+        return self._build(knowledge, first_only=True)
+
+    def rebuild(self, knowledge: KnowledgeReader) -> bool:
+        """The explicit rebuild: make the store's index this config's, whatever
+        it holds. Drop vectors, groups and the position, add 1 to the
+        generation, and store every knowledge item's vector again. True when
+        this call rebuilt it; False when it was this config's already (or
+        another process made it so first). Every passage is embedded before
+        the one short write transaction (the cache makes that free for the
+        same model), so an EmbeddingError changes nothing but the cache and
+        the index stays as it was. Events are indexed again by the next
+        advance()."""
+        return self._build(knowledge, first_only=False)
+
+    def _build(self, knowledge: KnowledgeReader, first_only: bool) -> bool:
+        if not self._to_build(first_only):
             return False
         items = list(knowledge.all())
         vectors = self._knowledge_vectors(items)
         with self._transaction():
-            if not self.stale():
-                return False  # another process rebuilt it meanwhile
+            if not self._to_build(first_only):
+                return False  # another process built it for this config meanwhile
             self._backend.reset(self.want())
             self._put_knowledge(knowledge, vectors)
+        return True
+
+    def _to_build(self, first_only: bool) -> bool:
+        """Whether the stored index is to be replaced by this config's. With
+        first_only, only a store that never had an index is built (generation
+        0); any other index than ours raises IndexMismatch."""
+        meta, generation, _ = self._backend.position()  # one read: one moment
+        want = self.want()
+        if meta == want:
+            return False
+        if first_only and generation > 0:
+            raise IndexMismatch(meta, want)
         return True
 
     def advance(self, events: EventStore, upto: int) -> None:

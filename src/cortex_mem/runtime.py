@@ -29,13 +29,19 @@ from .contract import (
     Scope,
 )
 from .embed import EmbeddingError
-from .index import Index, IndexConfigChanged
-from .store.base import CursorConflict, EngineStateBackend, EventStore, KnowledgeStore
+from .index import Index, IndexConfigChanged, check_unindexed
+from .store.base import (
+    CursorConflict,
+    EngineStateBackend,
+    EventStore,
+    KnowledgeStore,
+    VectorBackend,
+)
 
 log = logging.getLogger(__name__)
 
 _ABSENT = object()
-MAX_CONFIG_RETRIES = 3  # per event: another config rebuilt the index; rebuild ours and try again
+MAX_CONFIG_RETRIES = 3  # per event: the index was rebuilt, or the engine reset; check and try again
 MAX_STATE_VALUE_BYTES = 64 * 1024  # per key, JSON-encoded
 
 
@@ -167,11 +173,23 @@ class Runtime:
     result lands. A slow engine or embedder never holds a durable store's
     write lock.
 
-    The restart for a moved index or engine version is bounded: after
-    MAX_CONFIG_RETRIES (3) restarts of one event, sync raises
-    IndexConfigChanged or StateVersionChanged. Processes with another index
-    config, or another engine state_version, on one store are not supported;
-    they fail loudly instead of mixing.
+    A store has one index configuration. The Runtime builds the index only
+    on a store that never had one. When the store's index was built with
+    other settings than this Runtime's (another model, threshold or store,
+    or dropped on purpose), sync raises IndexMismatch with both settings and
+    changes nothing: no rebuild, no reset, no replay. The index is replaced
+    only by an explicit rebuild (Index.rebuild, drop_index), after which the
+    processes with the new settings replay once and the others get
+    IndexMismatch. `vectors` gives a Runtime with no index the same check:
+    it is the store's vector backend, and sync raises IndexMismatch while
+    the store holds an index (without `vectors`, a Runtime with no index
+    cannot see one and resets the engine, as for a state_version change).
+
+    The restart for a rebuilt index or a moved engine version is bounded:
+    after MAX_CONFIG_RETRIES (3) restarts of one event, sync raises
+    IndexConfigChanged or StateVersionChanged. Processes with another engine
+    state_version on one store are not supported; they fail loudly instead
+    of mixing.
 
     `sync()` returns how many events it delivered; `pending()` returns how
     many still wait after the engine's cursor.
@@ -186,9 +204,12 @@ class Runtime:
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
         max_failures: int | None = None,
         index: Index | None = None,
+        vectors: VectorBackend | None = None,
     ) -> None:
         if max_failures is not None and max_failures < 1:
             raise ValueError("max_failures must be at least 1, or None to never skip")
+        if index is not None and vectors is not None:
+            raise ValueError("vectors is for a Runtime with no index; the index has its own backend")
         self.engine = engine
         self.events = events
         self.knowledge = knowledge
@@ -196,6 +217,7 @@ class Runtime:
         self.transaction = transaction
         self.max_failures = max_failures
         self.index = index
+        self.vectors = vectors
         self.verdicts: list[Verdict] = []
         self.skipped: list[Skipped] = []
         self._failures: dict[int, int] = {}  # seq -> failed observe attempts in this process
@@ -243,13 +265,15 @@ class Runtime:
         event stays undelivered and is never skipped for it.
 
         If another process rebuilds the index, or resets this engine under
-        another state version, the versions are checked again (rebuilding the
-        index for this config and dropping the engine's state when it was
-        built on another) and the event starts over. An IndexConfigChanged
-        raised inside observe takes the same path. After MAX_CONFIG_RETRIES
-        such restarts of one event, IndexConfigChanged (index) or
-        StateVersionChanged (engine version) is raised; neither is counted
-        toward max_failures."""
+        another state version, the versions are checked again (dropping the
+        engine's state when it was built on another index generation) and
+        the event starts over. An IndexConfigChanged raised inside observe
+        takes the same path. After MAX_CONFIG_RETRIES such restarts of one
+        event, IndexConfigChanged (index) or StateVersionChanged (engine
+        version) is raised; neither is counted toward max_failures.
+
+        Raises IndexMismatch, before anything is delivered or changed, when
+        the store's index settings are not this Runtime's (see the class)."""
         self._check_versions()
         self._follow_knowledge()
         done = self.state.cursor()  # delivered or skipped, here or by another process
@@ -285,11 +309,11 @@ class Runtime:
                     generation = self.index.generation()
                 outcome, touched = self._deliver_next(epoch, cursor, seq, event, generation)
             except (IndexConfigChanged, _VersionMoved) as exc:
-                # Another process rebuilt the index (maybe with another config) or
-                # reset this engine under another version. Rebuild the index for
-                # ours if needed, check the engine's version again (a reset replays
-                # it) and start the event over, a few times: two configs or two
-                # engine versions on one store are not supported.
+                # Another process rebuilt the index or reset this engine under
+                # another version. Check the index (IndexMismatch if it now holds
+                # other settings) and the engine's version again (a reset replays
+                # it) and start the event over, a few times: two engine versions
+                # on one store are not supported.
                 retries[seq] = retries.get(seq, 0) + 1
                 if retries[seq] > MAX_CONFIG_RETRIES:
                     if isinstance(exc, _VersionMoved):
@@ -303,6 +327,14 @@ class Runtime:
                 continue
             delivered += outcome
             self._sync_knowledge(touched)
+
+    def check_index(self) -> None:
+        """Raise IndexMismatch when sync would, for the store's index settings
+        (see the class). Reads only: nothing is built, reset or delivered."""
+        if self.index is not None:
+            self.index.check()
+        elif self.vectors is not None:
+            check_unindexed(self.vectors)
 
     def pending(self) -> int:
         """How many events wait after the engine's cursor (read now, no lock),
@@ -375,7 +407,13 @@ class Runtime:
         reset by another version of the engine, or a rebuild of the index
         since the version was checked (check the versions again first). The
         epoch and cursor are checked again by state.commit; this read spares
-        the decision checks of a result that is going to be dropped."""
+        the decision checks of a result that is going to be dropped.
+
+        A Runtime with no index raises IndexMismatch here when the store has
+        got one meanwhile: nothing of the result is written."""
+        if self.index is None:
+            # No generation to compare: an index built since the check must not get this result.
+            self.check_index()
         now_epoch, now_cursor, version = self.state.position()
         if now_epoch != epoch or now_cursor != cursor:
             return "read"
@@ -394,9 +432,11 @@ class Runtime:
         event is reported in `skipped` only once this has committed; if it
         fails, the error is raised and the event is given up again on the next
         attempt. The index is not touched: it reached this event before
-        observe ran."""
+        observe ran. Raises IndexMismatch, skipping nothing, when the store's
+        index settings are no longer this Runtime's."""
         try:
             with self.transaction():
+                self.check_index()  # not on a store whose index settings are no longer ours
                 self.state.commit(cursor, seq, {}, set(), epoch=epoch)
         except CursorConflict:
             # Another process delivered or skipped it, or the engine was reset.
@@ -462,24 +502,30 @@ class Runtime:
 
     def _check_versions(self) -> None:
         """Runs on every sync, and again when a commit finds the index rebuilt
-        or the engine's state under another version. With an index, first
-        rebuild it if it is stale (Index.ensure_current, which embeds with no
-        transaction open). Then, when the stored version differs from
-        _want_version(), drop the engine's state and start delivery over, in
-        one short transaction that computes the version again (the index may
-        have been rebuilt meanwhile). A rebuild by any process adds 1 to the
-        index generation, so it changes the version of every engine on the
-        store. The same transaction empties the knowledge base: the replay
-        promotes again what the engine still holds true, and an item it no
-        longer promotes would otherwise stay with no engine state left to
-        demote it. Knowledge vectors follow on this sync.
+        or the engine's state under another version. First the index: build it
+        on a store that never had one (Index.ensure_current, which embeds with
+        no transaction open), and raise IndexMismatch, changing nothing, when
+        the store's index settings are not this Runtime's. Then, when the
+        stored version differs from _want_version(), drop the engine's state
+        and start delivery over, in one short transaction that checks the
+        index settings and computes the version again (the index may have
+        been rebuilt meanwhile; with other settings, that is IndexMismatch
+        and nothing is dropped). A rebuild by any process adds 1 to the index
+        generation, so it changes the version of every engine on the store.
+        The same transaction empties the knowledge base: the replay promotes
+        again what the engine still holds true, and an item it no longer
+        promotes would otherwise stay with no engine state left to demote
+        it. Knowledge vectors follow on this sync.
 
         The knowledge base is shared by the store, so it records its owner
         (_owner: the engine's class and version). When another engine, or
         this one under another version, emptied it for itself, this engine
         starts over too, even if its own state still has the right version."""
-        if self.index is not None and self.index.ensure_current(self.knowledge):
-            self._knowledge_reconciled = False  # compare every item again on this sync
+        if self.index is not None:
+            if self.index.ensure_current(self.knowledge):
+                self._knowledge_reconciled = False  # compare every item again on this sync
+        elif self.vectors is not None:
+            check_unindexed(self.vectors)
         want = self._want_version()
         owner = self._owner(want)
         if self.state.version() == want and (self._owner_seen == owner or self.knowledge.owner() == owner):
@@ -487,6 +533,10 @@ class Runtime:
             return  # the common case takes no lock
         reason = None
         with self.transaction():
+            # Again, now that no rebuild can come in between: a version that differs because the
+            # index was rebuilt with other settings is a mismatch to report, not a reason to
+            # empty what the processes with those settings built.
+            self.check_index()
             want = self._want_version()
             owner = self._owner(want)
             recorded = self.knowledge.owner()

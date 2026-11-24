@@ -671,6 +671,18 @@ class VectorBackendContract(_Contract):
         vb.reset({"model": "m2", "group_threshold": 0.9})
         assert vb.generation() == 2
 
+    def test_reset_to_none_drops_the_index_and_keeps_counting(self, vb):
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        vb.put_vector("knowledge", "k1", [1.0, 0.0], digest="d")
+        vb.set_indexed(0, 3, vb.generation())
+        vb.reset(None)
+        assert vb.position() == (None, 2, 0)  # no index, and not a store that never had one
+        assert vb.meta() is None
+        assert vb.vector("knowledge", "k1") is None
+        assert vb.knowledge_digests() == {}
+        vb.reset({"model": "m1", "group_threshold": 0.8})
+        assert vb.position() == ({"model": "m1", "group_threshold": 0.8}, 3, 0)
+
     def test_position_reads_meta_generation_and_indexed_together(self, vb):
         assert vb.position() == (None, 0, 0)
         meta = {"model": "m1", "group_threshold": 0.8}

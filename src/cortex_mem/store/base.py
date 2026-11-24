@@ -138,13 +138,14 @@ class VectorBackend(Protocol):
     # Index state
     def meta(self) -> dict[str, Any] | None:
         """{"model": str, "group_threshold": float, "store": str} as the Index
-        passed it to reset(), None until reset() is called."""
+        passed it to reset(). None until reset() is called, and after reset(None)."""
         ...
 
-    def reset(self, meta: dict[str, Any]) -> None:
+    def reset(self, meta: dict[str, Any] | None) -> None:
         """Drop every vector (and the knowledge digests) and group, move the cursor
         to 0, record meta and add 1 to generation(), all in one step. The embedding
-        cache stays."""
+        cache stays. None records that the store holds no index: meta() is None
+        again, and generation() tells it from a store that never had one."""
         ...
 
     def generation(self) -> int:
