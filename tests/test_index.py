@@ -15,7 +15,14 @@ from cortex_mem.embed import (
     float32,
     text_digest,
 )
-from cortex_mem.index import EMBED_BATCH, Index, IndexConfigChanged
+from cortex_mem.index import (
+    EMBED_BATCH,
+    Index,
+    IndexConfigChanged,
+    IndexMismatch,
+    check_unindexed,
+    drop_index,
+)
 from cortex_mem.store.base import CursorConflict
 from cortex_mem.store.memory import InMemoryDatabase
 from cortex_mem.store.sqlite import SqliteDatabase
@@ -82,7 +89,7 @@ def build(events, embedder=None, threshold=0.9, db=None):
     for e in events:
         db.events.append(e)
     index = Index(db.vectors, embedder or HashEmbedder(), threshold, transaction=db.transaction)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     index.advance(db.events, len(events))
     return db, index
 
@@ -90,7 +97,7 @@ def build(events, embedder=None, threshold=0.9, db=None):
 def put_knowledge(db, index, *items):
     """Put items in the knowledge base and let the index follow them (built
     first if it never was: sync_knowledge writes nothing into a stale index)."""
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     for k in items:
         db.knowledge.put(k)
     index.sync_knowledge(db.knowledge, [k.id for k in items])
@@ -235,18 +242,18 @@ def test_knowledge_vectors_follow_the_knowledge_base():
     assert list(db.vectors.vectors("knowledge")) == []
 
 
-def test_ensure_current_resets_and_reembeds_knowledge():
+def test_rebuild_resets_and_reembeds_knowledge():
     emb = CountingEmbedder()
     db, index = build([ev("e1"), ev("e2", "other words")], emb)  # built and advanced
     put_knowledge(db, index, item("k1"), item("k2", scope="personal", owner="u9", body="private note"))
     db.vectors.put_vector("knowledge", "gone", [1.0, 0.0])  # not in the knowledge base
     generation = db.vectors.generation()
     calls = len(emb.calls)
-    assert index.ensure_current(db.knowledge) is False  # current: nothing to do
+    assert index.rebuild(db.knowledge) is False  # current: nothing to do
     assert db.vectors.indexed() == 2
 
     other = Index(db.vectors, emb, 0.8)
-    assert other.ensure_current(db.knowledge) is True
+    assert other.rebuild(db.knowledge) is True
     assert db.vectors.meta() == other.want() == {"model": emb.model, "group_threshold": 0.8, "store": "memory"}
     assert db.vectors.generation() == generation + 1
     assert list(db.vectors.vectors("event")) == []
@@ -260,11 +267,70 @@ def test_ensure_current_resets_and_reembeds_knowledge():
     assert reader(db, other).group("e1").id == "e1"
 
 
+def test_ensure_current_builds_only_a_store_that_never_had_an_index():
+    db = InMemoryDatabase()
+    db.knowledge.put(item("k1"))
+    index = Index(db.vectors, HashEmbedder(), 0.9)
+    assert index.ensure_current(db.knowledge) is True  # never built: built with no command
+    assert db.vectors.position() == (index.want(), 1, 0)
+    assert [id for id, _ in db.vectors.vectors("knowledge")] == ["k1"]
+    assert index.ensure_current(db.knowledge) is False  # ours already
+    assert db.vectors.generation() == 1
+
+
+@pytest.mark.parametrize("other", [(HashEmbedder(), 0.8), (HashEmbedder(dim=128), 0.9)], ids=["threshold", "model"])
+def test_ensure_current_reports_another_config_and_changes_nothing(other):
+    db = InMemoryDatabase()
+    db.knowledge.put(item("k1"))
+    index = Index(db.vectors, HashEmbedder(), 0.9)
+    index.ensure_current(db.knowledge)
+    before = (db.vectors.position(), list(db.vectors.vectors("knowledge")))
+    emb = CountingEmbedder(other[0])
+
+    with pytest.raises(IndexMismatch) as raised:
+        Index(db.vectors, emb, other[1]).ensure_current(db.knowledge)
+
+    assert raised.value.stored == index.want()
+    assert raised.value.current == {"model": emb.model, "group_threshold": other[1], "store": "memory"}
+    for setting in (index.want(), raised.value.current):  # the message names both settings
+        assert f"model={setting['model']!r}" in str(raised.value)
+        assert f"group_threshold={setting['group_threshold']!r}" in str(raised.value)
+    assert emb.calls == []  # nothing was embedded for a rebuild that does not happen
+    assert (db.vectors.position(), list(db.vectors.vectors("knowledge"))) == before
+
+
+def test_a_dropped_index_is_not_built_again_without_a_rebuild():
+    db = InMemoryDatabase()
+    db.knowledge.put(item("k1"))
+    index = Index(db.vectors, HashEmbedder(), 0.9)
+    check_unindexed(db.vectors)  # no index: a process with no embedder may deliver
+    assert drop_index(db.vectors) is False  # nothing to drop, and the store still counts as never built
+    index.ensure_current(db.knowledge)
+    index.advance(appended(db, ev("e1")).events, 1)
+
+    with pytest.raises(IndexMismatch) as raised:  # an index, and no embedder to read it with
+        check_unindexed(db.vectors)
+    assert (raised.value.stored, raised.value.current) == (index.want(), None)
+    assert "no index (embedding off)" in str(raised.value)
+
+    assert drop_index(db.vectors) is True
+    assert db.vectors.position() == (None, 2, 0)
+    assert list(db.vectors.vectors("event")) == list(db.vectors.vectors("knowledge")) == []
+    check_unindexed(db.vectors)
+    # Embedding was turned off on purpose: a process that still has an embedder reports it.
+    with pytest.raises(IndexMismatch) as raised:
+        index.ensure_current(db.knowledge)
+    assert (raised.value.stored, raised.value.current) == (None, index.want())
+    assert db.vectors.position() == (None, 2, 0)
+    assert index.rebuild(db.knowledge) is True
+    assert db.vectors.position() == (index.want(), 3, 0)
+
+
 def test_stale_when_model_or_threshold_changes():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9)
     assert index.stale()  # never built
-    assert index.ensure_current(db.knowledge) is True
+    assert index.rebuild(db.knowledge) is True
     assert not index.stale()
     assert Index(db.vectors, HashEmbedder(), 0.9).stale() is False
     assert Index(db.vectors, HashEmbedder(), 0.8).stale()
@@ -473,7 +539,7 @@ def test_wrong_vector_count_raises_embedding_error(out):
     db = InMemoryDatabase()
     db.events.append(ev("e1"))
     index = Index(db.vectors, CountMismatchEmbedder(out), 0.9)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     with pytest.raises(EmbeddingError):
         index.advance(db.events, 1)
     assert db.vectors.indexed() == 0
@@ -588,7 +654,7 @@ def test_the_index_asks_the_store_for_similarity_instead_of_scanning():
     for e in events:
         db.events.append(e)
     index = Index(NoScanBackend(db.vectors), HashEmbedder(), 0.9)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     index.advance(db.events, len(events))
     put_knowledge(db, index, item("k1"))
     r = reader(db, index)
@@ -605,7 +671,7 @@ def test_a_non_finite_embedding_fails_loudly_and_writes_nothing(make):
     db.events.append(ev("e1", "a"))
     emb = TableEmbedder({"a": [float("nan"), 1.0, 0.0]})
     index = Index(db.vectors, emb, 0.9, transaction=db.transaction)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     with pytest.raises(EmbeddingError, match="finite"):
         index.advance(db.events, 1)
     assert (list(db.vectors.vectors("event")), db.vectors.group_of("e1"), db.vectors.indexed()) == ([], None, 0)
@@ -795,7 +861,7 @@ def test_advance_raises_a_conflict_it_cannot_explain(opened):
     gets the conflict raised, not an endless retry, and writes nothing."""
     db = appended(opened(), ev("e1", "one"), ev("e2", "two"))
     index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     index.advance(db.events, 2)
 
     class Stuck(SpyBackend):
@@ -885,27 +951,27 @@ def test_sync_knowledge_skips_a_write_when_the_item_changed_meanwhile(opened):
     assert db.vectors.vector("knowledge", "k1") == db.vectors.cached(emb.model, text_digest("deploy\nnew words"))
 
 
-def test_ensure_current_embeds_outside_the_transaction(opened):
+def test_rebuild_embeds_outside_the_transaction(opened):
     db = opened()
     db.knowledge.put(item("k1", body="first"))
     db.knowledge.put(item("k2", body="second"))
     index, emb, _, _ = spied(db, built=False)
 
-    assert index.ensure_current(db.knowledge) is True
+    assert index.rebuild(db.knowledge) is True
 
     assert sorted(emb.texts) == ["deploy\nfirst", "deploy\nsecond"]
     assert emb.inside == []
     assert not index.stale()
     assert db.vectors.generation() == 1
     assert set(db.vectors.knowledge_digests()) == {"k1", "k2"}
-    assert index.ensure_current(db.knowledge) is False
+    assert index.rebuild(db.knowledge) is False
     assert db.vectors.generation() == 1
 
 
-def test_ensure_current_failure_changes_nothing(opened):
+def test_rebuild_failure_changes_nothing(opened):
     db = appended(opened(), ev("e1"), ev("e2", "other words"))
     old = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
-    old.ensure_current(db.knowledge)
+    old.rebuild(db.knowledge)
     old.advance(db.events, 2)
     db.knowledge.put(item("k1", body="never embedded"))
 
@@ -918,9 +984,9 @@ def test_ensure_current_failure_changes_nothing(opened):
     fresh = Index(db.vectors, SpyEmbedder(spy, fail_on={"deploy\nnever embedded"}), 0.5, transaction=spy.transaction)
 
     with pytest.raises(EmbeddingError):
-        fresh.ensure_current(db.knowledge)
+        fresh.rebuild(db.knowledge)
 
-    assert fresh.stale()  # the next sync tries again
+    assert fresh.stale()
     assert state() == before
 
 
@@ -935,7 +1001,7 @@ def test_advance_refuses_to_write_into_an_index_of_another_config(opened):
     other = Index(db_b.vectors, HashEmbedder(dim=128), 0.9, transaction=db_b.transaction)
 
     def meanwhile(texts, kind):
-        other.ensure_current(db_b.knowledge)
+        other.rebuild(db_b.knowledge)
 
     first, emb, backend, _ = spied(db_a, SpyEmbedder(None, during=meanwhile))
 
@@ -1061,7 +1127,7 @@ def test_a_refused_query_finds_nothing_instead_of_failing():
 def test_sync_knowledge_of_touched_ids_reads_only_their_digests():
     db = InMemoryDatabase()
     index = Index(db.vectors, HashEmbedder(), 0.9, transaction=db.transaction)
-    index.ensure_current(db.knowledge)
+    index.rebuild(db.knowledge)
     for i in range(5):
         db.knowledge.put(item(f"k{i}", body=f"item {i}"))
     index.sync_knowledge(db.knowledge, None)

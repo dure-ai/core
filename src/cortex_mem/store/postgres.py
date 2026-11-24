@@ -846,16 +846,16 @@ class PgVectorBackend:
         value = self._get_meta("meta")
         return json.loads(value) if value is not None else None
 
-    def reset(self, meta: dict[str, Any]) -> None:
-        encoded = json.dumps(meta)
+    def reset(self, meta: dict[str, Any] | None) -> None:
         with self.db.transaction():
             con = self.db.con
             for name in self._hnsw_indexes():
                 con.execute(_sql(f'DROP INDEX IF EXISTS "{name}"'))
             for table in ("event_vectors", "knowledge_vectors", "vector_groups"):
                 con.execute(f"DELETE FROM {table}")
-            con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim')")
-            self._set_meta("meta", encoded)
+            con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'dim', 'meta')")
+            if meta is not None:
+                self._set_meta("meta", json.dumps(meta))
             self._set_meta("generation", str(self.generation() + 1))
             self._hnsw_for = None
 

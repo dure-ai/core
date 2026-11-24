@@ -798,3 +798,140 @@ def test_the_first_failure_of_an_outage_is_logged_once(caplog):
 
     assert caplog.text.count("embedding failed; delivery waits") == 1
     assert "Traceback" not in caplog.text
+
+
+# ── one index configuration per store ───────────────────────────────────────
+
+
+def _indexed_store(monkeypatch, tmp_path):
+    """A SQLite store with an index built by a server with the hash embedder, and two records."""
+    svc = _service_from_env(monkeypatch, tmp_path, CORTEX_EMBEDDER="hash")
+    svc.record("deploy uses release tags")
+    svc.record("payments need vendor v2")
+    return svc
+
+
+def _stored(svc):
+    state = svc.runtime.state
+    return svc.db.vectors.position(), state.position(), dict(state.scan()), svc.runtime.knowledge.all()
+
+
+@pytest.mark.parametrize("env", [{}, {"CORTEX_EMBEDDER": "hash", "CORTEX_GROUP_THRESHOLD": "0.8"}],
+                         ids=["no embedder", "threshold"])
+def test_a_server_with_other_index_settings_stores_records_and_refuses_recall(monkeypatch, tmp_path, caplog, env):
+    first = _indexed_store(monkeypatch, tmp_path)
+    before = _stored(first)
+    other = _service_from_env(monkeypatch, tmp_path, **env)
+
+    with caplog.at_level("ERROR", logger="cortex_mem_server"):
+        with pytest.raises(srv.IndexMismatch) as raised:
+            other.recall("deploy")
+        result = other.record("written by the mismatched server")
+        with pytest.raises(srv.IndexMismatch):
+            other.recall("deploy")
+
+    assert "group_threshold=0.9" in str(raised.value)  # the stored settings, and this server's
+    assert ("group_threshold=0.8" if env else "no index (embedding off)") in str(raised.value)
+    assert (result["delivered"], result["pending"]) == (False, 1)  # stored, and it waits
+    assert _stored(first) == before  # nothing rebuilt, reset or emptied
+    assert caplog.text.count("cortex-mem-server --rebuild-index") == 1  # logged once, not on every call
+
+    # The server with the store's settings goes on, and takes in what the other one stored.
+    assert [m["content"] for m in first.recall("written by the mismatched server", k=1)] != []
+    assert first.pending() == 0 and first.db.vectors.generation() == 1
+
+
+def test_a_rebuild_between_catching_up_and_recalling_is_logged(monkeypatch, tmp_path, caplog):
+    svc = _indexed_store(monkeypatch, tmp_path)
+    tick = svc.runtime.tick
+
+    def tick_then_rebuilt(now):
+        tick(now)
+        srv.rebuild_index(svc.db, srv.HashEmbedder(), 0.8)
+
+    monkeypatch.setattr(svc.runtime, "tick", tick_then_rebuilt)
+    with caplog.at_level("ERROR", logger="cortex_mem_server"), pytest.raises(srv.IndexMismatch):
+        svc.recall("deploy")
+    assert caplog.text.count("cortex-mem-server --rebuild-index") == 1
+
+
+def test_the_recall_tool_tells_the_agent_about_an_index_mismatch(monkeypatch, tmp_path):
+    _indexed_store(monkeypatch, tmp_path)
+    _service_from_env(monkeypatch, tmp_path)
+
+    with pytest.raises(srv.ToolError, match="cortex-mem-server --rebuild-index"):
+        srv.recall("deploy")
+
+
+def test_a_server_with_other_index_settings_does_not_start(monkeypatch, tmp_path):
+    first = _indexed_store(monkeypatch, tmp_path)
+    before = _stored(first)
+    started = []
+    monkeypatch.setattr(srv.mcp, "run", lambda: started.append(True))
+
+    for name in _EMBED_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TEAM", "t1")
+    monkeypatch.setattr(srv, "_service", None)
+    with pytest.raises(SystemExit) as stopped:
+        srv.main([])
+
+    assert "no index (embedding off)" in str(stopped.value) and "model='hash-256'" in str(stopped.value)
+    assert "cortex-mem-server --rebuild-index" in str(stopped.value)
+    assert started == [] and _stored(first) == before
+
+    monkeypatch.setenv("CORTEX_EMBEDDER", "hash")
+    monkeypatch.setattr(srv, "_service", None)
+    srv.main([])
+    assert started == [True]
+
+
+def _rebuild(monkeypatch, tmp_path, capsys, **env):
+    _service_from_env(monkeypatch, tmp_path, **env).db.close()  # set the environment only
+    monkeypatch.setattr(srv.mcp, "run", lambda: pytest.fail("--rebuild-index must exit without serving"))
+    capsys.readouterr()
+    srv.main(["--rebuild-index"])
+    return capsys.readouterr().out
+
+
+def test_rebuild_index_changes_the_stores_settings_and_only_it_does(monkeypatch, tmp_path, capsys):
+    old = _indexed_store(monkeypatch, tmp_path)
+    assert old.recall("deploy") != []
+
+    out = _rebuild(monkeypatch, tmp_path, capsys, CORTEX_EMBEDDER="hash", CORTEX_GROUP_THRESHOLD="0.8")
+    assert "group_threshold=0.9" in out and "group_threshold=0.8" in out
+    assert old.db.vectors.position() == ({"model": "hash-256", "group_threshold": 0.8, "store": "sqlite"}, 2, 0)
+
+    with pytest.raises(srv.IndexMismatch):  # the running server kept the old threshold
+        old.recall("deploy")
+    new = _service_from_env(monkeypatch, tmp_path, CORTEX_EMBEDDER="hash", CORTEX_GROUP_THRESHOLD="0.8")
+    assert new.recall("deploy") != [] and new.pending() == 0  # replayed once, on the new index
+
+    assert "nothing was rebuilt" in _rebuild(
+        monkeypatch, tmp_path, capsys, CORTEX_EMBEDDER="hash", CORTEX_GROUP_THRESHOLD="0.8"
+    )
+    assert new.db.vectors.generation() == 2
+
+
+def test_rebuild_index_with_no_embedder_turns_embedding_off_for_the_store(monkeypatch, tmp_path, capsys):
+    indexed = _indexed_store(monkeypatch, tmp_path)
+
+    out = _rebuild(monkeypatch, tmp_path, capsys)
+    assert "are now no index (embedding off)" in out
+    assert indexed.db.vectors.position() == (None, 2, 0)
+
+    plain = _service_from_env(monkeypatch, tmp_path)
+    assert plain.recall("deploy") != []  # text search, after one replay
+    with pytest.raises(srv.IndexMismatch):  # not built again by a server that still has an embedder
+        indexed.recall("deploy")
+    assert indexed.db.vectors.position() == (None, 2, 0)
+    assert "nothing was rebuilt" in _rebuild(monkeypatch, tmp_path, capsys)
+
+
+def test_rebuild_index_needs_no_team(monkeypatch, tmp_path, capsys):
+    for name in _EMBED_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_DB_PATH", str(tmp_path / "cortex.db"))
+    monkeypatch.setattr(srv.mcp, "run", lambda: pytest.fail("--rebuild-index must exit without serving"))
+    srv.main(["--rebuild-index"])  # a store with no index and no embedder: nothing to do
+    assert "nothing was rebuilt" in capsys.readouterr().out

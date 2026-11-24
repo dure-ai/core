@@ -465,16 +465,13 @@ class SqliteVectorBackend:
         rows = self.db.query("SELECT value FROM vector_meta WHERE key = 'meta'")
         return json.loads(rows[0][0]) if rows else None
 
-    def reset(self, meta: dict[str, Any]) -> None:
+    def reset(self, meta: dict[str, Any] | None) -> None:
         with self.db.transaction():
             self.db.con.execute("DELETE FROM vectors")
             self.db.con.execute("DELETE FROM vector_groups")
-            self.db.con.execute("DELETE FROM vector_meta WHERE key = 'indexed'")
-            self.db.con.execute(
-                "INSERT INTO vector_meta (key, value) VALUES ('meta', ?) "
-                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                (json.dumps(meta),),
-            )
+            self.db.con.execute("DELETE FROM vector_meta WHERE key IN ('indexed', 'meta')")
+            if meta is not None:
+                self.db.con.execute("INSERT INTO vector_meta (key, value) VALUES ('meta', ?)", (json.dumps(meta),))
             self.db.con.execute(
                 "INSERT INTO vector_meta (key, value) VALUES ('generation', '1') "
                 "ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"

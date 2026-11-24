@@ -225,14 +225,14 @@ class InMemoryVectorBackend:
     def meta(self) -> dict[str, Any] | None:
         return None if self._meta is None else dict(self._meta)
 
-    def reset(self, meta: dict[str, Any]) -> None:
+    def reset(self, meta: dict[str, Any] | None) -> None:
         for table in self._vectors.values():
             table.clear()
         self._groups.clear()
         self._cells.clear()
         self._digests.clear()
         self._indexed = 0
-        self._meta = dict(meta)
+        self._meta = None if meta is None else dict(meta)
         self._generation += 1
 
     def generation(self) -> int:

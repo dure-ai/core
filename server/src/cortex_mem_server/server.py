@@ -29,8 +29,18 @@ Environment variables (only CORTEX_TEAM is required):
 
 One server process is one session: Claude Code starts a process per session.
 Processes share the SQLite file or the PostgreSQL database; the runtime delivers each event once.
+
+A store has one index configuration: CORTEX_EMBEDDER, the embedding model and
+CORTEX_GROUP_THRESHOLD. A server whose settings differ from the store's index
+does not start, and one that meets the difference while running (the index was
+rebuilt under it) stores what is recorded without delivering it and refuses
+recall, until its settings match. Only `cortex-mem-server --rebuild-index`
+changes a store's index configuration: it rebuilds the index with the settings
+of the environment it runs in (CORTEX_EMBEDDER=none drops it) and exits
+without serving. It needs the store and embedding variables only.
 """
 
+import argparse
 import getpass
 import importlib
 import logging
@@ -57,7 +67,7 @@ from cortex_mem.embed import (
     OutageBreaker,
     UpstageEmbedder,
 )
-from cortex_mem.index import Index
+from cortex_mem.index import Index, IndexMismatch, describe_settings, drop_index
 from cortex_mem.runtime import Runtime
 from cortex_mem.store.base import Database
 from cortex_mem.store.postgres import PostgresDatabase, check_lock_timeout
@@ -77,6 +87,11 @@ log = logging.getLogger("cortex_mem_server")
 # that trickles in can take longer) before the delivery fails with an
 # EmbeddingError and is retried on the next call.
 UPSTAGE_TIMEOUT_S = 4.0
+REBUILD_HINT = (
+    "To keep the stored settings, start this server with them. To change them, run "
+    "`cortex-mem-server --rebuild-index` once with the new settings in its environment, then restart every "
+    "session with those settings"
+)
 
 
 def _narrow(requested: Scope | None, default: Scope) -> Scope:
@@ -153,7 +168,8 @@ class Service:
         self.db = db  # exposed so callers and tests can close the store
         self.runtime = Runtime(
             built, db.events, db.knowledge, db.state(name), transaction=db.transaction, max_failures=max_failures,
-            index=index,
+            # With no embedder, the store's vector backend lets the runtime refuse a store that holds an index.
+            index=index, vectors=db.vectors if index is None else None,
         )
         self.user, self.team, self.session, self.agent = user, team, session, agent
         self.repo = repo  # the configured repo: picks the scope policy; a tool argument only says where
@@ -161,6 +177,7 @@ class Service:
         self.clock = clock
         self._skipped_logged = 0
         self._outage = False  # an embedding outage has been logged and has not ended yet
+        self._mismatch: str | None = None  # the index mismatch that has been logged and has not ended yet
 
     def _caller(self, repo: str | None = None, context: Mapping[str, str] | None = None) -> Caller:
         return self._caught_up(repo, context)[0]
@@ -179,14 +196,24 @@ class Service:
         except EmbeddingError as exc:
             down = True
             self._embedding_failed(exc)
+        except IndexMismatch as exc:
+            self._index_mismatch(exc)  # a record is still stored; recall meets it again and refuses
         except Exception:
             # An engine failure must not stop the tool call; the runtime retries
             # the event next time and skips it after max_failures attempts.
             log.exception("engine failed while catching up; continuing")
         else:
             self._embedding_works()
+            self._mismatch = None
         self._log_skipped()
         return caller, down
+
+    def _index_mismatch(self, exc: IndexMismatch) -> None:
+        """Log an index mismatch once, when it begins (or changes): every tool call meets it until
+        this server's settings match the store's."""
+        if self._mismatch != str(exc):
+            log.error("%s. Nothing is delivered and recall is refused meanwhile. %s", exc, REBUILD_HINT)
+            self._mismatch = str(exc)
 
     def _embedding_failed(self, exc: EmbeddingError) -> None:
         """Log an outage once, when it begins: every tool call meets it until it ends."""
@@ -202,7 +229,7 @@ class Service:
     def _append(self, caller: Caller, **fields) -> tuple[str, bool, int | None]:
         """Append an event; returns its id, whether the engine has taken this
         event in (false while it waits: behind an earlier event, an embedding
-        outage or a failing engine; and false when it was skipped after
+        outage, an index mismatch or a failing engine; and false when it was skipped after
         max_failures failed deliveries) and how many events still wait, this
         one or others (None when that could not be read).
         Once stored, the event is not lost if delivery fails: it is retried
@@ -216,6 +243,8 @@ class Service:
                 raise  # refused before it was stored (e.g. missing refs)
             if isinstance(exc, EmbeddingError):
                 self._embedding_failed(exc)
+            elif isinstance(exc, IndexMismatch):
+                self._index_mismatch(exc)
             else:
                 log.exception("event %s stored, but the engine failed to take it in", event.id)
         finally:
@@ -273,7 +302,11 @@ class Service:
         context: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         caller, down = self._caught_up(repo, context)
-        handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
+        try:
+            handoffs = self.runtime.recall(query, caller, scope, event_id=uuid4().hex, k=k, embedding_down=down)
+        except IndexMismatch as exc:
+            self._index_mismatch(exc)  # the index was rebuilt since this call caught up
+            raise
         return [
             {"id": h.id, "content": h.content, "status": h.status, "conditions": dict(h.conditions)}
             for h in handoffs
@@ -409,7 +442,7 @@ def _vector_index() -> str:
     return name
 
 
-def _open_database() -> Database:
+def _open_database() -> SqliteDatabase | PostgresDatabase:
     """PostgreSQL when CORTEX_DB_URL is set, else SQLite at CORTEX_DB_PATH
     (default ~/.cortex-mem/cortex.db; its directory is created). Exits with
     a message that holds neither the URL nor the password when PostgreSQL
@@ -498,9 +531,15 @@ def recall(
     configured repo. Returns up to k memories, best first, and pending: how
     many recorded events have not reached memory yet (an integer, or null when
     it could not be read). While pending is above 0, the answer may miss them,
-    for example during an embedding outage; they arrive on later calls."""
+    for example during an embedding outage; they arrive on later calls. Fails
+    when this server's index settings are not the store's: a person has to fix
+    the configuration, so tell them instead of retrying."""
     service = get_service()
-    return {"memories": service.recall(query, scope, k, repo, context), "pending": service.pending()}
+    try:
+        memories = service.recall(query, scope, k, repo, context)
+    except IndexMismatch as exc:
+        raise ToolError(f"{exc}. {REBUILD_HINT}.") from exc
+    return {"memories": memories, "pending": service.pending()}
 
 
 @mcp.tool()
@@ -532,14 +571,73 @@ def report_outcome(
         raise ToolError(str(exc)) from exc
 
 
-def main() -> None:
+def rebuild_index(db: Database, embedder: Embedder | None, threshold: float) -> str:
+    """Make the store's index the one `embedder` and `threshold` configure,
+    whatever it holds now, and say what happened. With no embedder the index
+    is dropped: embedding is off for the store. This is the only way a
+    store's index configuration changes; a serving process never does it.
+
+    Vectors and groups are dropped and the knowledge vectors stored again;
+    the next server that syncs with these settings indexes the events again
+    (from the embedding cache when the model is the same) and replays its
+    engine once. Servers with other settings report the mismatch until they
+    are restarted with these."""
+    stored = db.vectors.meta()
+    if embedder is None:
+        changed, current = drop_index(db.vectors, db.transaction), None
+    else:
+        index = Index(db.vectors, embedder, threshold, transaction=db.transaction)
+        changed, current = index.rebuild(db.knowledge), index.want()
+    if not changed:
+        return f"The store's index settings are already {describe_settings(current)}; nothing was rebuilt."
+    return (
+        f"The store's index settings were {describe_settings(stored)} and are now {describe_settings(current)}. "
+        "Servers with these settings replay their engine once on their next call; restart every session "
+        "that runs with other settings, which now reports a mismatch."
+    )
+
+
+def _rebuild_and_exit() -> None:
+    embedder, threshold = _embedder(), _group_threshold()
+    _lock_timeout()
+    _vector_index()
+    db = _open_database()
+    try:
+        print(rebuild_index(db, embedder, threshold))
+    except EmbeddingError as exc:
+        raise SystemExit(f"cortex-mem: embedding failed, and the index is as it was: {exc}") from None
+    finally:
+        db.close()
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="cortex-mem-server", description="The cortex-mem MCP server (stdio).")
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help=(
+            "rebuild the store's index with the embedder, model and grouping threshold of this environment "
+            "(CORTEX_EMBEDDER=none drops it), then exit without serving; every engine on the store replays "
+            "the event log once afterwards"
+        ),
+    )
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")  # stderr
+    if args.rebuild_index:
+        # One run by a person, never a setting: a value that stays in a session's configuration
+        # would let two sessions with different settings rebuild over each other again.
+        _rebuild_and_exit()
+        return
     _identity()  # fail at start, not at the first tool call
     _max_failures()
     _embedder()
     _group_threshold()
     _lock_timeout()
     _vector_index()
+    try:
+        get_service().runtime.check_index()
+    except IndexMismatch as exc:
+        raise SystemExit(f"cortex-mem: {exc}. {REBUILD_HINT}.") from None
     mcp.run()
 
 
